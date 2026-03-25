@@ -1,0 +1,22 @@
+Continuing SoDVR — a BepInEx 6 IL2CPP VR mod for Shadows of Doubt. Read these files before doing anything else:
+
+1. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\HANDOVER.md  — full technical state
+2. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\CLAUDE.md    — project conventions
+3. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\OpenXRManager.cs  — main patch file
+4. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\VR\VRCamera.cs   — stereo render loop
+
+SHORT SUMMARY of where we are:
+
+Phase 5 — fixing null swapchain textures. The stereo loop runs (xrCreateSwapchain rc=0, stereo frames rendering) but swapchain image pointers are 0x0 so the headset sees black.
+
+Root cause: SC-member (VDXR's xrCreateSwapchain inner function) takes the streaming/null-texture branch because AL==0x0F at SC-member+0x242, so the JNE there is not taken.
+
+Fix applied (not yet run): convert JNE at SC-member+0x242 to unconditional JMP:
+  0F 85 61 01 00 00  →  E9 62 01 00 00 90
+Patch name: "SC-force-compositor"
+
+Previous attempt used offset 0x243 (wrong by 1) — log confirmed fn+0x243=0x85, so 0x0F is at +0x242.
+
+Build is done and deployed to BepInEx/plugins/SoDVR.dll. The game has not been run yet with this build.
+
+WORKING CONVENTION: When I say "done" it means I've run the game. Read BepInEx/LogOutput.log immediately and analyse it. Delegate all builds to yourself (I don't run builds). Step-by-step, one thing at a time.

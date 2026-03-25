@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>SoDVR.Preload</AssemblyName>
+    <RootNamespace>SoDVR.Preload</RootNamespace>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <GameDir>E:\SteamLibrary\steamapps\common\Shadows of Doubt</GameDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BepInEx.Core" Version="6.0.0-be.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="BepInEx.Preloader.Core">
+      <HintPath>$(GameDir)\BepInEx\core\BepInEx.Preloader.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Post-build: copy to BepInEx patchers -->
+  <Target Name="DeployPatcher" AfterTargets="Build">
+    <PropertyGroup>
+      <PatcherDir>$(GameDir)\BepInEx\patchers\SoDVR</PatcherDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(PatcherDir)\RuntimeDeps\Native" />
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="$(PatcherDir)" />
+    <Copy SourceFiles="..\RuntimeDeps\Native\UnityOpenXR.dll" DestinationFolder="$(PatcherDir)\RuntimeDeps\Native" />
+    <Copy SourceFiles="..\RuntimeDeps\Native\openxr_loader.dll" DestinationFolder="$(PatcherDir)\RuntimeDeps\Native" />
+  </Target>
+</Project>
