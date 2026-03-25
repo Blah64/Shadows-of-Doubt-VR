@@ -1,5 +1,21 @@
+# Build artifacts
 bin/
 obj/
-*.user
+*.nupkg
+
+# IDE / editor
 .vs/
+*.user
+.idea/
+*.suo
+*.sln.docstates
+
+# NuGet local cache
+packages/
+.nuget/
+
+# Game runtime binaries (not source — obtained from game install)
 Assembly-CSharp.dll
+
+# Claude Code local session state
+.claude/
