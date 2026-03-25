@@ -1,22 +1,24 @@
 Continuing SoDVR — a BepInEx 6 IL2CPP VR mod for Shadows of Doubt. Read these files before doing anything else:
 
-1. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\HANDOVER.md  — full technical state
-2. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\CLAUDE.md    — project conventions
-3. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\OpenXRManager.cs  — main patch file
-4. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\VR\VRCamera.cs   — stereo render loop
+1. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\CLAUDE.md         — project conventions
+2. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\HANDOVER.md       — full technical state + rewrite plan
+3. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\OpenXRManager.cs  — file to rewrite
+4. E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\VR\VRCamera.cs   — stereo render loop (do not change)
 
-SHORT SUMMARY of where we are:
+SHORT SUMMARY:
 
-Phase 5 — fixing null swapchain textures. The stereo loop runs (xrCreateSwapchain rc=0, stereo frames rendering) but swapchain image pointers are 0x0 so the headset sees black.
+We are switching from a VDXR-internal machine-code patching approach to standard OpenXR loader P/Invoke (the same approach used by LCVR, CWVR, UnityVRMod). The old approach (git 1be2b0e) got swapchain creation working but produced null texture pointers because VDXR's internal streaming pool (robj+0x990) was never populated despite bypassing 14 machine-code guards.
 
-Root cause: SC-member (VDXR's xrCreateSwapchain inner function) takes the streaming/null-texture branch because AL==0x0F at SC-member+0x242, so the JNE there is not taken.
+YOUR TASK: Rewrite OpenXRManager.cs.
 
-Fix applied (not yet run): convert JNE at SC-member+0x242 to unconditional JMP:
-  0F 85 61 01 00 00  →  E9 62 01 00 00 90
-Patch name: "SC-force-compositor"
+What to REMOVE: all PatchBytes calls, VDXR vtable patching, GetVDXRRuntimeObject, ScanAndPatch* functions, CallInitD3D11Direct, CallCompositorSetupDirect, SetRuntimeGraphicsRequirements, TrySubsystemPath, TryUnitySessionPath, NopFnACall, all UnityOpenXR.dll related code, PatchVtableDispatch/PatchInnerRequirementsCheck/PatchSecondCall/PatchCreateSessionContextBlock, AllocNear, DumpFunctionBytes.
 
-Previous attempt used offset 0x243 (wrong by 1) — log confirmed fn+0x243=0x85, so 0x0F is at +0x242.
+What to KEEP (working correctly already): CreateInstance, XrGetSystem, GetFn, GetD3D11Device, GetAdapterLuid, XrBeginSession, PollEvents, frame loop (Wait/Begin/End/thread), SetupStereo, CreateSwapchain, PickSwapchainFormat, EnumSwapchainImages, all swapchain acquire/wait/release, LocateViews, FrameEndStereo, D3D11CopyTexture, EyePose struct, ReadFloat/WriteFloat, LogActiveRuntime.
 
-Build is done and deployed to BepInEx/plugins/SoDVR.dll. The game has not been run yet with this build.
+What to FIX: XrCreateSession binding type 0x3B9B3378 → 1000003000 (standard XR_TYPE_GRAPHICS_BINDING_D3D11_KHR). CallD3D11GraphicsRequirements → simple single call with _instance/_systemId, type=1000003002.
+
+New init flow: load openxr_loader.dll → xrGetInstanceProcAddr → xrCreateInstance → xrGetSystem → xrGetD3D11GraphicsRequirementsKHR → xrCreateSession(D3D11 binding) → xrBeginSession → frame thread.
+
+After rewriting, build and deploy. Do not run the game until I say "done".
 
 WORKING CONVENTION: When I say "done" it means I've run the game. Read BepInEx/LogOutput.log immediately and analyse it. Delegate all builds to yourself (I don't run builds). Step-by-step, one thing at a time.

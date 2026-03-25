@@ -1,140 +1,134 @@
 # SoDVR — Technical Handover
 
 **Date**: 2026-03-25
-**Phase**: 5 (Stereo rendering) — swapchain texture path being fixed
+**Phase**: 5 rewrite — switching from VDXR internal patching to standard OpenXR loader
 
 ---
 
-## Current Status
+## Why We're Rewriting
 
-The stereo rendering loop is fully running:
-- `xrCreateSwapchain` returns rc=0, 3 images per eye (3648×3936 format=87/DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
-- `xrWaitFrame/BeginFrame/LocateViews/EndFrame` all working
-- VRCamera renders stereo frames and reports "Stereo frame #N"
-- **BLOCKER**: Swapchain image texture pointers are `0x0` (null) — copy src→dst does nothing, headset sees black
+The previous approach (git `1be2b0e`) patched VDXR's internal session-type guards directly in machine code:
+- 14 `PatchBytes` calls to NOP guard branches in xrCreateSession, xrCreateSwapchain, xrGetD3D11GraphicsRequirementsKHR, etc.
+- Direct calls into VDXR's internal compositor setup function (CSF) and initD3D11
+- Manual writes into the `OpenXrRuntime*` object (`robj`) to fake requirements
 
-The null textures are caused by SC-member taking the wrong branch at +0x242 (streaming/null-texture path instead of compositor/real-texture path).
+**Result**: Swapchains created (rc=0, 3 images), frame loop running, but swapchain image texture pointers were always null (0x0). The null path in SC-member traced back to `robj+0x990` (streaming pool) being unpopulated, which traced back to CSF's inner `ovr_Create()` wrapper being skipped when `robj+0x28 = 0x01`.
 
----
-
-## Root Cause Chain
-
-```
-xrCreateSwapchain
-  └─ SC-outer (wrapper, 3 guards patched: SC-jbe1/2, SC-jz)
-       └─ SC-member (VDXR's real implementation)
-            ├─ SC-member+0x225: CALL fn(robj, robj) → returns V in RAX (AL = 0x0F in streaming mode)
-            ├─ SC-member+0x240: SUB AL, 0x0F       → AL = 0 (since V == 0x0F)
-            ├─ SC-member+0x242: JNE +0x3A9         → NOT TAKEN (AL==0, so ZF=1)
-            │                                          (if AL≠0, JNE IS taken → compositor path)
-            ├─ [fall-through] XOR EAX,EAX          → RAX = 0
-            ├─ SC-member+0x267: CMP [robj+0x990],0  → robj+0x990 is always NULL
-            └─ → EBX = 6 → null texture pointers returned
-```
-
-**Why robj+0x990 is always NULL**: The compositor setup function (CSF, called at CS-member+0x1AA)
-checks `[robj+0x38] != 0` at CSF+0x42; since `robj+0x38` (compositor handle) is pre-set
-during `xrCreateInstance`, CSF always takes the JNE at CSF+0x47 to early return (+0x51A)
-without populating `robj+0x990`. We confirmed this by calling CSF directly — result=1 (success)
-but `robj+0x990` still 0 afterwards.
-
-**The fix**: Force the JNE at SC-member+0x242 to unconditional JMP → always take the compositor
-path at +0x3A9, which uses `robj+0x38` (confirmed non-null = 0x26CB4467200).
+**Root insight**: LCVR, CWVR, and UnityVRMod all use standard `openxr_loader.dll` P/Invoke on VDXR — no guard patching — and produce real D3D11 swapchain textures. The guard bypasses were solving a problem that likely didn't exist for the standard API path.
 
 ---
 
-## The Current Patch (SC-force-compositor)
+## Current State of the Codebase
 
-```
-SC-member+0x242:
-  Before: 0F 85 61 01 00 00  = JNE rel32(0x161) → target +0x3A9  [conditional]
-  After:  E9 62 01 00 00 90  = JMP rel32(0x162) → target +0x3A9  [unconditional] + NOP
+**OpenXRManager.cs** — still contains the old VDXR patching code. This file needs to be rewritten. Key code to **delete**:
+- `TryInitializeProvider` / `NopFnACall` — UnityOpenXR.dll setup, no longer needed
+- `TrySubsystemPath` — XRDisplaySubsystem path (always fails, IL2CPP stripped)
+- `TryUnitySessionPath` — dead end, session_InitializeSession returns false
+- `SetupDirect` — remove all `PatchBytes` and `ScanAndPatch*` calls; the VDXR guards don't fire on the standard loader path
+- `GetVDXRRuntimeObject`, `SetRuntimeGraphicsRequirements`, `CallInitD3D11Direct`, `CallCompositorSetupDirect` — all VDXR internal manipulation, delete
+- `PatchVtableDispatch`, `PatchInnerRequirementsCheck`, `PatchSecondCall`, `PatchCreateSessionContextBlock`, `ScanAndPatchMinus38`, `ScanAndPatchErrorCode`, `ScanAndPatchMinus38InDll` — patch infrastructure, delete
+- `GetRuntimeCreateSessionViaGpa`, `PatchRuntimeCreateSession`, `FindPeExport` — VDXR-specific, delete
+- `PatchSingleByte`, `PatchBytes`, `AllocNear`, `DumpFunctionBytes` — patch utilities, delete
+- `CallD3D11GraphicsRequirements` — replace with simple direct call
+- `EnumerateExtensions` — keep (useful diagnostic)
 
-  Note: E9 is 5 bytes (not 6 like 0F 85), so rel32 is 0x162 (not 0x161) to reach same target.
-```
+Key code to **keep** (already correct):
+- `CreateInstance` — works, uses standard XR_KHR_D3D11_enable extension
+- `XrGetSystem` — works
+- `GetFn` — works
+- `GetD3D11Device` — works (Texture2D.whiteTexture → GetNativeTexturePtr → vtable[3])
+- `GetAdapterLuid` — works (IDXGIDevice → GetAdapter → GetDesc)
+- `XrCreateSession` — fix only: change binding type from `0x3B9B3378` → `1000003000`
+- `XrBeginSession`, `PollEvents`, `PollEventsPublic` — keep as-is
+- `StartFrameThread`, `FrameThreadProc`, `FrameWait`, `FrameBegin`, `FrameEnd` — keep as-is
+- `StopFrameThread`, `FrameWaitPublic`, `FrameBeginPublic`, `FrameEndEmpty` — keep as-is
+- `SetupStereo`, `CreateSwapchain`, `PickSwapchainFormat`, `EnumSwapchainImages` — keep (remove ESI dump spam)
+- `AcquireSwapchainImage`, `WaitSwapchainImage`, `ReleaseSwapchainImage` — keep as-is
+- `LocateViews`, `ParseEyeView` — keep as-is
+- `FrameEndStereo`, `WriteProjectionView` — keep as-is
+- `D3D11CopyTexture` — keep as-is
+- `EyePose` struct — keep as-is
+- `ReadFloat`, `WriteFloat`, `LogActiveRuntime` — keep as-is
 
-**This patch was built and deployed but NOT yet run** as of this handover.
-
-Previous attempt failed because the offset was 0x243 instead of 0x242 (off by one):
-- log said `fn+0x243 = 0x85, expected 0x0F — skipping`
-- The byte 0x0F (JNE prefix) is at +0x242; 0x85 (second byte) is at +0x243
-
----
-
-## What to Check in the Log After Running
-
-1. `SC-force-compositor: patched` — patch applied successfully
-   OR `SC-force-compositor: fn+0x242 = XX, expected 0x0F — skipping` → need to investigate
-
-2. SC+0x230..+0x260 dump — verify instruction layout:
-   - Should see `0F 85 61 01 00 00` at bytes corresponding to +0x242 in the dump row
-   - Confirms JNE boundary before patching output is shown
-
-3. `copy: src=0x... dst=0x...` — dst should now be **non-zero** (real D3D11 texture pointers)
-
-4. `Stereo frame #N` continues — game still running
-
-5. Watch for any crash or xrEndFrame error after the patch lands
-
----
-
-## If SC-force-compositor Lands at Wrong Place
-
-The SC+0x230..+0x260 dump will show the actual instruction boundaries.
-Calculate the correct offset for `0F 85` in that region.
-
-Also check: does `0F 85 61 01 00 00` actually appear there, or is the rel32 different?
-The displacement `61 01 00 00` was inferred from the previous session's dump (which we no
-longer have). If it's wrong, the dump will show the true bytes and we can recalculate.
+**VRCamera.cs** — do not change.
+**Plugin.cs** — do not change.
 
 ---
 
-## If Patch Applies but dst Still 0x0
+## Rewrite Plan for OpenXRManager.cs
 
-The compositor path at SC-member+0x3A9 may need additional preconditions. From the dump
-already collected (SC+0x3A0..+0x480):
+### New `TryInitializeProvider`
+Only needs to:
+1. Load `openxr_loader.dll` → get `xrGetInstanceProcAddr`
+2. Store `_gpaAddr`, create `_gpa` delegate
+3. Return true
 
-```
-SC+0x3A0: EB 03 45 8B F2 85 DB 75 0A B8 E6 FF FF FF E9 37
-SC+0x3B0: 05 00 00 8B 56 34 41 B8 02 00 00 00 83 FA 06 45
-SC+0x3C0: 0F 45 C2 44 89 44 24 7C 4C 8B 4E 10 41 0F B6 C1
-...
-```
+Remove all UnityOpenXR.dll setup, XRSDKPreInit, NopFnACall.
 
-Key: at +0x3A5: `85 DB` = TEST EBX,EBX; `75 0A` = JNE if EBX≠0.
-If EBX==0 at entry, it falls to `B8 E6 FF FF FF` (MOV EAX,-26) and returns error.
-If EBX≠0, continues to +0x3B3 (real compositor texture allocation).
-
-**What is EBX at +0x242?** — Unknown. Need to check what SC-member stores in EBX before
-the JNE. If the compositor path always exits with error (EBX=0), need to understand what
-sets EBX to non-zero in normal VDXR flow (non-streaming mode).
-
----
-
-## What robj Looks Like (confirmed from logs)
-
-```
-robj+0x038 = 0x26CB4467200  ← compositor handle (non-null, key for compositor path)
-robj+0x938 = 0x22CC         ← some flags
-robj+0x940 = <D3D11 device ptr>
-robj+0x948 = <D3D11 context ptr>
-robj+0x990 = 0x0            ← always null (CSF short-circuits)
-robj+0xDB0 = <ptr>
-robj+0xDF0 = 0x2
-robj+0xE38 = 0xFFFFFFFF
-robj+0xF28 = <ptr>
-```
-
----
-
-## Pre-Run Setup (in Plugin.cs / OpenXRManager.cs)
-
-Before SC-member runs (called each xrCreateSwapchain), we ensure:
+### New `CheckAndStart`
+Remove Path A (TrySubsystemPath) entirely. Remove the 60-frame retry gate. Just:
 ```csharp
-SetRuntimeGraphicsRequirements(dev);   // writes graphicsReqQueried=1 + LUID to robj
-CallInitD3D11Direct(dev);              // stores D3D11 device/context at robj+0x940/948
-CallCompositorSetupDirect();           // calls CS-member+0x1AA (CSF) — returns 1, noop
+if (!_directReady) SetupDirect();
+if (!_directReady) return false;
+return TryDirectPath();
 ```
+
+### New `SetupDirect`
+```
+_gpa = delegate for _gpaAddr
+EnumerateExtensions()               // diagnostic
+CreateInstance()                    // xrCreateInstance
+GetFn(all needed functions)
+XrGetSystem()
+_directReady = true
+```
+No patches. No robj. No vtable inspection.
+
+### New `TryDirectPath`
+```
+GetD3D11Device() — wait until Unity has a D3D11 device
+CallD3D11GraphicsRequirements()     // xrGetD3D11GraphicsRequirementsKHR(_instance, _systemId, &reqs)
+XrCreateSession(device)             // XrGraphicsBindingD3D11KHR{type=1000003000, device}
+PollEvents()
+XrBeginSession()
+StartFrameThread()
+IsRunning = true
+```
+
+### New `CallD3D11GraphicsRequirements`
+Simple single call:
+```csharp
+Marshal.WriteInt32(p, 0, 1000003002); // XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR
+int rc = gfxReqs(_instance, _systemId, p);
+```
+No candidate loop, no counter logging.
+
+---
+
+## Delegates to Remove
+- `XrNegotiateLoaderRuntimeDelegate`
+- `VDXRSingletonDelegate`
+- `InitD3D11Delegate`
+- `CompositorSetupDelegate`
+- `XRSDKPreInitDelegate`, `SetStage1Delegate`, `GetProcAddrPtrDelegate`, `UnitySessionBoolDelegate`
+
+## Fields to Remove
+- `_hUnityOpenXR`, `_pfnCreateSessionDirect`, `_directReady` (keep), `_gfxReqsDone` (keep)
+- `_robjWriteDone`, `_robjDumped`, `_subsystemRetries`, `_unitySessTried`
+- `_postSessionFrames` (was used for retry gate, no longer needed)
+
+---
+
+## Expected Outcomes After Rewrite
+
+With standard loader and proper `XrGraphicsBindingD3D11KHR`:
+- `xrGetD3D11GraphicsRequirementsKHR` → rc=0 (no guard bypass needed)
+- `xrCreateSession` → rc=0, `_session` non-zero
+- `xrCreateSwapchain` → rc=0, swapchain images have real `ID3D11Texture2D*` pointers (non-null)
+- D3D11CopyTexture → renders Unity eye view into headset
+- Headset should show game image
+
+If xrGetD3D11GraphicsRequirementsKHR still fails (rc≠0), call xrCreateSession anyway — some runtimes enforce the call as merely advisory.
 
 ---
 
@@ -142,9 +136,9 @@ CallCompositorSetupDirect();           // calls CS-member+0x1AA (CSF) — return
 
 | File | Purpose |
 |------|---------|
-| `VRMod/SoDVR/OpenXRManager.cs` | All patching, VDXR direct calls, stereo frame API |
-| `VRMod/SoDVR/VR/VRCamera.cs` | Stereo render loop: cameras, RenderTexture, CopyEye |
-| `VRMod/SoDVR/Plugin.cs` | BepInEx entry point, scene load hook |
+| `VRMod/SoDVR/OpenXRManager.cs` | **Needs rewrite** (see above) |
+| `VRMod/SoDVR/VR/VRCamera.cs` | Stereo render loop — do not change |
+| `VRMod/SoDVR/Plugin.cs` | BepInEx entry point — do not change |
 | `BepInEx/plugins/SoDVR.dll` | Deployed plugin |
 | `BepInEx/LogOutput.log` | Runtime log |
 
@@ -152,22 +146,8 @@ CallCompositorSetupDirect();           // calls CS-member+0x1AA (CSF) — return
 
 ## Phase Roadmap
 
-- [x] Phase 1–4: OpenXR init, session, swapchain creation (all rc=0)
-- [ ] **Phase 5 (current)**: Real D3D11 textures in swapchain images → see image in headset
+- [x] Phase 1–4: OpenXR init, session, swapchain — all rc=0 (VDXR patch approach)
+- [ ] **Phase 5 (current)**: Rewrite OpenXRManager.cs → standard loader → real swapchain textures → image in headset
 - [ ] Phase 6: Input — head tracking → game camera, controller → movement/interaction
 - [ ] Phase 7: UI world-space conversion + laser pointer
 - [ ] Phase 8–11: Full input mapping, game-specific interactions, comfort, polish
-
----
-
-## Key Terminology
-
-| Term | Meaning |
-|------|---------|
-| `robj` | VDXR's `OpenXrRuntime*` internal object |
-| SC-member | vtable slot 24 inner function = real xrCreateSwapchain implementation |
-| CS-member | vtable slot 12 inner function = real xrCreateSession implementation |
-| CSF | Compositor Setup Function, called from CS-member+0x1AA |
-| GR-member | vtable slot 60 = xrGetD3D11GraphicsRequirementsKHR inner |
-| `PatchBytes(fn, off, expected, patch, name)` | Helper: VirtualProtect RW, verify `expected` at `fn+off`, write `patch`, log result |
-| EBX=6 | Code path inside SC-member that returns null texture descriptors |
