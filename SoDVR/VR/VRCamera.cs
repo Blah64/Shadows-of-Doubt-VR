@@ -37,6 +37,7 @@ public class VRCamera : MonoBehaviour
     private Camera        _rightCam = null!;
     private RenderTexture _leftRT   = null!;
     private RenderTexture _rightRT  = null!;
+    private Transform     _gameCam  = null!; // original game camera transform; we follow its world position
 
     // Per-frame state
     private long  _displayTime;
@@ -115,6 +116,9 @@ public class VRCamera : MonoBehaviour
 
         // ── Normal stereo frame loop ───────────────────────────────────────────
 
+        // Follow the game character's camera position each frame.
+        if (_gameCam != null) transform.position = _gameCam.position;
+
         _displayTime = OpenXRManager.FrameWaitPublic(out int waitRc);
         if (waitRc < 0)
         {
@@ -173,16 +177,16 @@ public class VRCamera : MonoBehaviour
         _rightRT.Create();
         SetupEyeCam(_rightCam, _rightRT);
 
-        // Disable existing main camera — keep its GameObject alive for game code
-        // that does Camera.main checks; reparent under CameraOffset.
+        // Disable existing main camera and track its transform so VROrigin follows the character.
+        // Do NOT reparent — keeping it at its world position so game raycasts stay correct.
         var mc = Camera.main;
         if (mc != null && mc != _leftCam && mc != _rightCam)
         {
             Log.LogInfo($"[VRCamera] Disabling original camera: {mc.gameObject.name}");
+            _gameCam = mc.transform;
             mc.enabled = false;
-            mc.transform.SetParent(_cameraOffset, false);
-            mc.transform.localPosition = Vector3.zero;
-            mc.transform.localRotation = Quaternion.identity;
+            // Teleport VROrigin to the game camera's current world position.
+            transform.position = _gameCam.position;
         }
 
         Log.LogInfo($"[VRCamera] Rig built: {w}x{h} ARGB32");

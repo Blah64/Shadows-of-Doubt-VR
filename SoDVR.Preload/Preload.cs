@@ -37,27 +37,22 @@ public class Preload : BasePatcher
 
     private void CreateSubsystemManifest()
     {
-        var subsystemDir = Path.Combine(GameDataDir, "UnitySubsystems", "UnityOpenXR");
-        Directory.CreateDirectory(subsystemDir);
-
-        var manifestPath = Path.Combine(subsystemDir, "UnitySubsystemsManifest.json");
+        // We deliberately do NOT create the UnityOpenXR subsystem manifest.
+        // If it exists (from a previous install), delete it.
+        // Rationale: loading UnityOpenXR.dll causes it to register itself as an OpenXR API
+        // layer, inserting its own xrCreateSession which rejects our GfxReqs workaround.
+        // Without the manifest Unity never activates UnityOpenXR, so it stays out of the chain.
+        var manifestPath = Path.Combine(
+            GameDataDir, "UnitySubsystems", "UnityOpenXR", "UnitySubsystemsManifest.json");
         if (File.Exists(manifestPath))
         {
-            Log.LogInfo("UnitySubsystems manifest already exists, skipping.");
-            return;
+            File.Delete(manifestPath);
+            Log.LogInfo("Deleted UnitySubsystems manifest (keeping UnityOpenXR out of OpenXR chain).");
         }
-
-        const string manifest =
-            "{\n" +
-            "    \"name\": \"OpenXR XR Plugin\",\n" +
-            "    \"version\": \"1.7.0\",\n" +
-            "    \"libraryName\": \"UnityOpenXR\",\n" +
-            "    \"displays\": [ { \"id\": \"OpenXR Display\" } ],\n" +
-            "    \"inputs\": [ { \"id\": \"OpenXR Input\" } ]\n" +
-            "}";
-
-        File.WriteAllText(manifestPath, manifest);
-        Log.LogInfo($"Created subsystem manifest at: {manifestPath}");
+        else
+        {
+            Log.LogInfo("UnitySubsystems manifest not present — good.");
+        }
     }
 
     private void CopyNativePlugins()
@@ -71,26 +66,25 @@ public class Preload : BasePatcher
             return;
         }
 
-        foreach (var nativeDll in new[] { "UnityOpenXR.dll", "openxr_loader.dll" })
+        // Deploy the standard Khronos openxr_loader.dll (always overwrite Unity's modified version).
+        var loaderSrc = Path.Combine(runtimeDepsDir, "openxr_loader.dll");
+        var loaderDst = Path.Combine(pluginsDir, "openxr_loader.dll");
+        if (File.Exists(loaderSrc))
         {
-            var src = Path.Combine(runtimeDepsDir, nativeDll);
-            var dst = Path.Combine(pluginsDir, nativeDll);
+            File.Copy(loaderSrc, loaderDst, overwrite: true);
+            Log.LogInfo("Deployed openxr_loader.dll (standard Khronos loader).");
+        }
+        else
+            Log.LogWarning("openxr_loader.dll not found in RuntimeDeps — VR will not work.");
 
-            if (!File.Exists(src))
-            {
-                Log.LogWarning($"{nativeDll} not found in RuntimeDeps — VR will not work without it.");
-                continue;
-            }
-
-            if (!File.Exists(dst))
-            {
-                File.Copy(src, dst);
-                Log.LogInfo($"Copied {nativeDll} to game plugins.");
-            }
-            else
-            {
-                Log.LogInfo($"{nativeDll} already present in game plugins.");
-            }
+        // Remove UnityOpenXR.dll from the game plugins directory.
+        // We do not use Unity's OpenXR subsystem; having this DLL present causes it to
+        // register itself as an OpenXR API layer and intercept xrCreateSession.
+        var unityXR = Path.Combine(pluginsDir, "UnityOpenXR.dll");
+        if (File.Exists(unityXR))
+        {
+            File.Delete(unityXR);
+            Log.LogInfo("Removed UnityOpenXR.dll (not needed; was interfering with OpenXR chain).");
         }
     }
 }
