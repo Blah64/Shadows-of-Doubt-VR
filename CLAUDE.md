@@ -17,7 +17,7 @@ VRMod/
   SoDVR/
     Plugin.cs              — BepInEx entry; creates VROrigin GameObject on scene load
     OpenXRManager.cs       — Standard OpenXR init (xrCreateInstance → session → swapchain), stereo frame loop
-    VR/VRCamera.cs         — Drives stereo rendering: xrWaitFrame/BeginFrame/Render/EndFrame
+    VR/VRCamera.cs         — Drives stereo rendering: xrWaitFrame/BeginFrame/Render/EndFrame + UI canvas management
   SoDVR.Preload/           — Preload helper (leave as-is)
   RuntimeDeps/             — DLL references for build (not deployed)
   SoDVR.csproj
@@ -85,7 +85,38 @@ It must be disabled before `xrCreateInstance` by setting its `disable_environmen
 See `DisableUnityOpenXRLayer()` in OpenXRManager.cs — reads all layer JSONs from registry
 and sets their `disable_environment` variables.
 
+## CRITICAL: IL2CPP interop pitfalls (learned in Phase 6)
+- `GetComponentInParent<Button>()` always returns null in IL2CPP context — do not use for Button detection
+- `Graphic.color` (vertex tint) and `material.color` (`_Color` shader property) are **separate** in HDRP UI
+  - Setting `mat.color.a` alone does NOT make a UI element transparent — must also set `g.color.a`
+  - `g.color = ...` marks the canvas dirty (`SetVertexDirty`) → avoid calling every frame or you cause continuous canvas mesh rebuilds and lag
+- `Resources.FindObjectsOfTypeAll<Canvas>()` is more reliable than `FindObjectsOfType<Canvas>()` in IL2CPP
+- `renderQueue` values (3000–3009) do NOT override HDRP's spherical-distance transparent sort;
+  HDRP ignores fine-grained queue ordering within the Transparent range
+
+## Phase 6 UI canvas status (PARTIAL — canvases visible, buttons dark)
+All screen-space canvases are converted to WorldSpace each scan cycle.
+- Canvases placed once in front of head on first valid pose; stay fixed (`_positionedCanvases` HashSet)
+- **Home key** re-centres all canvases
+- FadeOverlay suppressed (rate-limited every 4 frames to avoid canvas rebuild lag)
+- Button brightness still **unresolved**: `mat.color` boost (3×) doesn't help because HDRP UI composites via vertex alpha (`g.color`); buttons are visible but dark
+- Background transparency **unresolved**: `mat.color.a = 0.25f` is ineffective for same reason
+- No controller pointer / raycaster yet
+
+## Known canvas names (from LogOutput.log, 2026-03-26)
+| Canvas | Elements | Notes |
+|--------|----------|-------|
+| `Canvas` | 4 | Startup loading splash (800×600) |
+| `MenuCanvas` | 2231 | Main menu; `[0]'Background'`, `[2230]'FadeOverlay'` |
+| `GameCanvas` | 327 | In-game HUD; `[1]'Fade'` suppressed |
+| `OverlayCanvas` | 42 | sortOrder=4, 1920×1080 |
+| `TooltipCanvas` | 82 | sortOrder=3, 1920×1080 |
+| `PrototypeBuilderCanvas` | 144 | City builder, sortOrder=2 |
+| `VirtualCursorCanvas & EventSystem` | 181 | Virtual keyboard + cursor, sortOrder=5 |
+| `ActionPanelCanvas`, `DialogCanvas`, `BioDisplayCanvas`, `MinimapCanvas` | various | In-game panels |
+
 ## History
 - git `1be2b0e` — full VDXR-internal patching approach (archived checkpoint, do not rebase)
 - git `346a6df` — **Phase 5 complete**: standard loader working, stereo image in headset
-- Current work — Phase 6: camera positioning, head tracking → game world
+- **Phase 6 (current)**: camera positioning ✓, head tracking ✓, UI canvases visible in VR ✓, button brightness unresolved
+- **Phase 7 (next)**: controller input (OpenXR action sets, laser pointer, GraphicRaycaster clicks)

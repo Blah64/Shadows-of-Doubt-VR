@@ -1,85 +1,161 @@
 # SoDVR — Technical Handover
 
-**Date**: 2026-03-25
-**Phase**: 6 — Camera positioning, head tracking → game world
+**Date**: 2026-03-26
+**Phase**: 7 — Controller input (next work item)
 
 ---
 
-## What Works (Phase 5 Complete — git `346a6df`)
+## What Works (Fully Operational)
 
-The full OpenXR pipeline is operational:
-
-- `xrCreateInstance` → rc=0
-- `xrGetSystem` → rc=0, systemId=0x1
-- `xrGetD3D11GraphicsRequirementsKHR` → rc=0, LUID populated
-- `xrCreateSession` → rc=0, session=0x1
-- `xrBeginSession` → rc=0
-- `xrCreateSwapchain` × 2 → rc=0, 3648×3936, 3 images each
-- `xrEnumerateSwapchainImages` → rc=0, real `ID3D11Texture2D*` pointers (non-null)
-- `D3D11CopyResource` → working, frames delivered to headset
-- Head tracking → stereo image tracks with head movement ✓
+### Phase 5 — Stereo rendering (git `346a6df`)
+- `xrCreateInstance` → `xrGetSystem` → `xrGetD3D11GraphicsRequirementsKHR` → `xrCreateSession` → `xrBeginSession` → `xrCreateSwapchain ×2` → `xrEnumerateSwapchainImages` — all rc=0
+- Swapchain: 3648×3936, DXGI_FORMAT_R8G8B8A8_UNORM (format 28), 3 images per eye
+- `D3D11CopyResource` delivers frames to headset each Unity frame
+- Head tracking (`xrLocateViews`) drives left/right eye poses ✓
 - VROrigin follows game camera world position ✓
+- HDRP eye cameras: AA=None, custom FrameSettings (SSAO/SSR/Volumetrics/MotionBlur etc. off) ✓
+
+### Phase 6 — UI canvases visible in VR (current code)
+- All screen-space (`ScreenSpaceOverlay` / `ScreenSpaceCamera`) root canvases automatically converted to `WorldSpace` every 30 frames
+- Each canvas placed once in front of head on first valid tracked pose; stays fixed so player can look around it
+- **Home key** clears placement set — all canvases re-centre on next LateUpdate
+- FadeOverlay / Fade graphics suppressed (rate-limited every 4 frames)
+- Canvases visible in headset: main menu, HUD, tooltips, dialogs, minimap etc.
 
 ---
 
-## Critical VDXR Discoveries
+## Critical VDXR Discoveries (do not change these)
 
-### 1. Type constant offset (+0x5DC0)
-VDXR uses non-spec type constants for all D3D11 extension structs.
-The OpenXR loader passes through what the app writes, so we must write VDXR's values:
-
-| Struct | Spec | VDXR |
+### Type constant offset (+0x5DC0)
+| Struct | Spec | **VDXR value** |
 |---|---|---|
-| XrGraphicsBindingD3D11KHR | 1000003000 = 0x3B9AD5B8 | 0x3B9B3378 |
-| XrSwapchainImageD3D11KHR | 1000003001 = 0x3B9AD5B9 | 0x3B9B3379 |
-| XrGraphicsRequirementsD3D11KHR | 1000003002 = 0x3B9AD5BA | 0x3B9B337A |
+| XrGraphicsBindingD3D11KHR | 1000003000 | `unchecked((int)0x3B9B3378)` |
+| XrSwapchainImageD3D11KHR | 1000003001 | `unchecked((int)0x3B9B3379)` |
+| XrGraphicsRequirementsD3D11KHR | 1000003002 | `unchecked((int)0x3B9B337A)` |
 
-Discovered via Python + capstone disassembly of VDXR's vtable implementations:
-- `gfxReqs_impl` at +0x014: `cmp dword ptr [r9], 0x3b9b337a` — type check, returns -1 if mismatch
-- `createSession_impl` loop: iterates `next` chain checking for `0x3B9B3378`; if not found and gfxReqs flag unset → returns -38
+Base types (SESSION_CREATE_INFO=8 etc.) use spec values unchanged.
 
-### 2. openxr-oculus-compatibility API layer
-Virtual Desktop registers `openxr-oculus-compatibility.dll` as an implicit OpenXR API layer.
-It intercepts `xrCreateSession` and enforces its own graphics requirements check → -38.
-Fix: before `xrCreateInstance`, read the layer JSON and set `DISABLE_XR_APILAYER_VIRTUALDESKTOP_OCULUS_COMPATIBILITY=1`.
-See `DisableUnityOpenXRLayer()` in OpenXRManager.cs.
+### openxr-oculus-compatibility layer
+Must be disabled before `xrCreateInstance` — see `DisableUnityOpenXRLayer()` in `OpenXRManager.cs`.
 
-### 3. Swapchain format must match Unity RenderTexture
-- Unity `RenderTextureFormat.ARGB32` → D3D11 `DXGI_FORMAT_R8G8B8A8_UNORM` = format **28**
-- `CopyResource` silently fails if src/dst formats differ
-- VDXR supports format 28; use `_preferredFormats = { 28, 29, 87, 91 }`
+### Swapchain format
+`RenderTextureFormat.ARGB32` → format 28 (`DXGI_FORMAT_R8G8B8A8_UNORM`). `_preferredFormats = {28,29,87,91}`.
 
 ---
 
-## Current State (Phase 6 start)
-
-### VRCamera.cs
-- `_gameCam` field stores the original game camera's transform
-- `BuildCameraRig`: disables mc, saves `_gameCam = mc.transform`, teleports VROrigin to mc's world position
-- `Update()`: `if (_gameCam != null) transform.position = _gameCam.position;` — follows character each frame
-- Eye cameras positioned at VROrigin + HMD pose offset (from `xrLocateViews`)
-- Head tracking works: rotation/position applied via `ApplyCameraPose`
-
-### What the headset shows
-- Stereo image with correct head tracking ✓
-- Positioned at the game character's camera world position ✓
-- Game scene renders from that position ✓
+## Known VDXR-Supported Extensions (from log, 2026-03-26)
+Full list confirmed at runtime:
+```
+XR_KHR_D3D11_enable          (in use)
+XR_EXT_hand_tracking          ← hand tracking available
+XR_EXT_palm_pose
+XR_EXT_active_action_set_priority
+XR_FB_display_refresh_rate
+XR_KHR_composition_layer_depth
+XR_KHR_composition_layer_cylinder
+XR_KHR_visibility_mask
+XR_OCULUS_audio_device_guid
+```
+To use `XR_EXT_hand_tracking`, add it to the extensions array in `xrCreateInstance` (in `OpenXRManager.cs`).
 
 ---
 
-## Phase 6 Work Remaining
+## IL2CPP Interop Pitfalls (learned the hard way)
 
-### Camera / rendering
-- [ ] The game uses HDRP — verify eye cameras render game geometry correctly (may need `HDAdditionalCameraData`)
-- [ ] Verify colors/gamma look correct (HDRP tonemapping, linear vs gamma)
-- [ ] The game camera's **yaw** is not transferred to VROrigin — the player always faces "world north" regardless of game character orientation. May need to sync VROrigin.rotation.y from the game camera.
+| Pitfall | Detail |
+|---------|--------|
+| `GetComponentInParent<Button>()` | Always returns null in IL2CPP — never use for Button detection |
+| `Graphic.color` vs `mat.color` | Separate in HDRP UI. `mat.color.a` alone does not make UI transparent. Must set `g.color.a`. |
+| `g.color = ...` per-frame | Calls `SetVertexDirty()` → canvas mesh rebuild → serious lag at 60 Hz. Rate-limit or avoid. |
+| `renderQueue` in HDRP Transparent | HDRP ignores fine-grained queue values within Transparent range; always sorts by spherical distance. |
+| `FindObjectsOfType<Canvas>()` | Less reliable in IL2CPP. Use `Resources.FindObjectsOfTypeAll<Canvas>()`. |
 
-### Input — Phase 6
-- [ ] Head rotation → game character look direction (send mouse/look input to match HMD yaw)
-- [ ] Controller bindings — movement (walk/run), interact, jump, menu
-- [ ] OpenXR action sets: `xrCreateActionSet`, `xrCreateAction`, `xrSuggestInteractionProfileBindings`, `xrAttachSessionActionSets`
-- [ ] `xrLocateSpace` for hand/controller pose
-- [ ] Map controller input to game's IL2CPP input system
+---
+
+## Unresolved UI Issues (left for future work)
+
+### Button visibility / brightness
+- **Root cause**: HDRP composites UI colour as `vertex-color (g.color) × material._Color`. Our `mat.color` boost (`×3`) is ineffective unless `g.color` is also boosted. But setting `g.color` every frame causes canvas rebuild lag; setting it once at conversion time works but must avoid the game overriding it.
+- **Correct fix**: At `ForceUIZTestAlways` time, for non-background Graphic elements, also set `g.color = new Color(g.color.r * UIColorBoost, g.color.g * UIColorBoost, g.color.b * UIColorBoost, g.color.a)` — a one-time vertex colour boost at scan time only.
+
+### Background transparency
+- **Root cause**: Same issue — `mat.color.a = 0.25f` does nothing without `g.color.a = 0.25f`.
+- **Correct fix**: At scan time, for elements named "background*", also set `g.color = new Color(g.color.r, g.color.g, g.color.b, UIBackgroundAlpha)`.
+
+Both fixes are one-shot (called once per canvas at `ConvertCanvasToWorldSpace` time), so they avoid per-frame dirty marks.
+
+---
+
+## Phase 7 — Controller Input (next)
+
+### Goal
+Laser-pointer style interaction: controller pose tracked via OpenXR, ray projected into the scene, intersection with WorldSpace canvases detected by Unity's `GraphicRaycaster`, trigger = click.
+
+### Step 1 — Add controller extension to xrCreateInstance
+In `OpenXRManager.cs`, add to the extensions array:
+```csharp
+// Already have: "XR_KHR_D3D11_enable"
+// No extra extension needed for standard controller input — action sets are core OpenXR 1.0
+```
+
+### Step 2 — OpenXR action set setup (after xrCreateSession, before xrBeginSession)
+```
+xrCreateActionSet(instance, {name="gameplay", localizedName="Gameplay", priority=0}) → actionSet
+xrCreateAction(actionSet, {name="hand_pose",  type=XR_ACTION_TYPE_POSE_INPUT,    subactionPaths=["/user/hand/left","/user/hand/right"]}) → poseAction
+xrCreateAction(actionSet, {name="trigger",    type=XR_ACTION_TYPE_BOOLEAN_INPUT,  subactionPaths=["/user/hand/left","/user/hand/right"]}) → triggerAction
+xrCreateAction(actionSet, {name="thumbstick", type=XR_ACTION_TYPE_VECTOR2F_INPUT, subactionPaths=["/user/hand/left","/user/hand/right"]}) → thumbstickAction
+
+xrSuggestInteractionProfileBindings(instance, {
+  profile: "/interaction_profiles/oculus/touch_controller",   ← Samsung Galaxy XR uses this via VDXR
+  bindings: [
+    { poseAction,      "/user/hand/right/input/aim/pose" },
+    { poseAction,      "/user/hand/left/input/aim/pose"  },
+    { triggerAction,   "/user/hand/right/input/trigger/value" },
+    { triggerAction,   "/user/hand/left/input/trigger/value"  },
+    { thumbstickAction,"/user/hand/right/input/thumbstick"    },
+    { thumbstickAction,"/user/hand/left/input/thumbstick"     },
+  ]
+})
+
+xrCreateActionSpace(session, {action=poseAction, subactionPath="/user/hand/right"}) → rightAimSpace
+xrCreateActionSpace(session, {action=poseAction, subactionPath="/user/hand/left"})  → leftAimSpace
+
+xrAttachSessionActionSets(session, {actionSets=[actionSet]})
+```
+
+### Step 3 — Per frame (in Update / LateUpdate)
+```
+xrSyncActions(session, {activeSets=[{actionSet, XR_NULL_PATH}]})
+xrLocateSpace(rightAimSpace, referenceSpace, displayTime) → rightPose   // controller world pose
+xrGetActionStateBoolean(session, {action=triggerAction, subactionPath="/user/hand/right"}) → triggerState
+xrGetActionStateVector2f(session, {action=thumbstickAction, ...}) → stickState
+```
+
+### Step 4 — Laser pointer in VRCamera.cs
+- Create a `GameObject("RightController")` under VROrigin; add `LineRenderer` for the laser beam
+- Each frame: apply `rightPose` to controller transform (same coord flip as ApplyCameraPose)
+- Cast a `Physics.Raycast` from controller position along controller forward
+- Also cast against WorldSpace canvas: use `GraphicRaycaster` on each managed canvas
+
+### Step 5 — Canvas click via Unity event system
+```csharp
+// For each managed canvas, ensure it has a GraphicRaycaster with worldCamera set to _leftCam
+var gr = canvas.GetComponent<GraphicRaycaster>() ?? canvas.AddComponent<GraphicRaycaster>();
+gr.blockingMask = 0;
+
+// On trigger press, send pointer event:
+var ped = new PointerEventData(EventSystem.current);
+ped.position = _leftCam.WorldToScreenPoint(hitPoint);
+var results = new List<RaycastResult>();
+gr.Raycast(ped, results);
+if (results.Count > 0)
+    ExecuteEvents.Execute(results[0].gameObject, ped, ExecuteEvents.pointerClickHandler);
+```
+
+### Interaction profile note
+Samsung Galaxy XR paired through Virtual Desktop presents as an Oculus Touch controller to VDXR.
+Profile path: `/interaction_profiles/oculus/touch_controller`
+Aim pose gives pointing direction suitable for laser pointer (vs grip pose for held objects).
 
 ---
 
@@ -87,18 +163,22 @@ See `DisableUnityOpenXRLayer()` in OpenXRManager.cs.
 
 | File | Purpose |
 |------|---------|
-| `VRMod/SoDVR/OpenXRManager.cs` | OpenXR init, session, swapchain, frame loop |
-| `VRMod/SoDVR/VR/VRCamera.cs` | Stereo render loop, camera rig, position tracking |
+| `VRMod/SoDVR/OpenXRManager.cs` | OpenXR init, session, swapchain, frame loop — add action sets here |
+| `VRMod/SoDVR/VR/VRCamera.cs` | Stereo render loop, UI canvas management — add controller pose + laser here |
 | `VRMod/SoDVR/Plugin.cs` | BepInEx entry point — do not change |
 | `BepInEx/plugins/SoDVR.dll` | Deployed plugin |
 | `BepInEx/LogOutput.log` | Runtime log |
+| `VRMod/CLAUDE.md` | Claude project instructions (always loaded) |
+| `VRMod/HANDOVER.md` | This file |
 
 ---
 
 ## Phase Roadmap
 
-- [x] Phase 1–4: OpenXR init, session, swapchain — all rc=0 (VDXR patch approach, archived)
-- [x] **Phase 5**: Rewrite OpenXRManager.cs → standard loader → real swapchain textures → stereo image in headset
-- [ ] **Phase 6 (current)**: Camera positioning ✓ (partial), head tracking → game yaw, controller input
-- [ ] Phase 7: UI world-space conversion + laser pointer
-- [ ] Phase 8–11: Full input mapping, game-specific interactions, comfort, polish
+- [x] Phase 1–4: OpenXR init, session, swapchain (VDXR patch approach, archived `1be2b0e`)
+- [x] **Phase 5**: Standard loader → real swapchain textures → stereo image in headset (`346a6df`)
+- [x] **Phase 6**: Camera positioning, head tracking, UI canvases visible in VR
+- [ ] **Phase 7 (current)**: Controller input — laser pointer, trigger = click on canvas buttons
+- [ ] Phase 8: Movement (thumbstick → character move/rotate), jump, interact bindings
+- [ ] Phase 9: UI brightness fix (one-shot `g.color` boost at scan time), comfort options
+- [ ] Phase 10: Polish, performance tuning, comfort (vignette, snap-turn)

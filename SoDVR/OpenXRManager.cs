@@ -46,6 +46,18 @@ public static class OpenXRManager
     private static IntPtr _pfnCreateSwapchain, _pfnEnumSwapchainImages, _pfnEnumSwapchainFormats;
     private static IntPtr _pfnAcquireSwapchainImage, _pfnWaitSwapchainImage, _pfnReleaseSwapchainImage;
     private static IntPtr _pfnLocateViews;
+
+    // Controller input — action sets (Phase 7)
+    private static IntPtr _pfnCreateActionSet, _pfnCreateAction, _pfnStringToPath;
+    private static IntPtr _pfnSuggestInteractionProfileBindings;
+    private static IntPtr _pfnCreateActionSpace, _pfnAttachSessionActionSets;
+    private static IntPtr _pfnSyncActions, _pfnLocateSpace, _pfnGetActionStateBoolean;
+    private static ulong  _actionSet, _poseAction, _triggerAction;
+    private static ulong  _rightAimSpace, _leftAimSpace;
+    private static ulong  _rightHandPath, _leftHandPath;
+    public  static bool   ActionSetsReady { get; private set; }
+    private static int    _poseLogCount;
+    private static int    _syncLogCount;
     public  static ulong   ReferenceSpace        { get; private set; }
     public  static ulong   LeftSwapchain         { get; private set; }
     public  static ulong   RightSwapchain        { get; private set; }
@@ -123,6 +135,25 @@ public static class OpenXRManager
     private delegate int XrLocateViewsDelegate(ulong session, IntPtr viewLocateInfo, IntPtr viewState, uint viewCap, out uint viewCount, IntPtr views);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int XrEnumSwapchainFormatsDelegate(ulong session, uint cap, out uint count, IntPtr formats);
+    // Controller input — action sets (Phase 7)
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrCreateActionSetDelegate(ulong instance, IntPtr createInfo, out ulong actionSet);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrCreateActionDelegate(ulong actionSet, IntPtr createInfo, out ulong action);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrStringToPathDelegate(ulong instance, [MarshalAs(UnmanagedType.LPStr)] string pathString, out ulong path);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrSuggestInteractionProfileBindingsDelegate(ulong instance, IntPtr suggestedBindings);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrCreateActionSpaceDelegate(ulong session, IntPtr createInfo, out ulong space);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrAttachSessionActionSetsDelegate(ulong session, IntPtr attachInfo);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrSyncActionsDelegate(ulong session, IntPtr syncInfo);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrLocateSpaceDelegate(ulong space, ulong baseSpace, long time, IntPtr location);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrGetActionStateBooleanDelegate(ulong session, IntPtr getInfo, IntPtr state);
     // D3D11 vtable helpers
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void D3D11GetImmediateContextDelegate(IntPtr device, out IntPtr context);
@@ -375,6 +406,15 @@ public static class OpenXRManager
             GetFn("xrWaitSwapchainImage",              out _pfnWaitSwapchainImage);
             GetFn("xrReleaseSwapchainImage",           out _pfnReleaseSwapchainImage);
             GetFn("xrLocateViews",                     out _pfnLocateViews);
+            GetFn("xrCreateActionSet",                   out _pfnCreateActionSet);
+            GetFn("xrCreateAction",                      out _pfnCreateAction);
+            GetFn("xrStringToPath",                      out _pfnStringToPath);
+            GetFn("xrSuggestInteractionProfileBindings", out _pfnSuggestInteractionProfileBindings);
+            GetFn("xrCreateActionSpace",                 out _pfnCreateActionSpace);
+            GetFn("xrAttachSessionActionSets",           out _pfnAttachSessionActionSets);
+            GetFn("xrSyncActions",                       out _pfnSyncActions);
+            GetFn("xrLocateSpace",                       out _pfnLocateSpace);
+            GetFn("xrGetActionStateBoolean",             out _pfnGetActionStateBoolean);
 
             // Log which DLL owns each function pointer — reveals if UnityOpenXR is in the chain.
             LogFnOwner("xrGetSystem",      _pfnGetSystem);
@@ -385,6 +425,10 @@ public static class OpenXRManager
             rc = XrGetSystem();
             if (rc != 0 || _systemId == 0) { Log.LogError($"  xrGetSystem rc={rc}"); return; }
             Log.LogInfo($"  xrSystemId=0x{_systemId:X}");
+
+            // Instance-level action setup must happen before xrCreateSession on VDXR.
+            // Only creates the action set, actions, and suggests bindings — no session needed.
+            SetupActionSetsInstance();
 
             _directReady = true;
         }
@@ -431,6 +475,7 @@ public static class OpenXRManager
             Log.LogInfo($"  xrSession=0x{_session:X}");
 
             PollEvents();
+            SetupActionSetsSession(); // creates action spaces + attaches action sets; must precede xrBeginSession
 
             int rcBegin = XrBeginSession();
             Log.LogInfo($"  xrBeginSession rc={rcBegin}");
@@ -1252,6 +1297,332 @@ public static class OpenXRManager
         catch (Exception ex) { Log.LogWarning($"  D3D11CopyTexture: {ex.Message}"); }
     }
 
+    // ── Phase 7: action set setup ─────────────────────────────────────────────
+
+    private static void WriteAsciiString(IntPtr p, int offset, string s)
+    {
+        byte[] b = System.Text.Encoding.ASCII.GetBytes(s);
+        for (int i = 0; i < b.Length; i++) Marshal.WriteByte(p, offset + i, b[i]);
+    }
+
+    private static ulong XrStringToPath(string s)
+    {
+        if (_pfnStringToPath == IntPtr.Zero) return 0;
+        int rc = Marshal.GetDelegateForFunctionPointer<XrStringToPathDelegate>
+            (_pfnStringToPath)(_instance, s, out ulong path);
+        Log.LogInfo($"  xrStringToPath('{s}') rc={rc} path=0x{path:X}");
+        return path;
+    }
+
+    private static ulong CreateAction(string name, string localName, int actionType, ulong path0, ulong path1)
+    {
+        if (_pfnCreateAction == IntPtr.Zero || _actionSet == 0) return 0;
+        // XrActionCreateInfo: type(29)+pad(4)+next(8)+name[64]+actionType(4)+count(4)+paths*(8)+localName[128] = 224 bytes
+        const int sz = 224;
+        IntPtr info    = Marshal.AllocHGlobal(sz);
+        IntPtr pathArr = Marshal.AllocHGlobal(16);
+        try
+        {
+            for (int i = 0; i < sz; i++) Marshal.WriteByte(info, i, 0);
+            Marshal.WriteInt32(info,  0, 29);           // XR_TYPE_ACTION_CREATE_INFO
+            WriteAsciiString (info, 16, name);          // actionName[64]  at +16
+            Marshal.WriteInt32(info, 80, actionType);   // actionType       at +80
+            Marshal.WriteInt32(info, 84, 2);            // countSubactionPaths at +84
+            Marshal.WriteInt64(pathArr, 0, (long)path0);
+            Marshal.WriteInt64(pathArr, 8, (long)path1);
+            Marshal.WriteIntPtr(info, 88, pathArr);     // subactionPaths*  at +88
+            WriteAsciiString (info, 96, localName);     // localizedName[128] at +96
+            int rc = Marshal.GetDelegateForFunctionPointer<XrCreateActionDelegate>
+                (_pfnCreateAction)(_actionSet, info, out ulong action);
+            Log.LogInfo($"  xrCreateAction('{name}') type={actionType} rc={rc} action=0x{action:X}");
+            return action;
+        }
+        finally { Marshal.FreeHGlobal(info); Marshal.FreeHGlobal(pathArr); }
+    }
+
+    private static ulong CreateActionSpace(ulong action, ulong subactionPath)
+    {
+        if (_pfnCreateActionSpace == IntPtr.Zero || _session == 0) return 0;
+        // XrActionSpaceCreateInfo: type(38)+pad(4)+next(8)+action(8)+subPath(8)+pose(28) = 60, pad to 64
+        const int sz = 64;
+        IntPtr info = Marshal.AllocHGlobal(sz);
+        try
+        {
+            for (int i = 0; i < sz; i++) Marshal.WriteByte(info, i, 0);
+            Marshal.WriteInt32(info,  0, 38);                   // XR_TYPE_ACTION_SPACE_CREATE_INFO
+            Marshal.WriteInt64(info, 16, (long)action);
+            Marshal.WriteInt64(info, 24, (long)subactionPath);
+            WriteFloat(info, 44, 1.0f);                         // pose.orientation.w = 1 (identity)
+            int rc = Marshal.GetDelegateForFunctionPointer<XrCreateActionSpaceDelegate>
+                (_pfnCreateActionSpace)(_session, info, out ulong space);
+            Log.LogInfo($"  xrCreateActionSpace(sub=0x{subactionPath:X}) rc={rc} space=0x{space:X}");
+            return space;
+        }
+        finally { Marshal.FreeHGlobal(info); }
+    }
+
+    /// <summary>
+    /// PHASE 1 (instance-level) — called in SetupDirect after xrCreateInstance.
+    /// Creates the action set, individual actions, and suggests interaction profile bindings.
+    /// VDXR requires these calls to happen before xrCreateSession.
+    /// </summary>
+    private static void SetupActionSetsInstance()
+    {
+        try
+        {
+            if (_pfnCreateActionSet == IntPtr.Zero || _pfnCreateAction == IntPtr.Zero)
+            { Log.LogWarning("  SetupActionSetsInstance: fn ptrs not ready — skipping"); return; }
+
+            // Diagnostic: verify instance-level calls work by calling xrStringToPath first
+            {
+                ulong testPath = 0;
+                int testRc = Marshal.GetDelegateForFunctionPointer<XrStringToPathDelegate>
+                    (_pfnStringToPath)(_instance, "/user/hand/right", out testPath);
+                Log.LogInfo($"  PreCheck xrStringToPath rc={testRc} path=0x{testPath:X}");
+            }
+
+            // 1. Create action set
+            // XrActionSetCreateInfo: type(28)+pad(4)+next(8)+name[64]+localName[128]+priority(4)+pad(4) = 216
+            const int asSz = 216;
+            IntPtr asInfo = Marshal.AllocHGlobal(asSz);
+            try
+            {
+                for (int i = 0; i < asSz; i++) Marshal.WriteByte(asInfo, i, 0);
+                Marshal.WriteInt32(asInfo, 0, 28);              // XR_TYPE_ACTION_SET_CREATE_INFO
+                WriteAsciiString(asInfo, 16, "gameplay");       // actionSetName[64] at +16
+                WriteAsciiString(asInfo, 80, "Gameplay");       // localizedName[128] at +80
+                // priority = 0 already
+
+                // Diagnostic: dump first 32 bytes of struct so we can verify layout
+                var sb = new System.Text.StringBuilder("  CreateActionSet struct[0..31]: ");
+                for (int i = 0; i < 32; i++) sb.Append($"{Marshal.ReadByte(asInfo, i):X2} ");
+                Log.LogInfo(sb.ToString());
+
+                int rc = Marshal.GetDelegateForFunctionPointer<XrCreateActionSetDelegate>
+                    (_pfnCreateActionSet)(_instance, asInfo, out _actionSet);
+                Log.LogInfo($"  xrCreateActionSet rc={rc} actionSet=0x{_actionSet:X}");
+                if (rc != 0 || _actionSet == 0) return;
+            }
+            finally { Marshal.FreeHGlobal(asInfo); }
+
+            // 2. Subaction paths
+            _leftHandPath  = XrStringToPath("/user/hand/left");
+            _rightHandPath = XrStringToPath("/user/hand/right");
+            if (_leftHandPath == 0 || _rightHandPath == 0)
+            { Log.LogWarning("  SetupActionSetsInstance: hand paths = 0 — skipping"); return; }
+
+            // 3. Create actions
+            // actionType: 4=POSE_INPUT, 1=BOOLEAN_INPUT, 3=VECTOR2F_INPUT
+            _poseAction      = CreateAction("hand_pose",  "Hand Pose",  4, _leftHandPath, _rightHandPath);
+            _triggerAction   = CreateAction("trigger",    "Trigger",    1, _leftHandPath, _rightHandPath);
+            var thumbAction  = CreateAction("thumbstick", "Thumbstick", 3, _leftHandPath, _rightHandPath);
+            if (_poseAction == 0 || _triggerAction == 0)
+            { Log.LogWarning("  SetupActionSetsInstance: action creation failed"); return; }
+
+            // 4. Suggest Oculus Touch bindings (instance-level, no session needed)
+            ulong profile   = XrStringToPath("/interaction_profiles/oculus/touch_controller");
+            ulong aimRight  = XrStringToPath("/user/hand/right/input/aim/pose");
+            ulong aimLeft   = XrStringToPath("/user/hand/left/input/aim/pose");
+            ulong trigRight = XrStringToPath("/user/hand/right/input/trigger/value");
+            ulong trigLeft  = XrStringToPath("/user/hand/left/input/trigger/value");
+            ulong stickR    = XrStringToPath("/user/hand/right/input/thumbstick");
+            ulong stickL    = XrStringToPath("/user/hand/left/input/thumbstick");
+
+            // XrActionSuggestedBinding = action(8) + binding(8) = 16 bytes
+            int bindCount = 6;
+            IntPtr bindings = Marshal.AllocHGlobal(bindCount * 16);
+            try
+            {
+                void WriteBinding(int idx, ulong act, ulong path)
+                {
+                    Marshal.WriteInt64(bindings, idx * 16 + 0, (long)act);
+                    Marshal.WriteInt64(bindings, idx * 16 + 8, (long)path);
+                }
+                WriteBinding(0, _poseAction,    aimRight);
+                WriteBinding(1, _poseAction,    aimLeft);
+                WriteBinding(2, _triggerAction, trigRight);
+                WriteBinding(3, _triggerAction, trigLeft);
+                WriteBinding(4, thumbAction,    stickR);
+                WriteBinding(5, thumbAction,    stickL);
+
+                // XrInteractionProfileSuggestedBinding: type(24)+pad(4)+next(8)+profile(8)+count(4)+pad(4)+bindings*(8) = 40
+                IntPtr sugInfo = Marshal.AllocHGlobal(40);
+                try
+                {
+                    for (int i = 0; i < 40; i++) Marshal.WriteByte(sugInfo, i, 0);
+                    Marshal.WriteInt32(sugInfo,  0, 51);        // XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING
+                    Marshal.WriteInt64(sugInfo, 16, (long)profile);
+                    Marshal.WriteInt32(sugInfo, 24, bindCount);
+                    Marshal.WriteIntPtr(sugInfo, 32, bindings);
+                    int rc = Marshal.GetDelegateForFunctionPointer<XrSuggestInteractionProfileBindingsDelegate>
+                        (_pfnSuggestInteractionProfileBindings)(_instance, sugInfo);
+                    Log.LogInfo($"  xrSuggestInteractionProfileBindings rc={rc}");
+                }
+                finally { Marshal.FreeHGlobal(sugInfo); }
+            }
+            finally { Marshal.FreeHGlobal(bindings); }
+
+            Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X}");
+        }
+        catch (Exception ex) { Log.LogWarning($"  SetupActionSetsInstance: {ex}"); }
+    }
+
+    /// <summary>
+    /// PHASE 2 (session-level) — called in TryDirectPath after xrCreateSession.
+    /// Creates action spaces and attaches the action set to the session.
+    /// Must happen before xrBeginSession (VDXR requirement) and before xrSyncActions (spec requirement).
+    /// </summary>
+    private static void SetupActionSetsSession()
+    {
+        if (_actionSet == 0 || _poseAction == 0)
+        { Log.LogWarning("  SetupActionSetsSession: instance-level setup not done — skipping"); return; }
+        try
+        {
+            // 5. Create aim spaces (session-level)
+            _rightAimSpace = CreateActionSpace(_poseAction, _rightHandPath);
+            _leftAimSpace  = CreateActionSpace(_poseAction, _leftHandPath);
+            Log.LogInfo($"  rightAimSpace=0x{_rightAimSpace:X} leftAimSpace=0x{_leftAimSpace:X}");
+
+            // 6. Attach action set to session
+            // XrSessionActionSetsAttachInfo: type(60)+pad(4)+next(8)+count(4)+pad(4)+sets*(8) = 32
+            IntPtr setsArr = Marshal.AllocHGlobal(8);
+            IntPtr attInfo = Marshal.AllocHGlobal(32);
+            try
+            {
+                Marshal.WriteInt64(setsArr, 0, (long)_actionSet);
+                for (int i = 0; i < 32; i++) Marshal.WriteByte(attInfo, i, 0);
+                Marshal.WriteInt32(attInfo,  0, 60);            // XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO
+                Marshal.WriteInt32(attInfo, 16, 1);             // countActionSets
+                Marshal.WriteIntPtr(attInfo, 24, setsArr);
+                int rc = Marshal.GetDelegateForFunctionPointer<XrAttachSessionActionSetsDelegate>
+                    (_pfnAttachSessionActionSets)(_session, attInfo);
+                Log.LogInfo($"  xrAttachSessionActionSets rc={rc}");
+                if (rc == 0 && _rightAimSpace != 0 && _leftAimSpace != 0)
+                    ActionSetsReady = true;
+            }
+            finally { Marshal.FreeHGlobal(attInfo); Marshal.FreeHGlobal(setsArr); }
+
+            Log.LogInfo($"  ActionSetsReady={ActionSetsReady}");
+        }
+        catch (Exception ex) { Log.LogWarning($"  SetupActionSetsSession: {ex}"); }
+    }
+
+    // ── Phase 7: per-frame controller input API ───────────────────────────────
+
+    /// <summary>
+    /// Calls xrSyncActions once per frame. Must be called after xrWaitFrame.
+    /// Returns false if action sets aren't ready or sync fails (caller can ignore).
+    /// </summary>
+    public static bool SyncActions()
+    {
+        if (!ActionSetsReady || _pfnSyncActions == IntPtr.Zero || _session == 0) return false;
+        try
+        {
+            // XrActiveActionSet: actionSet(8)+subactionPath(8) = 16 bytes  (XR_NULL_PATH = 0)
+            IntPtr aas = Marshal.AllocHGlobal(16);
+            // XrActionsSyncInfo: type(61)+pad(4)+next(8)+count(4)+pad(4)+activeSets*(8) = 32
+            IntPtr si  = Marshal.AllocHGlobal(32);
+            try
+            {
+                Marshal.WriteInt64(aas, 0, (long)_actionSet);
+                Marshal.WriteInt64(aas, 8, 0);  // XR_NULL_PATH
+                for (int i = 0; i < 32; i++) Marshal.WriteByte(si, i, 0);
+                Marshal.WriteInt32(si,  0, 61); // XR_TYPE_ACTIONS_SYNC_INFO
+                Marshal.WriteInt32(si, 16, 1);  // countActiveSets
+                Marshal.WriteIntPtr(si, 24, aas);
+                int rc = Marshal.GetDelegateForFunctionPointer<XrSyncActionsDelegate>
+                    (_pfnSyncActions)(_session, si);
+                if (_syncLogCount < 3) { _syncLogCount++; Log.LogInfo($"  xrSyncActions rc={rc}"); }
+                return rc == 0;
+            }
+            finally { Marshal.FreeHGlobal(si); Marshal.FreeHGlobal(aas); }
+        }
+        catch (Exception ex) { Log.LogWarning($"  SyncActions: {ex.Message}"); return false; }
+    }
+
+    /// <summary>
+    /// Returns the aim pose of the specified controller in LOCAL reference space.
+    /// Apply same OpenXR→Unity coord flip as ApplyCameraPose: pos.z *= -1; quat = (-x,-y,z,w).
+    /// Returns false if pose is not valid this frame.
+    /// </summary>
+    public static bool GetControllerPose(bool right, long displayTime,
+        out UnityEngine.Quaternion orientation, out UnityEngine.Vector3 position)
+    {
+        orientation = UnityEngine.Quaternion.identity;
+        position    = UnityEngine.Vector3.zero;
+        if (!ActionSetsReady || _pfnLocateSpace == IntPtr.Zero) return false;
+        ulong space = right ? _rightAimSpace : _leftAimSpace;
+        if (space == 0 || ReferenceSpace == 0) return false;
+        try
+        {
+            // XrSpaceLocation: type(42)+pad(4)+next(8)+locationFlags(8)+pose(28) = 52, pad to 56
+            const int sz = 56;
+            IntPtr loc = Marshal.AllocHGlobal(sz);
+            try
+            {
+                for (int i = 0; i < sz; i++) Marshal.WriteByte(loc, i, 0);
+                Marshal.WriteInt32(loc, 0, 42); // XR_TYPE_SPACE_LOCATION
+                int rc = Marshal.GetDelegateForFunctionPointer<XrLocateSpaceDelegate>
+                    (_pfnLocateSpace)(space, ReferenceSpace, displayTime, loc);
+                ulong flags = (ulong)Marshal.ReadInt64(loc, 16);
+                if (_poseLogCount < 3)
+                {
+                    _poseLogCount++;
+                    Log.LogInfo($"  xrLocateSpace rc={rc} flags=0x{flags:X} t={displayTime}");
+                }
+                if (rc != 0) return false;
+                // XR_SPACE_LOCATION_ORIENTATION_VALID_BIT=1, XR_SPACE_LOCATION_POSITION_VALID_BIT=2
+                if ((flags & 3) != 3) return false;
+                // pose: orientation{x,y,z,w} at +24, position{x,y,z} at +40
+                orientation.x = ReadFloat(loc, 24);
+                orientation.y = ReadFloat(loc, 28);
+                orientation.z = ReadFloat(loc, 32);
+                orientation.w = ReadFloat(loc, 36);
+                position.x    = ReadFloat(loc, 40);
+                position.y    = ReadFloat(loc, 44);
+                position.z    = ReadFloat(loc, 48);
+                return true;
+            }
+            finally { Marshal.FreeHGlobal(loc); }
+        }
+        catch (Exception ex) { Log.LogWarning($"  GetControllerPose: {ex.Message}"); return false; }
+    }
+
+    /// <summary>
+    /// Returns whether the trigger button is pressed this frame.
+    /// Returns false (with pressed=false) if action sets aren't ready.
+    /// </summary>
+    public static bool GetTriggerState(bool right, out bool pressed)
+    {
+        pressed = false;
+        if (!ActionSetsReady || _pfnGetActionStateBoolean == IntPtr.Zero || _triggerAction == 0) return false;
+        try
+        {
+            // XrActionStateGetInfo: type(58)+pad(4)+next(8)+action(8)+subactionPath(8) = 32
+            IntPtr gi = Marshal.AllocHGlobal(32);
+            // XrActionStateBoolean: type(23)+pad(4)+next(8)+currentState(4)+changed(4)+lastChangeTime(8)+isActive(4)+pad(4) = 40
+            IntPtr st = Marshal.AllocHGlobal(40);
+            try
+            {
+                for (int i = 0; i < 32; i++) Marshal.WriteByte(gi, i, 0);
+                Marshal.WriteInt32(gi,  0, 58); // XR_TYPE_ACTION_STATE_GET_INFO
+                Marshal.WriteInt64(gi, 16, (long)_triggerAction);
+                Marshal.WriteInt64(gi, 24, (long)(right ? _rightHandPath : _leftHandPath));
+
+                for (int i = 0; i < 40; i++) Marshal.WriteByte(st, i, 0);
+                Marshal.WriteInt32(st, 0, 23); // XR_TYPE_ACTION_STATE_BOOLEAN
+
+                int rc = Marshal.GetDelegateForFunctionPointer<XrGetActionStateBooleanDelegate>
+                    (_pfnGetActionStateBoolean)(_session, gi, st);
+                if (rc == 0)
+                    pressed = Marshal.ReadInt32(st, 16) != 0; // currentState at +16
+                return rc == 0;
+            }
+            finally { Marshal.FreeHGlobal(gi); Marshal.FreeHGlobal(st); }
+        }
+        catch (Exception ex) { Log.LogWarning($"  GetTriggerState: {ex.Message}"); return false; }
+    }
+
     private static float ReadFloat(IntPtr p, int offset)
         => BitConverter.Int32BitsToSingle(Marshal.ReadInt32(p, offset));
 
@@ -1362,6 +1733,7 @@ public static class OpenXRManager
             while (_frameThreadRunning && _session != 0)
             {
                 long displayTime = FrameWait(out int waitRc);
+                LastDisplayTime = displayTime;  // expose to GetControllerPose / LocateViews
 
                 if (waitRc < 0)
                 {
