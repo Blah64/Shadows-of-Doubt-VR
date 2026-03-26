@@ -863,12 +863,19 @@ public static class OpenXRManager
             }
             Marshal.FreeHGlobal(vcvBuf);
             if (recW == 0) { recW = 1832; recH = 1920; Log.LogWarning($"  Fallback eye res {recW}x{recH}"); }
-            SwapchainWidth  = recW;
-            SwapchainHeight = recH;
+
+            // Scale down from native headset resolution to reduce GPU/VRAM load.
+            // The OpenXR compositor upscales to fill the display. 0.7 ≈ 50% of pixels.
+            const float RenderScale = 0.7f;
+            int scaledW = ((int)(recW * RenderScale) + 1) & ~1; // round to even
+            int scaledH = ((int)(recH * RenderScale) + 1) & ~1;
+            Log.LogInfo($"  Render scale {RenderScale}: {recW}x{recH} → {scaledW}x{scaledH}");
+            SwapchainWidth  = scaledW;
+            SwapchainHeight = scaledH;
 
             // ── 3. Create per-eye swapchains ────────────────────────────────────
-            if (!CreateSwapchain(recW, recH, out ulong leftSC) ||
-                !CreateSwapchain(recW, recH, out ulong rightSC))
+            if (!CreateSwapchain(scaledW, scaledH, out ulong leftSC) ||
+                !CreateSwapchain(scaledW, scaledH, out ulong rightSC))
             { Log.LogError("  xrCreateSwapchain failed"); return false; }
             LeftSwapchain  = leftSC;
             RightSwapchain = rightSC;

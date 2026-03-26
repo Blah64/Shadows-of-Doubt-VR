@@ -1,134 +1,85 @@
 # SoDVR — Technical Handover
 
 **Date**: 2026-03-25
-**Phase**: 5 rewrite — switching from VDXR internal patching to standard OpenXR loader
+**Phase**: 6 — Camera positioning, head tracking → game world
 
 ---
 
-## Why We're Rewriting
+## What Works (Phase 5 Complete — git `346a6df`)
 
-The previous approach (git `1be2b0e`) patched VDXR's internal session-type guards directly in machine code:
-- 14 `PatchBytes` calls to NOP guard branches in xrCreateSession, xrCreateSwapchain, xrGetD3D11GraphicsRequirementsKHR, etc.
-- Direct calls into VDXR's internal compositor setup function (CSF) and initD3D11
-- Manual writes into the `OpenXrRuntime*` object (`robj`) to fake requirements
+The full OpenXR pipeline is operational:
 
-**Result**: Swapchains created (rc=0, 3 images), frame loop running, but swapchain image texture pointers were always null (0x0). The null path in SC-member traced back to `robj+0x990` (streaming pool) being unpopulated, which traced back to CSF's inner `ovr_Create()` wrapper being skipped when `robj+0x28 = 0x01`.
-
-**Root insight**: LCVR, CWVR, and UnityVRMod all use standard `openxr_loader.dll` P/Invoke on VDXR — no guard patching — and produce real D3D11 swapchain textures. The guard bypasses were solving a problem that likely didn't exist for the standard API path.
-
----
-
-## Current State of the Codebase
-
-**OpenXRManager.cs** — still contains the old VDXR patching code. This file needs to be rewritten. Key code to **delete**:
-- `TryInitializeProvider` / `NopFnACall` — UnityOpenXR.dll setup, no longer needed
-- `TrySubsystemPath` — XRDisplaySubsystem path (always fails, IL2CPP stripped)
-- `TryUnitySessionPath` — dead end, session_InitializeSession returns false
-- `SetupDirect` — remove all `PatchBytes` and `ScanAndPatch*` calls; the VDXR guards don't fire on the standard loader path
-- `GetVDXRRuntimeObject`, `SetRuntimeGraphicsRequirements`, `CallInitD3D11Direct`, `CallCompositorSetupDirect` — all VDXR internal manipulation, delete
-- `PatchVtableDispatch`, `PatchInnerRequirementsCheck`, `PatchSecondCall`, `PatchCreateSessionContextBlock`, `ScanAndPatchMinus38`, `ScanAndPatchErrorCode`, `ScanAndPatchMinus38InDll` — patch infrastructure, delete
-- `GetRuntimeCreateSessionViaGpa`, `PatchRuntimeCreateSession`, `FindPeExport` — VDXR-specific, delete
-- `PatchSingleByte`, `PatchBytes`, `AllocNear`, `DumpFunctionBytes` — patch utilities, delete
-- `CallD3D11GraphicsRequirements` — replace with simple direct call
-- `EnumerateExtensions` — keep (useful diagnostic)
-
-Key code to **keep** (already correct):
-- `CreateInstance` — works, uses standard XR_KHR_D3D11_enable extension
-- `XrGetSystem` — works
-- `GetFn` — works
-- `GetD3D11Device` — works (Texture2D.whiteTexture → GetNativeTexturePtr → vtable[3])
-- `GetAdapterLuid` — works (IDXGIDevice → GetAdapter → GetDesc)
-- `XrCreateSession` — fix only: change binding type from `0x3B9B3378` → `1000003000`
-- `XrBeginSession`, `PollEvents`, `PollEventsPublic` — keep as-is
-- `StartFrameThread`, `FrameThreadProc`, `FrameWait`, `FrameBegin`, `FrameEnd` — keep as-is
-- `StopFrameThread`, `FrameWaitPublic`, `FrameBeginPublic`, `FrameEndEmpty` — keep as-is
-- `SetupStereo`, `CreateSwapchain`, `PickSwapchainFormat`, `EnumSwapchainImages` — keep (remove ESI dump spam)
-- `AcquireSwapchainImage`, `WaitSwapchainImage`, `ReleaseSwapchainImage` — keep as-is
-- `LocateViews`, `ParseEyeView` — keep as-is
-- `FrameEndStereo`, `WriteProjectionView` — keep as-is
-- `D3D11CopyTexture` — keep as-is
-- `EyePose` struct — keep as-is
-- `ReadFloat`, `WriteFloat`, `LogActiveRuntime` — keep as-is
-
-**VRCamera.cs** — do not change.
-**Plugin.cs** — do not change.
+- `xrCreateInstance` → rc=0
+- `xrGetSystem` → rc=0, systemId=0x1
+- `xrGetD3D11GraphicsRequirementsKHR` → rc=0, LUID populated
+- `xrCreateSession` → rc=0, session=0x1
+- `xrBeginSession` → rc=0
+- `xrCreateSwapchain` × 2 → rc=0, 3648×3936, 3 images each
+- `xrEnumerateSwapchainImages` → rc=0, real `ID3D11Texture2D*` pointers (non-null)
+- `D3D11CopyResource` → working, frames delivered to headset
+- Head tracking → stereo image tracks with head movement ✓
+- VROrigin follows game camera world position ✓
 
 ---
 
-## Rewrite Plan for OpenXRManager.cs
+## Critical VDXR Discoveries
 
-### New `TryInitializeProvider`
-Only needs to:
-1. Load `openxr_loader.dll` → get `xrGetInstanceProcAddr`
-2. Store `_gpaAddr`, create `_gpa` delegate
-3. Return true
+### 1. Type constant offset (+0x5DC0)
+VDXR uses non-spec type constants for all D3D11 extension structs.
+The OpenXR loader passes through what the app writes, so we must write VDXR's values:
 
-Remove all UnityOpenXR.dll setup, XRSDKPreInit, NopFnACall.
+| Struct | Spec | VDXR |
+|---|---|---|
+| XrGraphicsBindingD3D11KHR | 1000003000 = 0x3B9AD5B8 | 0x3B9B3378 |
+| XrSwapchainImageD3D11KHR | 1000003001 = 0x3B9AD5B9 | 0x3B9B3379 |
+| XrGraphicsRequirementsD3D11KHR | 1000003002 = 0x3B9AD5BA | 0x3B9B337A |
 
-### New `CheckAndStart`
-Remove Path A (TrySubsystemPath) entirely. Remove the 60-frame retry gate. Just:
-```csharp
-if (!_directReady) SetupDirect();
-if (!_directReady) return false;
-return TryDirectPath();
-```
+Discovered via Python + capstone disassembly of VDXR's vtable implementations:
+- `gfxReqs_impl` at +0x014: `cmp dword ptr [r9], 0x3b9b337a` — type check, returns -1 if mismatch
+- `createSession_impl` loop: iterates `next` chain checking for `0x3B9B3378`; if not found and gfxReqs flag unset → returns -38
 
-### New `SetupDirect`
-```
-_gpa = delegate for _gpaAddr
-EnumerateExtensions()               // diagnostic
-CreateInstance()                    // xrCreateInstance
-GetFn(all needed functions)
-XrGetSystem()
-_directReady = true
-```
-No patches. No robj. No vtable inspection.
+### 2. openxr-oculus-compatibility API layer
+Virtual Desktop registers `openxr-oculus-compatibility.dll` as an implicit OpenXR API layer.
+It intercepts `xrCreateSession` and enforces its own graphics requirements check → -38.
+Fix: before `xrCreateInstance`, read the layer JSON and set `DISABLE_XR_APILAYER_VIRTUALDESKTOP_OCULUS_COMPATIBILITY=1`.
+See `DisableUnityOpenXRLayer()` in OpenXRManager.cs.
 
-### New `TryDirectPath`
-```
-GetD3D11Device() — wait until Unity has a D3D11 device
-CallD3D11GraphicsRequirements()     // xrGetD3D11GraphicsRequirementsKHR(_instance, _systemId, &reqs)
-XrCreateSession(device)             // XrGraphicsBindingD3D11KHR{type=1000003000, device}
-PollEvents()
-XrBeginSession()
-StartFrameThread()
-IsRunning = true
-```
-
-### New `CallD3D11GraphicsRequirements`
-Simple single call:
-```csharp
-Marshal.WriteInt32(p, 0, 1000003002); // XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR
-int rc = gfxReqs(_instance, _systemId, p);
-```
-No candidate loop, no counter logging.
+### 3. Swapchain format must match Unity RenderTexture
+- Unity `RenderTextureFormat.ARGB32` → D3D11 `DXGI_FORMAT_R8G8B8A8_UNORM` = format **28**
+- `CopyResource` silently fails if src/dst formats differ
+- VDXR supports format 28; use `_preferredFormats = { 28, 29, 87, 91 }`
 
 ---
 
-## Delegates to Remove
-- `XrNegotiateLoaderRuntimeDelegate`
-- `VDXRSingletonDelegate`
-- `InitD3D11Delegate`
-- `CompositorSetupDelegate`
-- `XRSDKPreInitDelegate`, `SetStage1Delegate`, `GetProcAddrPtrDelegate`, `UnitySessionBoolDelegate`
+## Current State (Phase 6 start)
 
-## Fields to Remove
-- `_hUnityOpenXR`, `_pfnCreateSessionDirect`, `_directReady` (keep), `_gfxReqsDone` (keep)
-- `_robjWriteDone`, `_robjDumped`, `_subsystemRetries`, `_unitySessTried`
-- `_postSessionFrames` (was used for retry gate, no longer needed)
+### VRCamera.cs
+- `_gameCam` field stores the original game camera's transform
+- `BuildCameraRig`: disables mc, saves `_gameCam = mc.transform`, teleports VROrigin to mc's world position
+- `Update()`: `if (_gameCam != null) transform.position = _gameCam.position;` — follows character each frame
+- Eye cameras positioned at VROrigin + HMD pose offset (from `xrLocateViews`)
+- Head tracking works: rotation/position applied via `ApplyCameraPose`
+
+### What the headset shows
+- Stereo image with correct head tracking ✓
+- Positioned at the game character's camera world position ✓
+- Game scene renders from that position ✓
 
 ---
 
-## Expected Outcomes After Rewrite
+## Phase 6 Work Remaining
 
-With standard loader and proper `XrGraphicsBindingD3D11KHR`:
-- `xrGetD3D11GraphicsRequirementsKHR` → rc=0 (no guard bypass needed)
-- `xrCreateSession` → rc=0, `_session` non-zero
-- `xrCreateSwapchain` → rc=0, swapchain images have real `ID3D11Texture2D*` pointers (non-null)
-- D3D11CopyTexture → renders Unity eye view into headset
-- Headset should show game image
+### Camera / rendering
+- [ ] The game uses HDRP — verify eye cameras render game geometry correctly (may need `HDAdditionalCameraData`)
+- [ ] Verify colors/gamma look correct (HDRP tonemapping, linear vs gamma)
+- [ ] The game camera's **yaw** is not transferred to VROrigin — the player always faces "world north" regardless of game character orientation. May need to sync VROrigin.rotation.y from the game camera.
 
-If xrGetD3D11GraphicsRequirementsKHR still fails (rc≠0), call xrCreateSession anyway — some runtimes enforce the call as merely advisory.
+### Input — Phase 6
+- [ ] Head rotation → game character look direction (send mouse/look input to match HMD yaw)
+- [ ] Controller bindings — movement (walk/run), interact, jump, menu
+- [ ] OpenXR action sets: `xrCreateActionSet`, `xrCreateAction`, `xrSuggestInteractionProfileBindings`, `xrAttachSessionActionSets`
+- [ ] `xrLocateSpace` for hand/controller pose
+- [ ] Map controller input to game's IL2CPP input system
 
 ---
 
@@ -136,8 +87,8 @@ If xrGetD3D11GraphicsRequirementsKHR still fails (rc≠0), call xrCreateSession 
 
 | File | Purpose |
 |------|---------|
-| `VRMod/SoDVR/OpenXRManager.cs` | **Needs rewrite** (see above) |
-| `VRMod/SoDVR/VR/VRCamera.cs` | Stereo render loop — do not change |
+| `VRMod/SoDVR/OpenXRManager.cs` | OpenXR init, session, swapchain, frame loop |
+| `VRMod/SoDVR/VR/VRCamera.cs` | Stereo render loop, camera rig, position tracking |
 | `VRMod/SoDVR/Plugin.cs` | BepInEx entry point — do not change |
 | `BepInEx/plugins/SoDVR.dll` | Deployed plugin |
 | `BepInEx/LogOutput.log` | Runtime log |
@@ -146,8 +97,8 @@ If xrGetD3D11GraphicsRequirementsKHR still fails (rc≠0), call xrCreateSession 
 
 ## Phase Roadmap
 
-- [x] Phase 1–4: OpenXR init, session, swapchain — all rc=0 (VDXR patch approach)
-- [ ] **Phase 5 (current)**: Rewrite OpenXRManager.cs → standard loader → real swapchain textures → image in headset
-- [ ] Phase 6: Input — head tracking → game camera, controller → movement/interaction
+- [x] Phase 1–4: OpenXR init, session, swapchain — all rc=0 (VDXR patch approach, archived)
+- [x] **Phase 5**: Rewrite OpenXRManager.cs → standard loader → real swapchain textures → stereo image in headset
+- [ ] **Phase 6 (current)**: Camera positioning ✓ (partial), head tracking → game yaw, controller input
 - [ ] Phase 7: UI world-space conversion + laser pointer
 - [ ] Phase 8–11: Full input mapping, game-specific interactions, comfort, polish

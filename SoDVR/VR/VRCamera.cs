@@ -1,6 +1,7 @@
 using BepInEx.Logging;
 using System;
 using UnityEngine;
+using UnityEngine.Rendering.HighDefinition;
 
 namespace SoDVR.VR;
 
@@ -38,6 +39,11 @@ public class VRCamera : MonoBehaviour
     private RenderTexture _leftRT   = null!;
     private RenderTexture _rightRT  = null!;
     private Transform     _gameCam  = null!; // original game camera transform; we follow its world position
+
+    // Render throttle: call Camera.Render() every N stereo frames.
+    // 1 = every frame (full quality). 2 = every other frame (half GPU load, slight judder).
+    // The swapchain copy still runs every frame, so head tracking stays smooth via ATW.
+    private const int RenderEveryNFrames = 1;
 
     // Per-frame state
     private long  _displayTime;
@@ -117,6 +123,8 @@ public class VRCamera : MonoBehaviour
         // ── Normal stereo frame loop ───────────────────────────────────────────
 
         // Follow the game character's camera position each frame.
+        // Retry finding a game camera every 60 frames in case it wasn't available at rig build time.
+        if (_gameCam == null && (_frameCount % 60) == 0) TryFindGameCamera();
         if (_gameCam != null) transform.position = _gameCam.position;
 
         _displayTime = OpenXRManager.FrameWaitPublic(out int waitRc);
@@ -177,29 +185,101 @@ public class VRCamera : MonoBehaviour
         _rightRT.Create();
         SetupEyeCam(_rightCam, _rightRT);
 
-        // Disable existing main camera and track its transform so VROrigin follows the character.
-        // Do NOT reparent — keeping it at its world position so game raycasts stay correct.
-        var mc = Camera.main;
-        if (mc != null && mc != _leftCam && mc != _rightCam)
-        {
-            Log.LogInfo($"[VRCamera] Disabling original camera: {mc.gameObject.name}");
-            _gameCam = mc.transform;
-            mc.enabled = false;
-            // Teleport VROrigin to the game camera's current world position.
-            transform.position = _gameCam.position;
-        }
+        // Try to find and disable the game camera now. If it's not available yet
+        // (e.g. main menu hasn't spawned one), TryFindGameCamera() will keep retrying in Update().
+        TryFindGameCamera();
 
         Log.LogInfo($"[VRCamera] Rig built: {w}x{h} ARGB32");
     }
 
-    private static void SetupEyeCam(Camera cam, RenderTexture rt)
+    // Search all active cameras for one that isn't one of ours.
+    // Disables it so it doesn't render independently, and tracks its transform.
+    private void TryFindGameCamera()
+    {
+        foreach (var cam in Camera.allCameras)
+        {
+            if (cam == _leftCam || cam == _rightCam) continue;
+            if (!cam.gameObject.activeInHierarchy)  continue;
+            _gameCam = cam.transform;
+            cam.enabled = false;
+            Log.LogInfo($"[VRCamera] Found game camera: '{cam.gameObject.name}' pos={cam.transform.position}");
+            transform.position = _gameCam.position;
+            return;
+        }
+    }
+
+    // Expensive HDRP passes to disable on VR eye cameras.
+    // None of these contribute meaningfully to VR immersion at the cost they incur.
+    private static readonly FrameSettingsField[] s_VrDisabledFields =
+    {
+        FrameSettingsField.SSAO,                // Screen-space ambient occlusion
+        FrameSettingsField.SSR,                 // Screen-space reflections
+        FrameSettingsField.Volumetrics,         // Volumetric fog/lighting
+        FrameSettingsField.MotionVectors,       // Only needed for TAA/motion-blur (both off)
+        FrameSettingsField.MotionBlur,          // Causes VR sickness, not useful
+        FrameSettingsField.DepthOfField,        // Conflicts with VR focus distance
+        FrameSettingsField.ChromaticAberration, // Post-process noise, no VR benefit
+        FrameSettingsField.ContactShadows,      // Screen-space shadow detail pass
+    };
+
+    private void SetupEyeCam(Camera cam, RenderTexture rt)
     {
         cam.targetTexture   = rt;
         cam.stereoTargetEye = StereoTargetEyeMask.None;
         cam.nearClipPlane   = 0.01f;
         cam.farClipPlane    = 1000f;
         cam.allowHDR        = false;  // LDR matches UNORM_SRGB swapchain format
+        cam.allowMSAA       = false;  // HDRP manages AA itself; disabled below
         cam.enabled         = false;  // we call Render() explicitly in LateUpdate
+
+        try
+        {
+            var hd = cam.gameObject.GetComponent<HDAdditionalCameraData>()
+                  ?? cam.gameObject.AddComponent<HDAdditionalCameraData>();
+
+            // Disable TAA — causes per-frame history buffer writes (memory leak) and VR ghosting.
+            hd.antialiasing     = HDAdditionalCameraData.AntialiasingMode.None;
+            hd.dithering        = false;
+            hd.hasPersistentHistory = false;
+
+            // ── FrameSettings: disable expensive passes ────────────────────────
+            // Step 1: build override mask — get the struct, set bits, write back via setter.
+            // renderingPathCustomFrameSettingsOverrideMask has a real setter in HDRP 13,
+            // so the get→modify→set-back pattern works correctly here.
+            var om = hd.renderingPathCustomFrameSettingsOverrideMask;
+            foreach (var f in s_VrDisabledFields)
+                om.mask[(uint)(int)f] = true;
+            hd.renderingPathCustomFrameSettingsOverrideMask = om;
+
+            // Step 2: verify at least the first bit stuck (guards against IL2CPP struct copy issues).
+            bool maskOk = hd.renderingPathCustomFrameSettingsOverrideMask
+                            .mask[(uint)(int)FrameSettingsField.SSAO];
+
+            if (maskOk)
+            {
+                // Step 3: disable the passes in the custom FrameSettings.
+                // renderingPathCustomFrameSettings is a ref-returning property in HDRP 13;
+                // Il2CppInterop exposes this as a value-returning getter, so we must
+                // get a copy, modify it, and write it back.
+                var fs = hd.renderingPathCustomFrameSettings;
+                foreach (var f in s_VrDisabledFields)
+                    fs.SetEnabled(f, false);
+                hd.renderingPathCustomFrameSettings = fs;
+
+                // Step 4: enable custom frame settings only now that both mask and values are set.
+                hd.customRenderingSettings = true;
+                Log.LogInfo($"[VRCamera] HDRP: AA=None, customFS=true, {s_VrDisabledFields.Length} passes off on {cam.gameObject.name}");
+            }
+            else
+            {
+                Log.LogWarning($"[VRCamera] HDRP: override mask did not persist (IL2CPP struct copy) — skipping customFS on {cam.gameObject.name}");
+                Log.LogInfo($"[VRCamera] HDRP: AA=None, no history on {cam.gameObject.name}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"[VRCamera] HDAdditionalCameraData setup failed: {ex.Message}");
+        }
     }
 
     // ── LateUpdate: render → copy → end frame ────────────────────────────────
@@ -218,8 +298,17 @@ public class VRCamera : MonoBehaviour
             }
 
             // Render both eyes into their RenderTextures.
-            _leftCam.Render();
-            _rightCam.Render();
+            // Throttled by RenderEveryNFrames (1 = every frame, 2 = every other, etc.).
+            // The D3D11 copy still runs every frame, so ATW can correct head motion between renders.
+            // Unity D3D11 stores RenderTextures Y-flipped; invertCulling compensates
+            // for the negated projection Y row (see SetProjection).
+            if ((_frameCount % RenderEveryNFrames) == 0)
+            {
+                GL.invertCulling = true;
+                _leftCam.Render();
+                _rightCam.Render();
+                GL.invertCulling = false;
+            }
 
             // Acquire swapchain images, copy, release, then submit.
             bool leftOk  = CopyEye(true,  out uint leftIdx);
@@ -283,20 +372,27 @@ public class VRCamera : MonoBehaviour
 
     // OpenXR: right-handed (+Y up, +X right, -Z forward)
     // Unity:  left-handed  (+Y up, +X right, +Z forward)
-    // Conversion: flip Z on position, negate X and Z on quaternion.
+    //
+    // Position: flip Z  →  (x, y, -z)
+    //
+    // Quaternion: change-of-basis M = diag(1,1,-1), conjugation q' = M·R(q)·M yields
+    //   q_Unity = (-qx, -qy, qz, qw)
+    //   (negate X and Y; keep Z and W)
+    //   Verified: pitch-up → -X ✓  yaw-left → -Y ✓  roll-right → -Z ✓
     private static void ApplyCameraPose(Transform t, OpenXRManager.EyePose eye)
     {
         t.localPosition = new Vector3( eye.Position.x,
                                         eye.Position.y,
                                        -eye.Position.z);
         t.localRotation = new Quaternion(-eye.Orientation.x,
-                                          eye.Orientation.y,
-                                         -eye.Orientation.z,
+                                         -eye.Orientation.y,
+                                          eye.Orientation.z,
                                           eye.Orientation.w);
     }
 
     // Off-centre perspective from OpenXR tangent-angle FOV.
     // angleLeft ≤ 0, angleRight ≥ 0, angleUp ≥ 0, angleDown ≤ 0.
+    // Row 1 (Y) is negated to compensate for Unity D3D11 storing RenderTextures Y-flipped.
     private static void SetProjection(Camera cam, OpenXRManager.EyePose eye)
     {
         float n = cam.nearClipPlane, f = cam.farClipPlane;
@@ -304,7 +400,9 @@ public class VRCamera : MonoBehaviour
         float r = Mathf.Tan(eye.FovRight) * n;
         float t = Mathf.Tan(eye.FovUp)    * n;
         float b = Mathf.Tan(eye.FovDown)  * n;
-        cam.projectionMatrix = Matrix4x4.Frustum(l, r, b, t, n, f);
+        var m = Matrix4x4.Frustum(l, r, b, t, n, f);
+        m.m10 = -m.m10; m.m11 = -m.m11; m.m12 = -m.m12; m.m13 = -m.m13;
+        cam.projectionMatrix = m;
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
