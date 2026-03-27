@@ -39,10 +39,8 @@ public class VRCamera : MonoBehaviour
     private static ManualLogSource Log => Plugin.Log;
 
     private Transform     _cameraOffset = null!;
-    private Camera        _leftCam    = null!;   // scene camera — all layers except UI
+    private Camera        _leftCam    = null!;   // main eye camera — renders scene + UI
     private Camera        _rightCam   = null!;
-    private Camera        _leftUICam  = null!;   // UI overlay camera — layer 5 only, no exposure/tonemapping
-    private Camera        _rightUICam = null!;
     private RenderTexture _leftRT     = null!;
     private RenderTexture _rightRT    = null!;
     private Transform     _gameCam    = null!;   // original game camera transform; we follow its world position
@@ -50,11 +48,6 @@ public class VRCamera : MonoBehaviour
     // Unity built-in UI layer.  Canvas GameObjects default to this layer; all their
     // children inherit it.  Scene cameras exclude it so only UI cameras render UI.
     private const int UILayer       = 5;
-    // Private layer used exclusively for the VRExposureOverride Volume.
-    // UI cameras set volumeLayerMask = 1<<UIVolumeLayer so only they see EV=0/NoTonemapping.
-    // Scene cameras set volumeLayerMask = ~(1<<UIVolumeLayer) so they never see it.
-    private const int UIVolumeLayer = 31;
-
     // Render throttle: call Camera.Render() every N stereo frames.
     // 1 = every frame (full quality). 2 = every other frame (half GPU load, slight judder).
     // The swapchain copy still runs every frame, so head tracking stays smooth via ATW.
@@ -65,19 +58,11 @@ public class VRCamera : MonoBehaviour
     private const float UIVerticalOffset = 0.0f;    // metres up/down from eye level
     private const float UICanvasScale    = 0.0015f; // world-units per canvas pixel (1920px → 2.88 m wide)
     private const int   UICanvasScanRate = 30;      // Unity frames between canvas scans
-    // ExposureControl + Tonemapping are now disabled in s_VrDisabledFields for the eye cameras,
-    // so linear UI colours map directly to LDR output.  Only a very small boost is needed:
-    //   1.0 = literal material colour (white text → white in headset)
-    //   1.5 = slight contrast lift for text so it pops against mid-grey backgrounds
-    // UI cameras use a dedicated Volume: EV=0, Tonemapping=None.
-    // Linear output clips to [0,1] directly.  A boost >1 guarantees near-white even if
-    // the original material colour is slightly less than 1.  Background is kept dim.
-    private const float UIColorBoost     = 2.0f;  // (unused — text colour no longer overridden; kept for reference)
-    private const float UIImageBoost     = 0.7f;  // images: slightly darker than original → better contrast with text
     // Alpha applied to any Graphic whose GameObject name contains "background".
     // Makes the canvas backdrop semi-transparent so buttons and text show through it
     // even when HDRP's distance sort happens to render the background last.
     private const float UIBackgroundAlpha = 0.25f;
+    private const float UITextBrightnessBoost = 4.0f;
 
     // Per-frame state
     private long  _displayTime;
@@ -101,19 +86,28 @@ public class VRCamera : MonoBehaviour
     // Once in this set the canvas transform is never moved again by us.
     private readonly HashSet<int> _positionedCanvases = new();
 
+    // Canvas instance IDs that belong to VRMod itself (settings panel, cursor, etc.).
+    // Every mutation pass (RescanCanvasAlpha, etc.) must skip canvases in this set —
+    // we own those materials and manage them directly.
+    private readonly HashSet<int> _ownedCanvasIds = new();
+
     // Fullscreen "fade overlay" Graphics that should stay at alpha=0 during VR gameplay.
     // The game uses these for fade-to-black transitions; they end up opaque and bury buttons.
     // We force their vertex alpha to 0 every frame so the menu remains readable.
     // Key = Graphic instanceID.
     private readonly Dictionary<int, Graphic> _managedFades = new();
 
-    // ── Controller / cursor dot ───────────────────────────────────────────────
+    // ── VR settings panel (Phase 0 test canvas) ──────────────────────────────
+    private GameObject?   _settingsPanelGO;   // root GO of VRSettingsPanelInternal
+
+    // ── Controller / cursor dot ──────────────────────────────────────────────
     private GameObject?   _rightControllerGO;
-    // Cursor approach: create a ScreenSpaceOverlay canvas "VRCursorCanvasInternal" at startup.
-    // ScanAndConvertCanvases picks it up and converts it to WorldSpace through the SAME pipeline
-    // as all game canvases — this gives it proper HDRP registration, which is why game canvases
-    // ARE visible while standalone WorldSpace canvases created from scratch are NOT.
-    // sortingOrder=100 ensures it is drawn on top of all game canvases (max sortingOrder ≈ 10).
+    // Cursor: ScreenSpaceOverlay canvas "VRCursorCanvasInternal" created at rig-build time.
+    // ScanAndConvertCanvases converts it to WorldSpace via the normal pipeline — giving it proper
+    // HDRP registration and the ZTest Always material patch from RescanCanvasAlpha.
+    // It is NOT in _ownedCanvasIds so all mutation passes (including the ZTest patch) run on it.
+    // PositionCanvases repositions it every frame (never added to _positionedCanvases).
+    // The dot moves via anchoredPosition (2D) inside this fixed-distance canvas.
     private Canvas?        _cursorCanvas;   // VRCursorCanvasInternal once scan converts it
     private RectTransform? _cursorRect;     // the dot's RectTransform inside _cursorCanvas
     private bool        _prevTrigger;
@@ -136,15 +130,13 @@ public class VRCamera : MonoBehaviour
     // don't spam the log every 30 frames.
     private readonly HashSet<int> _queueMapLogged = new();
     // Version stamp — bump to invalidate s_uiZTestMats cache and force material rebuild.
-    private const int UIMaterialVersion = 2;
-    // Material instance IDs whose shader has been swapped from TMP/Distance Field to UI/Default.
-    // Populated once per unique font material; TMP rebuilds reuse the same material object so
-    // the swap persists across redraws without triggering a rebuild loop.
+    private const int UIMaterialVersion = 3;
     private static readonly HashSet<int> s_shaderSwappedMats = new();
-    // Tracks RectMask2D component native pointers we have already disabled, to avoid
-    // re-logging them every 30 frames.
-    private static readonly HashSet<IntPtr> s_disabledRectMasks = new();
-
+    private static readonly HashSet<IntPtr> s_textBoostedGraphics = new();
+    private static readonly HashSet<int> s_menuMaskRelaxedCanvases = new();
+    private static readonly HashSet<int> s_menuMaskabilityRelaxed = new();
+    private static readonly Dictionary<int, Material> s_menuTmpReadableMats = new();
+    private static readonly Dictionary<int, TextMeshProUGUI> s_menuTextFallbacks = new();
     // ── Awake ─────────────────────────────────────────────────────────────────
 
     private void Awake()
@@ -178,13 +170,17 @@ public class VRCamera : MonoBehaviour
             catch (Exception ex) { Log.LogWarning($"[VRCamera] ScanAndConvertCanvases outer: {ex.GetType().Name}: {ex.Message}"); }
         }
 
-        // Home key: re-centre all canvases in front of the current head pose.
+        // F8: re-centre all canvases in front of the current head pose.
         // Useful after loading or if menus appear at the wrong height/direction.
-        if (Input.GetKeyDown(KeyCode.Home))
+        if (Input.GetKeyDown(KeyCode.F8))
         {
             _positionedCanvases.Clear();
             Log.LogInfo("[VRCamera] Recenter: canvases will be re-placed on next LateUpdate.");
         }
+
+        // F10: toggle the VR settings panel.
+        if (Input.GetKeyDown(KeyCode.F10))
+            VRSettingsPanel.Toggle();
 
         // End key: diagnostic dump — logs active text graphics on all managed canvases.
         // Shows vertex colour, _FaceColor (TMP), mat.color and local-Z so we can diagnose
@@ -213,11 +209,58 @@ public class VRCamera : MonoBehaviour
                     float lz   = g.rectTransform?.localPosition.z ?? 0f;
                     float cra  = -1f;
                     try { cra = g.canvasRenderer.GetAlpha(); } catch { }
+                    string crClip = "n/a";
+                    try { crClip = g.canvasRenderer.hasRectClipping ? "on" : "off"; } catch { }
+                    string crCull = "n/a";
+                    try { crCull = g.canvasRenderer.cull ? "on" : "off"; } catch { }
+                    float groupAlpha = 1f;
+                    try
+                    {
+                        var groups = g.GetComponentsInParent<CanvasGroup>(true);
+                        foreach (var group in groups)
+                        {
+                            if (group == null) continue;
+                            groupAlpha *= group.alpha;
+                        }
+                    }
+                    catch { }
                     string crMn = crMat?.name ?? "null";
                     string crSh = crMat?.shader?.name ?? "null";
+                    int crId = crMat != null ? crMat.GetInstanceID() : 0;
+                    string crFace = "n/a";
+                    string crOutline = "n/a";
+                    string crOutlineWidth = "n/a";
+                    try
+                    {
+                        if (crMat != null && crMat.HasProperty("_FaceColor"))
+                        {
+                            var c = crMat.GetColor("_FaceColor");
+                            crFace = $"({c.r:F2},{c.g:F2},{c.b:F2},a={c.a:F2})";
+                        }
+                    }
+                    catch { }
+                    try
+                    {
+                        if (crMat != null && crMat.HasProperty("_OutlineColor"))
+                        {
+                            var c = crMat.GetColor("_OutlineColor");
+                            crOutline = $"({c.r:F2},{c.g:F2},{c.b:F2},a={c.a:F2})";
+                        }
+                    }
+                    catch { }
+                    try
+                    {
+                        if (crMat != null && crMat.HasProperty("_OutlineWidth"))
+                            crOutlineWidth = crMat.GetFloat("_OutlineWidth").ToString("F3");
+                    }
+                    catch { }
                     // TMP-specific diagnostics
                     string tmpCast = "noTMP";
                     string tmpCol  = "n/a";
+                    string tmpFace = "n/a";
+                    string tmpFM = "n/a";
+                    string tmpFSM = "n/a";
+                    string tmpMatMatch = "n/a";
                     try
                     {
                         var tmp = g.TryCast<TMP_Text>();
@@ -226,6 +269,28 @@ public class VRCamera : MonoBehaviour
                             tmpCast = "OK";
                             var tc = tmp.color;
                             tmpCol = $"({tc.r:F2},{tc.g:F2},{tc.b:F2},a={tc.a:F2})";
+                            try
+                            {
+                                var c = tmp.faceColor;
+                                tmpFace = $"({c.r / 255f:F2},{c.g / 255f:F2},{c.b / 255f:F2},a={c.a / 255f:F2})";
+                            }
+                            catch { }
+                            try
+                            {
+                                var fm = tmp.fontMaterial;
+                                tmpFM = fm != null ? $"{fm.name}#{fm.GetInstanceID()}" : "null";
+                                if (crMat != null && fm != null)
+                                    tmpMatMatch = crMat.GetInstanceID() == fm.GetInstanceID() ? "fontMat" : "other";
+                            }
+                            catch { }
+                            try
+                            {
+                                var fsm = tmp.fontSharedMaterial;
+                                tmpFSM = fsm != null ? $"{fsm.name}#{fsm.GetInstanceID()}" : "null";
+                                if (tmpMatMatch == "n/a" && crMat != null && fsm != null)
+                                    tmpMatMatch = crMat.GetInstanceID() == fsm.GetInstanceID() ? "fontShared" : "other";
+                            }
+                            catch { }
                         }
                         else tmpCast = "NULL";
                     }
@@ -243,12 +308,23 @@ public class VRCamera : MonoBehaviour
                             texFmt = tmp2.font.atlasTexture.format.ToString();
                     }
                     catch { }
+                    string snippet = GetVisibleTextSnippet(g);
+                    bool watchTransform =
+                        string.Equals(snippet, "Back", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(snippet, "Resolution", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(snippet, "Display Mode", StringComparison.OrdinalIgnoreCase);
+                    string trSummary = watchTransform ? GetTransformSummary(g) : "";
+                    string trParents = watchTransform ? GetParentChain(g) : "";
                     Log.LogInfo($"[VRCamera] TXT '{cv.gameObject.name}'/{g.gameObject.name} " +
+                                $"text=\"{snippet}\" " +
                                 $"g.col=({vc.r:F2},{vc.g:F2},{vc.b:F2},a={vc.a:F2}) " +
-                                $"tmp.col={tmpCol} tmpCast={tmpCast} " +
-                                $"crA={cra:F2} lz={lz:F3} crShader={crSh} " +
+                                $"tmp.col={tmpCol} tmp.face={tmpFace} tmpCast={tmpCast} " +
+                                $"tmp.fm={tmpFM} tmp.fsm={tmpFSM} tmpMatch={tmpMatMatch} " +
+                                $"crA={cra:F2} grpA={groupAlpha:F2} crClip={crClip} crCull={crCull} lz={lz:F3} crMat={crMn}#{crId} crShader={crSh} " +
+                                $"crFace={crFace} crOutline={crOutline} crOW={crOutlineWidth} " +
                                 $"TSA=({tsa.x:F1},{tsa.y:F1},{tsa.z:F1},{tsa.w:F1}) texFmt={texFmt} " +
-                                $"patched={patched} matSwapped={matSwapped}");
+                                $"patched={patched} matSwapped={matSwapped}" +
+                                (watchTransform ? $" tr={trSummary} chain={trParents}" : ""));
                     if (++shown >= 60) { Log.LogInfo($"[VRCamera] ... (truncated, >{shown} text elements active)"); break; }
                 }
                 // Also dump CanvasGroups so we can spot alpha fade animations.
@@ -356,12 +432,8 @@ public class VRCamera : MonoBehaviour
             _posesValid   = true;
             ApplyCameraPose(_leftCam.transform,  _leftEye);
             ApplyCameraPose(_rightCam.transform, _rightEye);
-            SetProjection(_leftCam,    _leftEye);
-            SetProjection(_rightCam,   _rightEye);
-            // UI cameras inherit world pose from scene cameras (parented to them),
-            // but need their projection matrices set explicitly each frame.
-            SetProjection(_leftUICam,  _leftEye);
-            SetProjection(_rightUICam, _rightEye);
+            SetProjection(_leftCam,  _leftEye);
+            SetProjection(_rightCam, _rightEye);
         }
         else
         {
@@ -396,14 +468,14 @@ public class VRCamera : MonoBehaviour
         _cameraOffset = offsetGO.transform;
 
         // ── Scene cameras (render everything EXCEPT the UI layer) ────────────────
-        // They use the game's own auto-exposure + tonemapping volumes untouched.
+        // Render the scene and world-space UI together through the same eye cameras.
         var leftGO = new GameObject("LeftEye");
         leftGO.transform.SetParent(_cameraOffset, false);
         _leftCam = leftGO.AddComponent<Camera>();
         _leftRT  = new RenderTexture(w, h, 24, RenderTextureFormat.ARGB32) { name = "SoDVR_Left" };
         _leftRT.Create();
         SetupEyeCam(_leftCam, _leftRT);
-        _leftCam.cullingMask = ~(1 << UILayer); // exclude UI layer — rendered by UI cameras
+        _leftCam.cullingMask = ~0;
 
         var rightGO = new GameObject("RightEye");
         rightGO.transform.SetParent(_cameraOffset, false);
@@ -411,187 +483,83 @@ public class VRCamera : MonoBehaviour
         _rightRT  = new RenderTexture(w, h, 24, RenderTextureFormat.ARGB32) { name = "SoDVR_Right" };
         _rightRT.Create();
         SetupEyeCam(_rightCam, _rightRT);
-        _rightCam.cullingMask = ~(1 << UILayer);
-
-        // Prevent scene cameras from seeing the VRExposureOverride volume (layer UIVolumeLayer).
-        // We set the volumeLayerMask to all layers except UIVolumeLayer so the game's own
-        // exposure/tonemapping volumes are used unchanged for scene rendering.
-        try
-        {
-            var hdL = _leftCam.gameObject.GetComponent<HDAdditionalCameraData>();
-            var hdR = _rightCam.gameObject.GetComponent<HDAdditionalCameraData>();
-            int sceneMask = ~(1 << UIVolumeLayer);
-            if (hdL != null) hdL.volumeLayerMask = sceneMask;
-            if (hdR != null) hdR.volumeLayerMask = sceneMask;
-        }
-        catch (Exception ex) { Log.LogWarning($"[VRCamera] Scene camera volumeLayerMask: {ex.Message}"); }
-
-        // ── VRExposureOverride Volume (layer UIVolumeLayer = 31) ─────────────────
-        // Lives on layer 31 — only the UI cameras' volumeLayerMask includes this layer.
-        // EV=0 + Tonemapping=None → UI colours output as direct linear LDR:
-        //   material (2,2,2,a) → clamps to (1,1,1) → white in headset.
-        // Scene cameras' volumeLayerMask excludes layer 31, so their rendering is
-        // completely unaffected and uses the game's own exposure/tonemapping.
-        try
-        {
-            var volGO = new GameObject("VRExposureOverride");
-            volGO.layer = UIVolumeLayer;           // only UI cameras can query it
-            volGO.transform.SetParent(transform, false);
-            var vol     = volGO.AddComponent<Volume>();
-            vol.isGlobal = true;
-            vol.priority = 1000f;
-            var profile  = ScriptableObject.CreateInstance<VolumeProfile>();
-
-            var exp = profile.Add<Exposure>(true);
-            exp.mode.Override(ExposureMode.Fixed);
-            exp.fixedExposure.Override(-10f);      // EV=-10 diagnostic: if text brightens, volume IS applied but EV=0 was wrong
-
-            var tm = profile.Add<Tonemapping>(true);
-            tm.mode.Override(TonemappingMode.None); // no tonemapping — linear→LDR clamp
-
-            vol.sharedProfile = profile;
-            Log.LogInfo("[VRCamera] VRExposureOverride volume on layer 31: EV=0, Tonemapping=None");
-        }
-        catch (Exception volEx)
-        {
-            Log.LogWarning($"[VRCamera] VRExposureOverride volume setup failed: {volEx.Message}");
-        }
-
-        // ── UI overlay cameras (render ONLY the UI layer) ────────────────────────
-        // Parented to their scene-camera sibling so they automatically share the same
-        // world pose after ApplyCameraPose + SetProjection are called in Update.
-        // clearFlags=Depth keeps scene colour and clears depth so UI never z-fights.
-        // volumeLayerMask = 1<<UIVolumeLayer → only the VRExposureOverride volume,
-        // giving EV=0 + Tonemapping=None → full-brightness direct LDR output for UI.
-        _leftUICam  = CreateUIOverlayCam("LeftEyeUI",  _leftCam,  _leftRT);
-        _rightUICam = CreateUIOverlayCam("RightEyeUI", _rightCam, _rightRT);
+        _rightCam.cullingMask = ~0;
 
         // Try to find and disable the game camera now. If it's not available yet
         // (e.g. main menu hasn't spawned one), TryFindGameCamera() will keep retrying in Update().
         TryFindGameCamera();
 
-        // Right-controller cursor dot.
-        // Strategy: create the cursor canvas as ScreenSpaceOverlay so that
-        // ScanAndConvertCanvases finds it and converts it through the normal pipeline.
-        // All game canvases ARE visible because they go through that pipeline.
-        // Standalone WorldSpace canvases created from scratch do NOT render (HDRP registration).
         var ctrlGO = new GameObject("RightController");
         ctrlGO.layer = UILayer;
         ctrlGO.transform.SetParent(_cameraOffset, false);
         _rightControllerGO = ctrlGO;
 
+        // Cursor dot: ScreenSpaceOverlay canvas created here, converted to WorldSpace by
+        // ScanAndConvertCanvases — same pipeline as all game canvases, giving HDRP registration.
+        // NOT in _ownedCanvasIds so RescanCanvasAlpha applies the ZTest Always material patch.
+        // PositionCanvases keeps it at UIDistance in front of the head every frame.
+        // The dot moves via anchoredPosition inside the canvas (2D projection).
         try
         {
             var ccGO = new GameObject("VRCursorCanvasInternal");
             ccGO.layer = UILayer;
-            UnityEngine.Object.DontDestroyOnLoad(ccGO); // survive scene transitions
+            UnityEngine.Object.DontDestroyOnLoad(ccGO); // survive loading→menu scene transition
             var cc = ccGO.AddComponent<Canvas>();
-            cc.renderMode  = RenderMode.ScreenSpaceOverlay; // ScanAndConvertCanvases will convert it
-            cc.sortingOrder = 100; // drawn on top of all game canvases (max game sortingOrder ≈ 10)
+            cc.renderMode   = RenderMode.ScreenSpaceOverlay;
+            cc.sortingOrder = 100; // above all game canvases
+            _cursorCanvas = cc; // cache immediately — don't rely on name-lookup in PositionCanvases
 
-            var dotGO = new GameObject("VRCursorDot");
+            var dotGO = new GameObject("Dot");
             dotGO.layer = UILayer;
-            _cursorRect = dotGO.AddComponent<RectTransform>();
-            _cursorRect.SetParent(ccGO.transform, false);
-            _cursorRect.sizeDelta       = new Vector2(20f, 20f); // 20 canvas px ≈ 3 cm at UICanvasScale
-            _cursorRect.anchorMin       = new Vector2(0.5f, 0.5f);
-            _cursorRect.anchorMax       = new Vector2(0.5f, 0.5f);
-            _cursorRect.pivot           = new Vector2(0.5f, 0.5f);
-            _cursorRect.anchoredPosition = Vector2.zero;
-
+            // Set parent BEFORE adding Image so RectTransform is created in the right hierarchy.
+            dotGO.transform.SetParent(ccGO.transform, false);
+            // AddComponent<Image> creates a RectTransform internally; get it via GetComponent.
+            // Do NOT call AddComponent<RectTransform>() on a fresh GO — it may return null in
+            // IL2CPP because the GO already has a plain Transform component.
             var img = dotGO.AddComponent<Image>();
             img.raycastTarget = false;
-            // Material + color set by ForceUIZTestAlways when canvas is converted.
-            // Will render as a bright white/boosted dot — visible on any background.
+            _cursorRect = dotGO.GetComponent<RectTransform>();
+            if (_cursorRect != null)
+            {
+                _cursorRect.sizeDelta        = new Vector2(20f, 20f);
+                _cursorRect.anchorMin        = new Vector2(0.5f, 0.5f);
+                _cursorRect.anchorMax        = new Vector2(0.5f, 0.5f);
+                _cursorRect.pivot            = new Vector2(0.5f, 0.5f);
+                _cursorRect.anchoredPosition = Vector2.zero;
+            }
 
-            _cursorRect.gameObject.SetActive(false); // hidden until controller pose is valid
-            Log.LogInfo("[VRCamera] VRCursorCanvasInternal created (ScreenSpaceOverlay → will be converted by scan)");
+            dotGO.SetActive(false); // hidden until controller pose is valid
+            Log.LogInfo($"[VRCamera] VRCursorCanvasInternal created — cursorRect={_cursorRect != null}");
         }
         catch (Exception ex)
         {
             Log.LogWarning($"[VRCamera] Cursor canvas creation failed: {ex.Message}");
         }
 
+        // ── Phase 1: VR Settings Panel ───────────────────────────────────────────
+        try
+        {
+            _settingsPanelGO = VRSettingsPanel.Init(
+                _ownedCanvasIds,
+                id => _positionedCanvases.Remove(id));
+            Log.LogInfo("[VRCamera] VRSettingsPanel.Init complete.");
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"[VRCamera] VRSettingsPanel.Init failed: {ex.Message}");
+        }
+
         Log.LogInfo($"[VRCamera] Rig built: {w}x{h} ARGB32");
     }
 
-    /// <summary>
-    /// Creates a UI overlay camera that renders on top of <paramref name="sceneCam"/>'s output.
-    /// The new GO is parented to <paramref name="sceneCam"/>'s transform so it automatically
-    /// inherits whatever pose ApplyCameraPose + SetProjection set each frame.
-    /// </summary>
-    private Camera CreateUIOverlayCam(string goName, Camera sceneCam, RenderTexture rt)
-    {
-        var go  = new GameObject(goName);
-        go.transform.SetParent(sceneCam.transform, false); // inherits scene cam pose
-        var cam = go.AddComponent<Camera>();
-        cam.targetTexture   = rt;
-        cam.clearFlags      = CameraClearFlags.Depth; // keep scene colour; clear depth
-        cam.cullingMask     = 1 << UILayer;           // UI layer only
-        cam.stereoTargetEye = StereoTargetEyeMask.None;
-        cam.nearClipPlane   = 0.01f;
-        cam.farClipPlane    = 1000f;
-        cam.allowHDR        = false;
-        cam.allowMSAA       = false;
-        cam.enabled         = false; // driven manually in LateUpdate
-        cam.depth           = sceneCam.depth + 1; // render after scene camera
-        try
-        {
-            var hd = go.AddComponent<HDAdditionalCameraData>();
-            hd.antialiasing         = HDAdditionalCameraData.AntialiasingMode.None;
-            hd.dithering            = false;
-            hd.hasPersistentHistory = false;
-            // ClearColorMode.None = don't clear the colour buffer; composite UI on top of
-            // whatever the scene camera already wrote to the shared RenderTexture.
-            // Default is ClearColorMode.Sky which would erase the scene render.
-            hd.clearColorMode       = HDAdditionalCameraData.ClearColorMode.None;
-            // Only query the VRExposureOverride volume (layer 31).
-            // This gives EV=0 + Tonemapping=None → UI linear colours map directly to LDR.
-            hd.volumeLayerMask      = 1 << UIVolumeLayer;
-            Log.LogInfo($"[VRCamera] UI overlay cam '{goName}': layer5-only, volumeMask=layer{UIVolumeLayer}");
-
-            // Disable ExposureControl + Tonemapping via FrameSettings so HDRP's exposure
-            // correction doesn't darken unlit UI/Default vertex colours (white → ~0.1 grey).
-            // Same pattern as SetupEyeCam where TonemapOff=True confirmed the write sticks.
-            try
-            {
-                var uiFS = new[] { FrameSettingsField.ExposureControl, FrameSettingsField.Tonemapping };
-                var om   = hd.renderingPathCustomFrameSettingsOverrideMask;
-                foreach (var f in uiFS) om.mask[(uint)(int)f] = true;
-                hd.renderingPathCustomFrameSettingsOverrideMask = om;
-                bool maskOk = hd.renderingPathCustomFrameSettingsOverrideMask
-                                .mask[(uint)(int)FrameSettingsField.ExposureControl];
-                if (maskOk)
-                {
-                    var fs = hd.renderingPathCustomFrameSettings;
-                    foreach (var f in uiFS) fs.SetEnabled(f, false);
-                    hd.renderingPathCustomFrameSettings = fs;
-                    hd.customRenderingSettings = true;
-                    var rb     = hd.renderingPathCustomFrameSettings;
-                    bool expOff = !rb.IsEnabled(FrameSettingsField.ExposureControl);
-                    bool tmOff  = !rb.IsEnabled(FrameSettingsField.Tonemapping);
-                    Log.LogInfo($"[VRCamera] UI cam '{goName}' FS: ExposureOff={expOff} TonemapOff={tmOff}");
-                }
-                else Log.LogWarning($"[VRCamera] UI cam '{goName}': FS override mask didn't persist");
-            }
-            catch (Exception fsEx)
-            {
-                Log.LogWarning($"[VRCamera] UI cam '{goName}' FS setup: {fsEx.Message}");
-            }
-        }
-        catch (Exception ex) { Log.LogWarning($"[VRCamera] UI cam HDData failed: {ex.Message}"); }
-        return cam;
-    }
-
-    // Search all active cameras for one that isn't one of ours.
-    // Disables it so it doesn't render independently, and tracks its transform.
+    // Search all active cameras for one that is not one of ours.
+    // Disables it so it does not render independently, and tracks its transform.
     private void TryFindGameCamera()
     {
         foreach (var cam in Camera.allCameras)
         {
             if (cam == _leftCam || cam == _rightCam) continue;
-            if (cam == _leftUICam || cam == _rightUICam) continue;
-            if (!cam.gameObject.activeInHierarchy)  continue;
+            if (!cam.gameObject.activeInHierarchy) continue;
             _gameCam = cam.transform;
             cam.enabled = false;
             Log.LogInfo($"[VRCamera] Found game camera: '{cam.gameObject.name}' pos={cam.transform.position}");
@@ -601,81 +569,60 @@ public class VRCamera : MonoBehaviour
     }
 
     // Expensive HDRP passes to disable on VR eye cameras.
-    // None of these contribute meaningfully to VR immersion at the cost they incur.
     private static readonly FrameSettingsField[] s_VrDisabledFields =
     {
-        FrameSettingsField.SSAO,                // Screen-space ambient occlusion
-        FrameSettingsField.SSR,                 // Screen-space reflections
-        FrameSettingsField.Volumetrics,         // Volumetric fog/lighting
-        FrameSettingsField.MotionVectors,       // Only needed for TAA/motion-blur (both off)
-        FrameSettingsField.MotionBlur,          // Causes VR sickness, not useful
-        FrameSettingsField.DepthOfField,        // Conflicts with VR focus distance
-        FrameSettingsField.ChromaticAberration, // Post-process noise, no VR benefit
-        FrameSettingsField.ContactShadows,      // Screen-space shadow detail pass
-        // Exposure + tonemapping compress linear (1,1,1) UI colours to ~0.5 grey in the headset.
-        // Disabling both gives direct linear→LDR output so UI/text renders at its literal colour.
-        // Scene geometry may lose auto-exposure correction but remains fully readable in VR.
-        FrameSettingsField.ExposureControl,     // Bypass HDRP auto-exposure on eye cameras
-        FrameSettingsField.Tonemapping,         // Bypass tonemapping; LDR clamp gives correct UI white
+        FrameSettingsField.SSAO,
+        FrameSettingsField.SSR,
+        FrameSettingsField.Volumetrics,
+        FrameSettingsField.MotionVectors,
+        FrameSettingsField.MotionBlur,
+        FrameSettingsField.DepthOfField,
+        FrameSettingsField.ChromaticAberration,
+        FrameSettingsField.ContactShadows,
+        FrameSettingsField.Tonemapping,
     };
 
     private void SetupEyeCam(Camera cam, RenderTexture rt)
     {
-        cam.targetTexture   = rt;
+        cam.targetTexture = rt;
         cam.stereoTargetEye = StereoTargetEyeMask.None;
-        cam.nearClipPlane   = 0.01f;
-        cam.farClipPlane    = 1000f;
-        cam.allowHDR        = false;  // LDR matches UNORM_SRGB swapchain format
-        cam.allowMSAA       = false;  // HDRP manages AA itself; disabled below
-        cam.enabled         = false;  // we call Render() explicitly in LateUpdate
+        cam.nearClipPlane = 0.01f;
+        cam.farClipPlane = 1000f;
+        cam.allowHDR = false;
+        cam.allowMSAA = false;
+        cam.enabled = false;
 
         try
         {
             var hd = cam.gameObject.GetComponent<HDAdditionalCameraData>()
                   ?? cam.gameObject.AddComponent<HDAdditionalCameraData>();
 
-            // Disable TAA — causes per-frame history buffer writes (memory leak) and VR ghosting.
-            hd.antialiasing     = HDAdditionalCameraData.AntialiasingMode.None;
-            hd.dithering        = false;
+            hd.antialiasing = HDAdditionalCameraData.AntialiasingMode.None;
+            hd.dithering = false;
             hd.hasPersistentHistory = false;
 
-            // ── FrameSettings: disable expensive passes ────────────────────────
-            // Step 1: build override mask — get the struct, set bits, write back via setter.
-            // renderingPathCustomFrameSettingsOverrideMask has a real setter in HDRP 13,
-            // so the get→modify→set-back pattern works correctly here.
             var om = hd.renderingPathCustomFrameSettingsOverrideMask;
             foreach (var f in s_VrDisabledFields)
                 om.mask[(uint)(int)f] = true;
             hd.renderingPathCustomFrameSettingsOverrideMask = om;
 
-            // Step 2: verify at least the first bit stuck (guards against IL2CPP struct copy issues).
             bool maskOk = hd.renderingPathCustomFrameSettingsOverrideMask
                             .mask[(uint)(int)FrameSettingsField.SSAO];
 
             if (maskOk)
             {
-                // Step 3: disable the passes in the custom FrameSettings.
-                // renderingPathCustomFrameSettings is a ref-returning property in HDRP 13;
-                // Il2CppInterop exposes this as a value-returning getter, so we must
-                // get a copy, modify it, and write it back.
                 var fs = hd.renderingPathCustomFrameSettings;
                 foreach (var f in s_VrDisabledFields)
                     fs.SetEnabled(f, false);
                 hd.renderingPathCustomFrameSettings = fs;
-
-                // Step 4: enable custom frame settings only now that both mask and values are set.
                 hd.customRenderingSettings = true;
                 Log.LogInfo($"[VRCamera] HDRP: AA=None, customFS=true, {s_VrDisabledFields.Length} passes off on {cam.gameObject.name}");
 
-                // Readback to verify the IL2CPP struct write actually persisted.
-                // If ExposureOff/TonemapOff print False here, the setter is a no-op and
-                // we must rely on the Volume override instead.
                 try
                 {
                     var fsRb = hd.renderingPathCustomFrameSettings;
-                    bool expOff  = !fsRb.IsEnabled(FrameSettingsField.ExposureControl);
                     bool tmapOff = !fsRb.IsEnabled(FrameSettingsField.Tonemapping);
-                    Log.LogInfo($"[VRCamera] HDRP FS readback on {cam.gameObject.name}: ExposureOff={expOff} TonemapOff={tmapOff}");
+                    Log.LogInfo($"[VRCamera] HDRP FS readback on {cam.gameObject.name}: TonemapOff={tmapOff}");
                 }
                 catch (Exception rbEx)
                 {
@@ -684,7 +631,7 @@ public class VRCamera : MonoBehaviour
             }
             else
             {
-                Log.LogWarning($"[VRCamera] HDRP: override mask did not persist (IL2CPP struct copy) — skipping customFS on {cam.gameObject.name}");
+                Log.LogWarning($"[VRCamera] HDRP: override mask did not persist (IL2CPP struct copy) - skipping customFS on {cam.gameObject.name}");
                 Log.LogInfo($"[VRCamera] HDRP: AA=None, no history on {cam.gameObject.name}");
             }
         }
@@ -694,14 +641,11 @@ public class VRCamera : MonoBehaviour
         }
     }
 
-    // ── LateUpdate: render → copy → end frame ────────────────────────────────
-
     private void LateUpdate()
     {
         if (!_stereoReady || !_frameOpen) return;
         _frameOpen = false;
 
-        // Reposition all managed canvases in front of the current head pose.
         PositionCanvases();
 
         try
@@ -712,35 +656,22 @@ public class VRCamera : MonoBehaviour
                 return;
             }
 
-            // Render both eyes into their RenderTextures.
-            // Throttled by RenderEveryNFrames (1 = every frame, 2 = every other, etc.).
-            // The D3D11 copy still runs every frame, so ATW can correct head motion between renders.
-            // Unity D3D11 stores RenderTextures Y-flipped; invertCulling compensates
-            // for the negated projection Y row (see SetProjection).
             if ((_frameCount % RenderEveryNFrames) == 0)
             {
-                // Flush all pending canvas dirty flags before rendering so the eye cameras
-                // see the current frame's canvas materials (not last frame's state).
-                // Without this, canvas rebuilds triggered by our material assignments fire
-                // AFTER LateUpdate via Canvas.willRenderCanvases, meaning eye cameras always
-                // see stale (default/dark) materials.
                 Canvas.ForceUpdateCanvases();
 
                 GL.invertCulling = true;
-                _leftCam.Render();    // scene (all layers except UI)
-                _leftUICam.Render();  // UI overlay (layer 5 only, EV=0/no tonemapping)
+                _leftCam.Render();
                 _rightCam.Render();
-                _rightUICam.Render();
                 GL.invertCulling = false;
             }
 
-            // Acquire swapchain images, copy, release, then submit.
-            bool leftOk  = CopyEye(true,  out uint leftIdx);
+            bool leftOk = CopyEye(true, out uint leftIdx);
             bool rightOk = CopyEye(false, out uint rightIdx);
 
             if (!leftOk || !rightOk)
             {
-                Log.LogWarning("[VRCamera] Swapchain copy failed — empty frame.");
+                Log.LogWarning("[VRCamera] Swapchain copy failed - empty frame.");
                 OpenXRManager.FrameEndEmpty(_displayTime);
                 return;
             }
@@ -748,7 +679,7 @@ public class VRCamera : MonoBehaviour
             OpenXRManager.FrameEndStereo(_displayTime, _leftEye, _rightEye, leftIdx, rightIdx);
 
             _frameCount++;
-            if (_frameCount <= 10 || (_frameCount % 60) == 0)
+            if (_frameCount <= 10)
                 Log.LogInfo($"[VRCamera] Stereo frame #{_frameCount}");
         }
         catch (Exception ex)
@@ -762,18 +693,25 @@ public class VRCamera : MonoBehaviour
     {
         imageIndex = 0;
         string eye = left ? "L" : "R";
-        ulong sc     = left ? OpenXRManager.LeftSwapchain         : OpenXRManager.RightSwapchain;
-        var   images = left ? OpenXRManager.LeftSwapchainImages    : OpenXRManager.RightSwapchainImages;
-        var   rt     = left ? _leftRT : _rightRT;
+        ulong sc = left ? OpenXRManager.LeftSwapchain : OpenXRManager.RightSwapchain;
+        IntPtr[] images = left ? OpenXRManager.LeftSwapchainImages : OpenXRManager.RightSwapchainImages;
+        RenderTexture rt = left ? _leftRT : _rightRT;
 
-        if (!OpenXRManager.AcquireSwapchainImage(sc, out imageIndex, out int acquireRc))
+        if (sc == 0 || images == null || images.Length == 0 || rt == null)
         {
-            if (_frameCount < 5) Log.LogWarning($"[VRCamera] {eye} AcquireSwapchainImage rc={acquireRc}");
+            Log.LogWarning($"[VRCamera] {eye} copy skipped - swapchain not ready");
             return false;
         }
+
+        if (!OpenXRManager.AcquireSwapchainImage(sc, out imageIndex))
+        {
+            Log.LogWarning($"[VRCamera] {eye} AcquireSwapchainImage failed");
+            return false;
+        }
+
         if (!OpenXRManager.WaitSwapchainImage(sc))
         {
-            if (_frameCount < 5) Log.LogWarning($"[VRCamera] {eye} WaitSwapchainImage failed");
+            Log.LogWarning($"[VRCamera] {eye} WaitSwapchainImage failed");
             OpenXRManager.ReleaseSwapchainImage(sc);
             return false;
         }
@@ -792,16 +730,13 @@ public class VRCamera : MonoBehaviour
         return true;
     }
 
-    // ── UI canvas management ──────────────────────────────────────────────────
-
     /// <summary>
-    /// Finds all root Screen Space canvases that haven't been converted yet and
+    /// Finds all root Screen Space canvases that have not been converted yet and
     /// changes them to WorldSpace so the eye cameras can see them.
     /// Called every UICanvasScanRate frames (pre- and post-stereo).
     /// </summary>
     private void ScanAndConvertCanvases()
     {
-        // Prune entries whose GameObjects have been destroyed.
         var dead = new List<int>();
         foreach (var kvp in _managedCanvases)
             if (kvp.Value == null) dead.Add(kvp.Key);
@@ -810,8 +745,6 @@ public class VRCamera : MonoBehaviour
         Canvas[] all;
         try
         {
-            // Resources.FindObjectsOfTypeAll is more reliable than FindObjectsOfType in
-            // IL2CPP for types outside UnityEngine.CoreModule (like UnityEngine.UI.Canvas).
             all = Resources.FindObjectsOfTypeAll<Canvas>();
         }
         catch (Exception ex)
@@ -820,37 +753,35 @@ public class VRCamera : MonoBehaviour
             return;
         }
 
-        // Diagnostic: log scan result counts so we can tell if the call is working.
         if (_frameCount <= 60 || (_frameCount % 300) == 0)
             Log.LogInfo($"[VRCamera] Canvas scan: found {all.Length} canvas(es), managed={_managedCanvases.Count}");
 
         foreach (var canvas in all)
         {
             if (canvas == null) continue;
-
-            if (!canvas.isRootCanvas) continue;                     // skip nested canvases
-            if (canvas.renderMode == RenderMode.WorldSpace) continue; // already converted
+            if (!canvas.isRootCanvas) continue;
+            if (canvas.renderMode == RenderMode.WorldSpace) continue;
             int id = canvas.GetInstanceID();
-            if (_managedCanvases.ContainsKey(id)) continue;         // already converted
+            if (_managedCanvases.ContainsKey(id)) continue;
+
+            // Skip high-churn transient canvases that get constantly created/destroyed
+            // by the city generator (MapDuctComponent, MapButtonComponent, etc.).
+            // These would spam the log and waste material patch slots.
+            string cname = canvas.gameObject.name ?? "";
+            if (cname.IndexOf("MapDuct", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                cname.IndexOf("MapButton", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                cname.IndexOf("Loading Icon", StringComparison.OrdinalIgnoreCase) >= 0)
+                continue;
 
             ConvertCanvasToWorldSpace(canvas);
             _managedCanvases[id] = canvas;
         }
 
-        // Rescan already-managed root canvases for newly added or activated child graphics.
-        // Secondary menus often activate child panels *after* the root canvas was converted,
-        // so their graphics would never have been material-boosted or alpha-fixed otherwise.
-        // RescanCanvasAlpha is a lightweight pass: material cache hits are free, and vertex
-        // alpha is only set for graphics not yet in s_vertexAlphaFixed.
         foreach (var kvp in _managedCanvases)
         {
             if (kvp.Value != null) RescanCanvasAlpha(kvp.Value);
         }
 
-        // Also look for nested Canvas components inside managed root canvases.
-        // Some games place secondary-menu panels as child canvases (not root), which the
-        // main scan skips.  We convert their graphics but leave renderMode as-is (they
-        // inherit WorldSpace from the root).
         var rootList = new List<Canvas>(_managedCanvases.Values);
         foreach (var root in rootList)
         {
@@ -862,55 +793,25 @@ public class VRCamera : MonoBehaviour
             {
                 if (nc == null) continue;
                 int nid = nc.GetInstanceID();
-                if (nid == root.GetInstanceID()) continue; // skip self
-                if (_managedCanvases.ContainsKey(nid)) continue; // already tracked
+                if (nid == root.GetInstanceID()) continue;
+                if (_managedCanvases.ContainsKey(nid)) continue;
 
-                // Patch graphics in this nested canvas.
                 int patched = ForceUIZTestAlways(nc, logQueueMap: true);
                 _managedCanvases[nid] = nc;
-                Log.LogInfo($"[VRCamera] NestedCanvas '{nc.gameObject.name}' " +
-                            $"in '{root.gameObject.name}' patched={patched}");
+                Log.LogInfo($"[VRCamera] NestedCanvas '{nc.gameObject.name}' in '{root.gameObject.name}' patched={patched}");
             }
         }
 
-        // Lazily assign worldCamera once the stereo rig is ready (canvases may be
-        // converted before _leftCam exists, so we back-fill here each scan cycle).
         if (_leftCam != null)
         {
             foreach (var c in _managedCanvases.Values)
                 if (c != null && c.worldCamera == null) c.worldCamera = _leftCam;
         }
     }
-
-    /// <summary>
-    /// Lightweight per-scan-cycle pass over an already-managed canvas that patches any
-    /// graphics not yet processed (newly added or late-activated children).
-    ///
-    /// "Already processed" is detected by reading <c>unity_GUIZTestMode</c> from the
-    /// graphic's current material: if it equals 8 (Always), we set it — skip.  This is
-    /// more reliable than <c>GetInstanceID()</c> in IL2CPP, where the managed wrapper
-    /// objects returned by <c>GetComponentsInChildren</c> are re-created each call and
-    /// may have different C# identity even for the same native object.
-    ///
-    /// New background elements → renderQueue 3000 (drawn first, always behind).
-    /// New foreground elements → renderQueue 3009 (drawn last, always in front).
-    /// This prevents re-scan materials from colliding with the initial 0-9 tier spread
-    /// and avoids backgrounds burying text via HDRP distance sort.
-    /// </summary>
     // Native IL2CPP object pointers of Graphics we have already patched.
-    // g.Pointer is the raw address of the native C++ component — stable for the object's
-    // lifetime and immune to C# wrapper recreation (unlike GetInstanceID() or material.name).
     private static readonly HashSet<IntPtr> s_patchedGraphicPtrs = new();
-    // Maps native Graphic pointer → the VRPatch material we assigned.
-    // Used by RescanCanvasAlpha to restore the material if Unity resets it on SetActive.
     private static readonly Dictionary<IntPtr, Material> s_patchedMats = new();
 
-    /// <summary>
-    /// Returns the number of Transform steps from <paramref name="t"/> up to (but not including)
-    /// <paramref name="root"/>, clamped to [0, 9].  Used to assign renderQueue tiers so that
-    /// parent elements always get a lower queue than their children — guaranteeing correct
-    /// painter order regardless of where elements appear in the flat GetComponentsInChildren list.
-    /// </summary>
     private static int ComputeDepth(Transform t, Transform root)
     {
         int depth = 0;
@@ -922,14 +823,11 @@ public class VRCamera : MonoBehaviour
         return depth;
     }
 
-    /// <summary>Returns true if the Graphic is a text-rendering component (legacy Text or TMP).</summary>
     private static bool IsTextGraphic(Graphic g)
     {
         try
         {
-            // Legacy UnityEngine.UI.Text — TryCast is reliable for managed interop types.
             if (g.TryCast<UnityEngine.UI.Text>() != null) return true;
-            // TextMeshPro family — may not be in interop assemblies; use type name check.
             string tn = g.GetIl2CppType()?.Name ?? "";
             return tn.IndexOf("TextMeshPro", StringComparison.OrdinalIgnoreCase) >= 0
                 || tn == "TMP_Text" || tn == "TMP_SubMeshUI";
@@ -937,44 +835,674 @@ public class VRCamera : MonoBehaviour
         catch { return false; }
     }
 
-    private void RescanCanvasAlpha(Canvas canvas)
+    private static Color BoostRgb(Color c, float boost)
+        => new(c.r * boost, c.g * boost, c.b * boost, Mathf.Max(c.a, 1f));
+
+    private void ApplyReadableTextBoost(Graphic g)
     {
-        string canvasName = canvas.gameObject.name;
+        if (g == null || !IsTextGraphic(g)) return;
+        if (!s_textBoostedGraphics.Add(g.Pointer)) return;
+
         try
         {
-            // ── Mask / RectMask2D disable ─────────────────────────────────────────
-            // Both Mask (stencil) and RectMask2D (software scissor) break in WorldSpace:
-            // stencil conflicts with HDRP; RectMask2D uses stale screen-space rects that
-            // clip ScrollRect content to nothing.  Disable both.
-            try
+            var tmp = g.TryCast<TMP_Text>();
+            if (tmp != null)
+                tmp.color = BoostRgb(tmp.color, UITextBrightnessBoost);
+            else
+                g.color = BoostRgb(g.color, UITextBrightnessBoost);
+        }
+        catch { }
+
+        try
+        {
+            var mat = g.material;
+            if (mat != null)
             {
-                var masks = canvas.GetComponentsInChildren<UnityEngine.UI.Mask>(true);
-                foreach (var m in masks)
+                if (mat.HasProperty("_Color"))
+                    mat.color = BoostRgb(mat.color, UITextBrightnessBoost);
+                if (mat.HasProperty("_FaceColor"))
+                    mat.SetColor("_FaceColor", BoostRgb(mat.GetColor("_FaceColor"), UITextBrightnessBoost));
+            }
+        }
+        catch { }
+
+        try
+        {
+            var crMat = g.canvasRenderer.GetMaterial(0);
+            if (crMat != null)
+            {
+                if (crMat.HasProperty("_Color"))
+                    crMat.color = BoostRgb(crMat.color, UITextBrightnessBoost);
+                if (crMat.HasProperty("_FaceColor"))
+                    crMat.SetColor("_FaceColor", BoostRgb(crMat.GetColor("_FaceColor"), UITextBrightnessBoost));
+            }
+        }
+        catch { }
+    }
+
+    private static bool ShouldRelaxMenuClipping(Canvas canvas)
+    {
+        if (canvas == null) return false;
+        string name = canvas.gameObject.name;
+        return string.Equals(name, "MenuCanvas", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetVisibleTextSnippet(Graphic g)
+    {
+        try
+        {
+            var tmp = g.TryCast<TMP_Text>();
+            if (tmp != null)
+            {
+                string text = tmp.text ?? "";
+                text = text.Replace("\r", " ").Replace("\n", " ").Trim();
+                if (text.Length > 48) text = text[..48];
+                return text;
+            }
+        }
+        catch { }
+
+        try
+        {
+            var uguiText = g.TryCast<UnityEngine.UI.Text>();
+            if (uguiText != null)
+            {
+                string text = uguiText.text ?? "";
+                text = text.Replace("\r", " ").Replace("\n", " ").Trim();
+                if (text.Length > 48) text = text[..48];
+                return text;
+            }
+        }
+        catch { }
+
+        return "";
+    }
+
+    private static bool IsLikelyNavButtonText(Graphic g)
+    {
+        if (g == null) return false;
+
+        string snippet = GetVisibleTextSnippet(g);
+        if (string.Equals(snippet, "Back", StringComparison.OrdinalIgnoreCase)) return true;
+        if (string.Equals(snippet, "Continue", StringComparison.OrdinalIgnoreCase)) return true;
+        if (string.Equals(snippet, "Settings", StringComparison.OrdinalIgnoreCase)) return true;
+        if (string.Equals(snippet, "Options", StringComparison.OrdinalIgnoreCase)) return true;
+
+        try
+        {
+            for (Transform t = g.transform; t != null; t = t.parent)
+            {
+                string n = t.gameObject.name ?? "";
+                if (n.IndexOf("button", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (n.IndexOf("back", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (n.IndexOf("tab", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+        }
+        catch { }
+
+        return false;
+    }
+
+    private static bool IsLikelySettingsLabelText(Graphic g)
+    {
+        if (g == null) return false;
+
+        string snippet = GetVisibleTextSnippet(g);
+        if (string.IsNullOrWhiteSpace(snippet)) return false;
+
+        try
+        {
+            string objName = g.gameObject.name ?? "";
+            if (string.Equals(objName, "LabelText", StringComparison.OrdinalIgnoreCase)) return true;
+            if (string.Equals(objName, "Label", StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        catch { }
+
+        return IsScrollViewMenuText(g);
+    }
+
+    private static bool IsScrollViewMenuText(Graphic g)
+    {
+        if (g == null) return false;
+        try
+        {
+            for (Transform t = g.transform; t != null; t = t.parent)
+            {
+                string n = t.gameObject.name ?? "";
+                if (string.Equals(n, "Scroll View", StringComparison.OrdinalIgnoreCase)) return true;
+                if (string.Equals(n, "Viewport", StringComparison.OrdinalIgnoreCase)) return true;
+                if (string.Equals(n, "Content", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    private static string GetTransformSummary(Graphic g)
+    {
+        if (g == null) return "n/a";
+        try
+        {
+            var rt = g.rectTransform;
+            var wp = rt.position;
+            var lp = rt.localPosition;
+            var sz = rt.rect.size;
+            var sc = rt.lossyScale;
+            return $"wp=({wp.x:F2},{wp.y:F2},{wp.z:F2}) lp=({lp.x:F2},{lp.y:F2},{lp.z:F2}) rs=({sz.x:F1},{sz.y:F1}) ls=({sc.x:F3},{sc.y:F3},{sc.z:F3})";
+        }
+        catch { return "n/a"; }
+    }
+
+    private static string GetParentChain(Graphic g, int maxDepth = 6)
+    {
+        if (g == null) return "n/a";
+        try
+        {
+            var parts = new List<string>();
+            int depth = 0;
+            for (Transform t = g.transform; t != null && depth < maxDepth; t = t.parent, depth++)
+                parts.Add(t.gameObject.name ?? "null");
+            return string.Join(" <- ", parts);
+        }
+        catch { return "n/a"; }
+    }
+
+    private static Transform FindAncestorByName(Transform start, params string[] names)
+    {
+        try
+        {
+            for (Transform t = start; t != null; t = t.parent)
+            {
+                string n = t.gameObject.name ?? "";
+                foreach (var want in names)
                 {
-                    if (m == null || !m.enabled) continue;
-                    m.enabled = false;
-                    Log.LogInfo($"[VRCamera] MaskDisabled(rescan) '{m.gameObject.name}' on '{canvasName}'");
+                    if (string.Equals(n, want, StringComparison.OrdinalIgnoreCase))
+                        return t;
                 }
             }
-            catch { }
+        }
+        catch { }
+        return null;
+    }
+
+    private static void SyncReadableFallbackRect(RectTransform src, RectTransform dst, float zOffset)
+    {
+        if (src == null || dst == null) return;
+        try
+        {
+            var parent = dst.parent;
+            Vector3 targetWorld = src.position + (src.forward * zOffset);
+
+            dst.anchorMin = new Vector2(0.5f, 0.5f);
+            dst.anchorMax = new Vector2(0.5f, 0.5f);
+            dst.pivot = src.pivot;
+            dst.sizeDelta = src.rect.size;
+
+            if (parent != null)
+            {
+                dst.localPosition = parent.InverseTransformPoint(targetWorld);
+                dst.localRotation = Quaternion.Inverse(parent.rotation) * src.rotation;
+            }
+            else
+            {
+                dst.position = targetWorld;
+                dst.rotation = src.rotation;
+            }
+
+            dst.localScale = Vector3.one;
+        }
+        catch { }
+    }
+
+    private void EnsureMenuTextFallback(Graphic g)
+    {
+        if (g == null || !ShouldRelaxMenuClipping(g.canvas)) return;
+        if (!IsLikelyNavButtonText(g) && !IsLikelySettingsLabelText(g)) return;
+
+        var tmp = g.TryCast<TMP_Text>();
+        if (tmp == null) return;
+
+        string text = tmp.text ?? "";
+        if (string.IsNullOrWhiteSpace(text)) return;
+
+        int sourceId = g.GetInstanceID();
+        if (!s_menuTextFallbacks.TryGetValue(sourceId, out var fallback) || fallback == null)
+        {
+            var go = new GameObject("VRReadableFallbackText");
+            go.layer = g.gameObject.layer;
             try
             {
-                var rm2ds = canvas.GetComponentsInChildren<UnityEngine.UI.RectMask2D>(true);
-                foreach (var rm in rm2ds)
-                {
-                    if (rm == null) continue;
-                    var rmPtr = rm.Pointer;
-                    if (!rm.enabled && s_disabledRectMasks.Contains(rmPtr)) continue;
-                    if (rm.enabled) rm.enabled = false;
-                    if (s_disabledRectMasks.Add(rmPtr))
-                        Log.LogInfo($"[VRCamera] RectMask2DDisabled '{rm.gameObject.name}' on '{canvasName}'");
-                }
+                Transform parent = g.transform.parent;
+                if (IsLikelySettingsLabelText(g))
+                    parent = FindAncestorByName(g.transform, "Components", "GraphicsSettingsPanel", "MainMenu") ?? parent;
+                else if (IsLikelyNavButtonText(g))
+                    parent = FindAncestorByName(g.transform, "ButtonArea", "GraphicsSettingsPanel", "MainMenu") ?? parent;
+                if (parent == null && g.canvas != null) parent = g.canvas.transform;
+                go.transform.SetParent(parent, true);
             }
             catch { }
 
-            // ── Force all canvas children onto UILayer ────────────────────────────────
-            // Catches dynamically-created option items that spawn on Layer 0 after the
-            // initial ForceUIZTestAlways pass.
+            var rt = go.AddComponent<RectTransform>();
+            fallback = go.AddComponent<TextMeshProUGUI>();
+            fallback.raycastTarget = false;
+            fallback.maskable = false;
+            fallback.richText = false;
+            fallback.enableWordWrapping = false;
+            fallback.font = tmp.font;
+            fallback.alignment = tmp.alignment;
+            fallback.overflowMode = TextOverflowModes.Overflow;
+            fallback.outlineColor = new Color32(0, 0, 0, 255);
+            fallback.outlineWidth = 0.45f;
+            fallback.faceColor = new Color32(255, 255, 255, 255);
+
+            s_menuTextFallbacks[sourceId] = fallback;
+            SyncReadableFallbackRect(g.rectTransform, rt, IsLikelySettingsLabelText(g) ? -0.03f : -0.02f);
+        }
+
+        try
+        {
+            bool highContrast = IsLikelyNavButtonText(g) || IsLikelySettingsLabelText(g);
+            fallback.gameObject.layer = g.gameObject.layer;
+            fallback.text = text;
+            fallback.enabled = true;
+            fallback.font = tmp.font;
+            fallback.fontStyle = FontStyles.Bold;
+            fallback.fontSize = tmp.fontSize;
+            fallback.alignment = tmp.alignment;
+            fallback.color = highContrast ? new Color(20f, 20f, 20f, 1f) : new Color(12f, 12f, 12f, 1f);
+            fallback.faceColor = new Color32(255, 255, 255, 255);
+            fallback.outlineColor = new Color32(0, 0, 0, 255);
+            fallback.outlineWidth = 0.45f;
+            fallback.canvasRenderer.cull = false;
+            fallback.canvasRenderer.SetAlpha(1f);
+            fallback.maskable = false;
+            Material fbMat = null;
+            try { fbMat = fallback.fontMaterial; } catch { }
+            if (fbMat != null) ForceReadableTmpMaterialState(fbMat, tmp.font?.atlasTexture, true);
+            SyncReadableFallbackRect(g.rectTransform, fallback.rectTransform, IsLikelySettingsLabelText(g) ? -0.03f : -0.02f);
+            fallback.transform.SetAsLastSibling();
+        }
+        catch { }
+    }
+
+    private void RelaxMenuCanvasClipping(Canvas canvas)
+    {
+        if (!ShouldRelaxMenuClipping(canvas)) return;
+
+        int canvasId = canvas.GetInstanceID();
+        bool firstPass = s_menuMaskRelaxedCanvases.Add(canvasId);
+
+        int disabledMasks = 0;
+        try
+        {
+            var masks = canvas.GetComponentsInChildren<Mask>(true);
+            foreach (var mask in masks)
+            {
+                if (mask == null || !mask.enabled) continue;
+                mask.enabled = false;
+                disabledMasks++;
+            }
+        }
+        catch { }
+
+        int disabledRectMasks = 0;
+        try
+        {
+            var rectMasks = canvas.GetComponentsInChildren<RectMask2D>(true);
+            foreach (var rectMask in rectMasks)
+            {
+                if (rectMask == null || !rectMask.enabled) continue;
+                rectMask.enabled = false;
+                disabledRectMasks++;
+            }
+        }
+        catch { }
+
+        int textUnmasked = 0;
+        int rectClipCleared = 0;
+        int rendererUnculled = 0;
+        int canvasGroupsRaised = 0;
+        try
+        {
+            var groups = canvas.GetComponentsInChildren<CanvasGroup>(true);
+            foreach (var group in groups)
+            {
+                if (group == null) continue;
+                if (group.alpha < 0.99f)
+                {
+                    group.alpha = 1f;
+                    canvasGroupsRaised++;
+                }
+            }
+        }
+        catch { }
+        try
+        {
+            var graphics = canvas.GetComponentsInChildren<Graphic>(true);
+            foreach (var g in graphics)
+            {
+                if (g == null || !IsTextGraphic(g)) continue;
+
+                try
+                {
+                    if (g.canvasRenderer.hasRectClipping)
+                    {
+                        g.canvasRenderer.DisableRectClipping();
+                        rectClipCleared++;
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    if (g.canvasRenderer.cull)
+                    {
+                        g.canvasRenderer.cull = false;
+                        rendererUnculled++;
+                    }
+                }
+                catch { }
+
+                var maskable = g.TryCast<MaskableGraphic>();
+                if (maskable == null) continue;
+
+                int gid = g.GetInstanceID();
+                bool wasTracked = s_menuMaskabilityRelaxed.Contains(gid);
+                if (maskable.maskable)
+                {
+                    maskable.maskable = false;
+                    textUnmasked++;
+                }
+                if (!wasTracked) s_menuMaskabilityRelaxed.Add(gid);
+            }
+        }
+        catch { }
+
+        if (firstPass || disabledMasks > 0 || disabledRectMasks > 0 || textUnmasked > 0)
+        {
+            Log.LogInfo(
+                $"[VRCamera] MenuClipRelax '{canvas.gameObject.name}': " +
+                $"Mask={disabledMasks} RectMask2D={disabledRectMasks} TextMaskable={textUnmasked} RectClipCleared={rectClipCleared} " +
+                $"TextUnculled={rendererUnculled} CanvasGroupAlpha={canvasGroupsRaised}");
+        }
+    }
+
+    private static void NeutralizeStencilMasking(Material mat)
+    {
+        if (mat == null) return;
+
+        try { if (mat.HasProperty("_Stencil")) mat.SetInt("_Stencil", 0); } catch { }
+        try { if (mat.HasProperty("_StencilComp")) mat.SetInt("_StencilComp", (int)CompareFunction.Always); } catch { }
+        try { if (mat.HasProperty("_StencilOp")) mat.SetInt("_StencilOp", (int)StencilOp.Keep); } catch { }
+        try { if (mat.HasProperty("_StencilReadMask")) mat.SetInt("_StencilReadMask", 255); } catch { }
+        try { if (mat.HasProperty("_StencilWriteMask")) mat.SetInt("_StencilWriteMask", 255); } catch { }
+        try { if (mat.HasProperty("_ColorMask")) mat.SetInt("_ColorMask", 15); } catch { }
+        try { if (mat.HasProperty("_UseUIAlphaClip")) mat.SetInt("_UseUIAlphaClip", 0); } catch { }
+    }
+
+    private static void StrengthenMenuTextMaterial(Material mat)
+    {
+        if (mat == null) return;
+
+        try
+        {
+            if (mat.HasProperty("_FaceColor"))
+                mat.SetColor("_FaceColor", new Color(8f, 8f, 8f, 1f));
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_Color"))
+                mat.color = new Color(8f, 8f, 8f, 1f);
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_OutlineColor"))
+                mat.SetColor("_OutlineColor", new Color(0f, 0f, 0f, 1f));
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_OutlineWidth"))
+                mat.SetFloat("_OutlineWidth", 0.2f);
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_UnderlayColor"))
+                mat.SetColor("_UnderlayColor", new Color(0f, 0f, 0f, 0.95f));
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_UnderlayOffsetX"))
+                mat.SetFloat("_UnderlayOffsetX", 0.05f);
+            if (mat.HasProperty("_UnderlayOffsetY"))
+                mat.SetFloat("_UnderlayOffsetY", -0.05f);
+            if (mat.HasProperty("_UnderlayDilate"))
+                mat.SetFloat("_UnderlayDilate", 0.2f);
+            if (mat.HasProperty("_UnderlaySoftness"))
+                mat.SetFloat("_UnderlaySoftness", 0f);
+        }
+        catch { }
+
+        try { mat.EnableKeyword("OUTLINE_ON"); } catch { }
+        try { mat.EnableKeyword("UNDERLAY_ON"); } catch { }
+    }
+
+    private static void ForceReadableTmpMaterialState(Material mat, Texture atlasTexture, bool highContrast = false)
+    {
+        if (mat == null) return;
+
+        NeutralizeStencilMasking(mat);
+        StrengthenMenuTextMaterial(mat);
+
+        try
+        {
+            if (atlasTexture != null && mat.HasProperty("_MainTex"))
+                mat.SetTexture("_MainTex", atlasTexture);
+        }
+        catch { }
+
+        try
+        {
+            if (atlasTexture != null && mat.HasProperty("_FaceTex"))
+                mat.SetTexture("_FaceTex", atlasTexture);
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_FaceColor"))
+                mat.SetColor("_FaceColor", highContrast ? new Color(20f, 20f, 20f, 1f) : new Color(8f, 8f, 8f, 1f));
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_Color"))
+                mat.color = highContrast ? new Color(20f, 20f, 20f, 1f) : new Color(8f, 8f, 8f, 1f);
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_OutlineColor"))
+                mat.SetColor("_OutlineColor", new Color(0f, 0f, 0f, 1f));
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_OutlineWidth"))
+                mat.SetFloat("_OutlineWidth", highContrast ? 0.45f : 0.25f);
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_UnderlayColor"))
+                mat.SetColor("_UnderlayColor", new Color(0f, 0f, 0f, 1f));
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_UnderlayOffsetX"))
+                mat.SetFloat("_UnderlayOffsetX", highContrast ? 0.08f : 0.05f);
+            if (mat.HasProperty("_UnderlayOffsetY"))
+                mat.SetFloat("_UnderlayOffsetY", highContrast ? -0.08f : -0.05f);
+            if (mat.HasProperty("_UnderlayDilate"))
+                mat.SetFloat("_UnderlayDilate", highContrast ? 0.35f : 0.2f);
+            if (mat.HasProperty("_UnderlaySoftness"))
+                mat.SetFloat("_UnderlaySoftness", 0f);
+        }
+        catch { }
+
+        try
+        {
+            if (mat.HasProperty("_TextureSampleAdd"))
+                mat.SetVector("_TextureSampleAdd", Vector4.zero);
+        }
+        catch { }
+    }
+
+    private void ApplyMenuTextShaderFallback(Graphic g, Material mat)
+    {
+        // Disabled in favor of patching TMP's actual font materials directly.
+    }
+
+    private void ApplyMenuTmpReadableMaterial(Graphic g)
+    {
+        if (g == null) return;
+        var tmp = g.TryCast<TMP_Text>();
+        if (tmp == null) return;
+        bool highContrast = IsLikelyNavButtonText(g) || IsLikelySettingsLabelText(g);
+
+        try
+        {
+            tmp.color = highContrast ? new Color(20f, 20f, 20f, 1f) : new Color(10f, 10f, 10f, 1f);
+        }
+        catch { }
+
+        try
+        {
+            tmp.faceColor = new Color32(255, 255, 255, 255);
+        }
+        catch { }
+
+        try
+        {
+            tmp.outlineColor = new Color32(0, 0, 0, 255);
+            tmp.outlineWidth = highContrast ? 0.45f : 0.2f;
+        }
+        catch { }
+
+        Material source = null;
+        try { source = tmp.fontMaterial; } catch { }
+        if (source == null)
+        {
+            try { source = tmp.fontSharedMaterial; } catch { }
+        }
+        if (source == null) return;
+
+        Texture atlasTexture = null;
+        try { atlasTexture = tmp.font?.atlasTexture; } catch { }
+
+        ForceReadableTmpMaterialState(source, atlasTexture, highContrast);
+
+        int sourceId = source.GetInstanceID();
+        if (!s_menuTmpReadableMats.TryGetValue(sourceId, out var readable))
+        {
+            readable = new Material(source);
+            readable.name = "VRMenuTMP_" + source.name;
+            s_menuTmpReadableMats[sourceId] = readable;
+        }
+
+        ForceReadableTmpMaterialState(readable, atlasTexture, highContrast);
+
+        try { tmp.fontMaterial = readable; } catch { }
+        try { tmp.fontSharedMaterial = readable; } catch { }
+        try { tmp.havePropertiesChanged = true; } catch { }
+        try { tmp.UpdateMeshPadding(); } catch { }
+        try { tmp.UpdateMaterial(); } catch { }
+        try { tmp.SetAllDirty(); } catch { }
+        try { tmp.ForceMeshUpdate(false, false); } catch { }
+
+        try { g.canvasRenderer.SetMaterial(readable, 0); } catch { }
+        try { if (atlasTexture != null) g.canvasRenderer.SetTexture(atlasTexture); } catch { }
+        try
+        {
+            var crMat = g.canvasRenderer.GetMaterial(0);
+            if (crMat != null)
+                ForceReadableTmpMaterialState(crMat, atlasTexture, highContrast);
+        }
+        catch { }
+    }
+
+    private void RelaxMenuTextMaterials(Canvas canvas)
+    {
+        if (!ShouldRelaxMenuClipping(canvas)) return;
+
+        int patchedMaterials = 0;
+        try
+        {
+            var graphics = canvas.GetComponentsInChildren<Graphic>(true);
+            foreach (var g in graphics)
+            {
+                if (g == null || !IsTextGraphic(g)) continue;
+
+                try
+                {
+                    var mat = g.material;
+                    if (mat != null)
+                    {
+                        NeutralizeStencilMasking(mat);
+                        StrengthenMenuTextMaterial(mat);
+                        patchedMaterials++;
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    var crMat = g.canvasRenderer.GetMaterial(0);
+                    if (crMat != null)
+                    {
+                        NeutralizeStencilMasking(crMat);
+                        StrengthenMenuTextMaterial(crMat);
+                        patchedMaterials++;
+                    }
+                }
+                catch { }
+
+                ApplyMenuTmpReadableMaterial(g);
+                EnsureMenuTextFallback(g);
+            }
+        }
+        catch { }
+
+        if (patchedMaterials > 0)
+            Log.LogInfo($"[VRCamera] MenuStencilRelax '{canvas.gameObject.name}': materials={patchedMaterials}");
+    }
+
+    private void RescanCanvasAlpha(Canvas canvas)
+    {
+        // Never mutate canvases owned by VRMod — we manage their materials directly.
+        if (_ownedCanvasIds.Contains(canvas.GetInstanceID())) return;
+
+        string canvasName = canvas.gameObject.name;
+        try
+        {
+            RelaxMenuCanvasClipping(canvas);
+            RelaxMenuTextMaterials(canvas);
+
             try
             {
                 var transforms = canvas.GetComponentsInChildren<Transform>(true);
@@ -989,13 +1517,10 @@ public class VRCamera : MonoBehaviour
                     }
                 }
                 if (layerFixed > 0)
-                    Log.LogInfo($"[VRCamera] LayerFix(rescan) '{canvasName}': {layerFixed} object(s) → layer {UILayer}");
+                    Log.LogInfo($"[VRCamera] LayerFix(rescan) '{canvasName}': {layerFixed} object(s) -> layer {UILayer}");
             }
             catch { }
 
-            // ── CanvasGroup alpha fix ─────────────────────────────────────────────────
-            // A CanvasGroup with alpha<1 makes ALL children invisible regardless of
-            // individual Graphic.color or material settings.  Force any such groups to 1.
             try
             {
                 var groups = canvas.GetComponentsInChildren<CanvasGroup>(true);
@@ -1004,28 +1529,24 @@ public class VRCamera : MonoBehaviour
                     if (cg == null) continue;
                     if (cg.alpha < 0.99f)
                     {
-                        Log.LogInfo($"[VRCamera] CanvasGroupFix '{cg.gameObject.name}' on '{canvasName}': {cg.alpha:F2}→1");
+                        Log.LogInfo($"[VRCamera] CanvasGroupFix '{cg.gameObject.name}' on '{canvasName}': {cg.alpha:F2}->1");
                         cg.alpha = 1f;
                     }
                 }
             }
-            catch { /* safe to ignore — CanvasGroup fix is best-effort */ }
+            catch { }
 
-            // ── Graphic material + vertex-alpha patch ─────────────────────────────────
             var graphics = canvas.GetComponentsInChildren<Graphic>(true);
-            int newCount  = 0;
-            int diagCount = 0; // limit per-element diagnostic lines per call
-
+            int newCount = 0;
             foreach (var g in graphics)
             {
                 if (g == null) continue;
 
-                string nm    = g.gameObject.name;
-                bool   isBg  = nm.IndexOf("background", StringComparison.OrdinalIgnoreCase) >= 0;
-                bool   isFade = nm.IndexOf("fade",       StringComparison.OrdinalIgnoreCase) >= 0;
-                bool   isText = IsTextGraphic(g); // computed early so the already-patched path can use it
+                string nm = g.gameObject.name;
+                bool isBg = nm.IndexOf("background", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isFade = nm.IndexOf("fade", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isText = IsTextGraphic(g);
 
-                // Register fade elements so PositionCanvases can zero their alpha each frame.
                 if (isFade)
                 {
                     int fid = g.GetInstanceID();
@@ -1036,194 +1557,56 @@ public class VRCamera : MonoBehaviour
                     }
                 }
 
-                // Use the raw native pointer as the "already patched" key.
-                // g.Pointer (Il2CppObjectBase.Pointer) is the address of the native C++ object —
-                // it never changes while the object is alive, unlike GetInstanceID() or material.name
-                // which are unreliable through IL2CppInterop wrapper churn.
                 IntPtr ptr = g.Pointer;
-                if (s_patchedGraphicPtrs.Contains(ptr))
+                if (!s_patchedGraphicPtrs.Contains(ptr))
                 {
-                    // Already patched — restore material if Unity reset it (e.g. on SetActive),
-                    // then re-check vertex colour.
-                    if (s_patchedMats.TryGetValue(ptr, out var savedMat))
-                    {
-                        try
-                        {
-                            var cur = g.material;
-                            // Accept our own VRCursorMat as well as VRPatch_ prefixes.
-                            bool matOk = cur != null &&
-                                         (cur.name.StartsWith("VRPatch_", StringComparison.Ordinal) ||
-                                          cur.name.StartsWith("VRCursor",  StringComparison.Ordinal));
-                            if (!matOk)
-                            {
-                                g.material = savedMat;
-                                if (diagCount < 5)
-                                {
-                                    Log.LogInfo($"[VRCamera] MatRestored '{canvasName}' '{nm}' was='{cur?.name}'");
-                                    diagCount++;
-                                }
-                            }
-                        }
-                        catch { }
-                    }
-                    if (!isBg && !isText)
-                    {
-                        // Preserve original vertex colour — forcing white destroys contrast when
-                        // item-row backgrounds use a solid-colour Image (white text on white = invisible).
-                        // Only force alpha=1 so fade-animations don't hide graphics.
-                        try
-                        {
-                            var vc = g.color;
-                            if (vc.a < 1f) g.color = new Color(vc.r, vc.g, vc.b, 1f);
-                        }
-                        catch { }
-                    }
-                    else if (!isBg) // isText
-                    {
-                        // Force white vertex colour via TMP_Text.color (not Graphic.color).
-                        // TMP hides Graphic.color with "new color" — setting via Graphic only
-                        // changes m_Color which TMP ignores; TMP uses m_fontColor instead.
-                        try
-                        {
-                            var tmp = g.TryCast<TMP_Text>();
-                            if (tmp != null)
-                            {
-                                var tc = tmp.color;
-                                if (tc.r < 0.99f || tc.g < 0.99f || tc.b < 0.99f || tc.a < 0.99f)
-                                    tmp.color = Color.white;
-                            }
-                        }
-                        catch { }
-                        // TMP's Distance Field shader does not render visibly in this HDRP setup.
-                        // Swap it in-place to UI/Default (which does work): change the shader on
-                        // the font material object directly.  TMP rebuilds keep calling
-                        // cr.SetMaterial(sameMat, 0) — the same material, now with UI/Default shader.
-                        // No cr.SetMaterial call from our side → no rebuild loop.
-                        // Tracked by material instance ID so the swap only fires once per font asset.
-                        try
-                        {
-                            var crm = g.canvasRenderer.GetMaterial(0);
-                            if (crm != null && !s_shaderSwappedMats.Contains(crm.GetInstanceID()))
-                            {
-                                var sn = crm.shader?.name ?? "";
-                                if (sn.IndexOf("Distance Field", StringComparison.OrdinalIgnoreCase) >= 0)
-                                {
-                                    var uiSh = Shader.Find("UI/Default");
-                                    if (uiSh != null)
-                                    {
-                                        crm.shader = uiSh;
-                                        crm.SetInt("unity_GUIZTestMode", 8); // ZTest Always in WorldSpace
-                                        crm.SetVector("_TextureSampleAdd", new Vector4(1f, 1f, 1f, 0f)); // Alpha8 atlas → white text
-                                        s_shaderSwappedMats.Add(crm.GetInstanceID());
-                                        Log.LogInfo($"[VRCamera] TMP-Swap '{crm.name}' → UI/Default");
-                                    }
-                                }
-                            }
-                        }
-                        catch { }
-                    }
-                    continue;
-                }
+                    Material orig;
+                    try { orig = g.material; }
+                    catch { continue; }
+                    if (orig == null) continue;
 
-                // ── Not in pointer set — read material to decide what to do ───────────
-                Material orig;
-                try   { orig = g.material; }
-                catch { continue; }
-                if (orig == null) continue;
+                    string shaderName = orig.shader?.name ?? "";
+                    bool isAdditive = shaderName.IndexOf("Additive", StringComparison.OrdinalIgnoreCase) >= 0
+                                   || shaderName.IndexOf("Particle", StringComparison.OrdinalIgnoreCase) >= 0
+                                   || shaderName.IndexOf("Add", StringComparison.OrdinalIgnoreCase) >= 0;
+                    int boostType = isAdditive ? 3 : (isBg ? 2 : (isText ? 1 : 0));
+                    int origId = orig.GetInstanceID();
+                    int queue = isBg ? 3000 : (isText ? 3009 : (isAdditive ? 3001 : 3008));
+                    long matKey = ((long)origId << 2) | (long)boostType;
 
-                // If the material already has our VRPatch_ prefix it was stamped by
-                // ForceUIZTestAlways before s_patchedGraphicPtrs was populated for it.
-                // Adopt it into the pointer set and skip re-patching (avoids 30×30=900× boost).
-                if (orig.name?.StartsWith("VRPatch_") == true)
-                {
+                    if (!s_uiZTestMats.TryGetValue(matKey, out var mat))
+                    {
+                        mat = new Material(orig);
+                        mat.name = "VRPatch_" + orig.name;
+                        mat.SetInt("unity_GUIZTestMode", 8);
+                        try { if (mat.HasProperty("_ZTestMode")) mat.SetInt("_ZTestMode", 8); } catch { }
+                        try { if (mat.HasProperty("_ZTest")) mat.SetInt("_ZTest", 8); } catch { }
+                        if (!isAdditive)
+                        {
+                            mat.renderQueue = queue;
+                            if (isBg)
+                            {
+                                Color c = mat.color;
+                                mat.color = new Color(c.r, c.g, c.b, UIBackgroundAlpha);
+                            }
+                        }
+                        s_uiZTestMats[matKey] = mat;
+                    }
+
+                    try { g.material = mat; } catch { continue; }
                     s_patchedGraphicPtrs.Add(ptr);
-                    s_patchedMats[ptr] = orig; // record the VRPatch material
-                    if (!isBg)
-                    {
-                        try
-                        {
-                            var vc = g.color;
-                            if (vc.a < 1f) g.color = new Color(vc.r, vc.g, vc.b, 1f);
-                        }
-                        catch { }
-                    }
-                    continue;
+                    s_patchedMats[ptr] = mat;
+                    newCount++;
                 }
 
-                string shaderName = orig.shader?.name ?? "";
-                bool isAdditive = shaderName.IndexOf("Additive",  StringComparison.OrdinalIgnoreCase) >= 0
-                               || shaderName.IndexOf("Particle",  StringComparison.OrdinalIgnoreCase) >= 0
-                               || shaderName.IndexOf("Add",       StringComparison.OrdinalIgnoreCase) >= 0;
-
-                // isText already computed above (before the pointer early-continue).
-
-                // Diagnostic: log first 3 new elements per scan (reduced from 10 to cut noise).
-                if (diagCount < 3)
-                {
-                    Log.LogInfo($"[VRCamera] RescanNew '{canvasName}' '{nm}' origName='{orig.name}' " +
-                                $"shader='{shaderName}' isText={isText} gAlpha={g.color.a:F2}");
-                    diagCount++;
-                }
-
-                // Key by (origId, boostType) — same as ForceUIZTestAlways — so each
-                // element gets a per-source-material colour boost and fixed renderQueue.
-                // Painter order: bg(3000) < image(3008) < text(3009).
-                int  boostType = isAdditive ? 3 : (isBg ? 2 : (isText ? 1 : 0));
-                int  origId    = orig.GetInstanceID();
-                int  queue     = isBg ? 3000 : (isText ? 3009 : (isAdditive ? 3001 : 3008));
-                long matKey    = ((long)origId << 2) | (long)boostType;
-
-                if (!s_uiZTestMats.TryGetValue(matKey, out var mat))
-                {
-                    mat = new Material(orig);
-                    mat.name = "VRPatch_" + orig.name;
-                    mat.SetInt("unity_GUIZTestMode", 8);
-                    try { if (mat.HasProperty("_ZTestMode")) mat.SetInt("_ZTestMode", 8); } catch { }
-                    try { if (mat.HasProperty("_ZTest"))     mat.SetInt("_ZTest",     8); } catch { }
-
-                    if (!isAdditive)
-                    {
-                        mat.renderQueue = queue;
-                        Color c = mat.color;
-                        if (isBg)
-                            mat.color = new Color(c.r, c.g, c.b, UIBackgroundAlpha);
-                        else if (isText)
-                        {
-                            // Do NOT override mat.color or _FaceColor.
-                            // Game artists chose text colours with contrast against their backgrounds in mind.
-                            // Forcing white makes dark-on-light text invisible (options menus, settings panels).
-                            // With ExposureControl+Tonemapping disabled on UI cameras, original colours
-                            // map directly to linear LDR output — no boost needed.
-                            // Only disable _ExposureWeight so HDRP doesn't dim text via exposure.
-                            try
-                            {
-                                if (mat.HasProperty("_ExposureWeight"))
-                                    mat.SetFloat("_ExposureWeight", 0f);
-                            }
-                            catch { }
-                        }
-                        else
-                            mat.color = new Color(UIImageBoost, UIImageBoost, UIImageBoost, c.a);
-                    }
-
-                    s_uiZTestMats[matKey] = mat;
-                }
-
-                try { g.material = mat; } catch { continue; }
-
-                // Mark as patched using the native pointer — immune to wrapper recreation.
-                s_patchedGraphicPtrs.Add(ptr);
-                s_patchedMats[ptr] = mat;
-                newCount++;
-
-                // Z-nudge (mirrors ForceUIZTestAlways three-tier depth ordering).
                 if (isBg)
                 {
                     try
                     {
                         var rt = g.rectTransform;
                         var lp = rt.localPosition;
-                        if (lp.z < 0.004f) rt.localPosition = new Vector3(lp.x, lp.y, 0.005f);
+                        float targetZ = ShouldRelaxMenuClipping(canvas) ? 0.03f : 0.005f;
+                        if (lp.z < targetZ - 0.001f) rt.localPosition = new Vector3(lp.x, lp.y, targetZ);
                     }
                     catch { }
                 }
@@ -1233,56 +1616,34 @@ public class VRCamera : MonoBehaviour
                     {
                         var rt = g.rectTransform;
                         var lp = rt.localPosition;
-                        if (lp.z > -0.004f) rt.localPosition = new Vector3(lp.x, lp.y, -0.005f);
+                        float targetZ = ShouldRelaxMenuClipping(canvas)
+                            ? (IsScrollViewMenuText(g) ? -0.08f : -0.03f)
+                            : -0.005f;
+                        if (lp.z > targetZ + 0.001f) rt.localPosition = new Vector3(lp.x, lp.y, targetZ);
+                    }
+                    catch { }
+                }
+                else if (ShouldRelaxMenuClipping(canvas))
+                {
+                    try
+                    {
+                        var rt = g.rectTransform;
+                        var lp = rt.localPosition;
+                        const float targetZ = 0.01f;
+                        if (lp.z < targetZ - 0.001f) rt.localPosition = new Vector3(lp.x, lp.y, targetZ);
                     }
                     catch { }
                 }
 
-                // Vertex colour: for text, force white via TMP_Text.color (TMP hides Graphic.color
-                // with "new" — Graphic.color sets m_Color which TMP ignores for vertex generation).
-                // For non-text elements preserve original RGB and only force alpha=1.
                 if (!isBg)
                 {
                     try
                     {
-                        if (isText)
-                        {
-                            var tmp = g.TryCast<TMP_Text>();
-                            if (tmp != null) tmp.color = Color.white;
-                        }
-                        else
-                        {
-                            var vc = g.color;
-                            if (vc.a < 1f) g.color = new Color(vc.r, vc.g, vc.b, 1f);
-                        }
+                        var vc = g.color;
+                        if (vc.a < 1f) g.color = new Color(vc.r, vc.g, vc.b, 1f);
                     }
                     catch { }
-                }
-
-                // For TMP Distance Field text: swap shader to UI/Default (same as already-patched path).
-                if (isText)
-                {
-                    try
-                    {
-                        var crm = g.canvasRenderer.GetMaterial(0);
-                        if (crm != null && !s_shaderSwappedMats.Contains(crm.GetInstanceID()))
-                        {
-                            var sn = crm.shader?.name ?? "";
-                            if (sn.IndexOf("Distance Field", StringComparison.OrdinalIgnoreCase) >= 0)
-                            {
-                                var uiSh = Shader.Find("UI/Default");
-                                if (uiSh != null)
-                                {
-                                    crm.shader = uiSh;
-                                    crm.SetInt("unity_GUIZTestMode", 8);
-                                    crm.SetVector("_TextureSampleAdd", new Vector4(1f, 1f, 1f, 0f)); // Alpha8 atlas → white text
-                                    s_shaderSwappedMats.Add(crm.GetInstanceID());
-                                    Log.LogInfo($"[VRCamera] TMP-Swap(new) '{crm.name}' → UI/Default");
-                                }
-                            }
-                        }
-                    }
-                    catch { }
+                    if (isText) ApplyReadableTextBoost(g);
                 }
             }
 
@@ -1291,25 +1652,10 @@ public class VRCamera : MonoBehaviour
         }
         catch (Exception ex)
         {
-            Log.LogWarning($"[VRCamera] RescanCanvasAlpha '{canvasName}': " +
-                           $"{ex.GetType().Name}: {ex.Message}");
+            Log.LogWarning($"[VRCamera] RescanCanvasAlpha '{canvasName}': {ex.GetType().Name}: {ex.Message}");
         }
     }
 
-    /// <summary>
-    /// Converts a single canvas to WorldSpace so the VR eye cameras see it as a
-    /// floating panel in front of the player.
-    /// <para>
-    /// HDRP sorts transparent objects back-to-front by spherical distance from the
-    /// camera.  In WorldSpace the background Image (at canvas centre) sits exactly
-    /// at <c>UIDistance</c>, while off-centre buttons are fractionally further away.
-    /// HDRP therefore renders the background LAST and it buries every button under
-    /// it.  <see cref="ForceUIZTestAlways"/> fixes this by assigning ascending
-    /// <c>renderQueue</c> values (3000 → 3009) based on hierarchy order so that
-    /// elements later in the draw order always paint over earlier ones, overriding
-    /// the HDRP distance sort.
-    /// </para>
-    /// </summary>
     private void ConvertCanvasToWorldSpace(Canvas canvas)
     {
         var scaler = canvas.GetComponent<CanvasScaler>();
@@ -1324,12 +1670,8 @@ public class VRCamera : MonoBehaviour
         rt.sizeDelta = new Vector2(refW, refH);
         canvas.transform.localScale = Vector3.one * UICanvasScale;
 
-        // Assign ascending render-queue tiers so painter order is respected despite
-        // HDRP's spherical-distance sort (see method documentation above).
         int patched = ForceUIZTestAlways(canvas);
 
-        // Ensure a GraphicRaycaster exists so the laser pointer can hit-test this canvas.
-        // blockingMask=0 skips physics blockers — we only care about UI elements.
         try
         {
             var gr = canvas.GetComponent<GraphicRaycaster>();
@@ -1339,60 +1681,16 @@ public class VRCamera : MonoBehaviour
         }
         catch (Exception ex) { Log.LogWarning($"[VRCamera] GraphicRaycaster setup: {ex.Message}"); }
 
-        Log.LogInfo($"[VRCamera] Canvas '{canvas.gameObject.name}' → WorldSpace " +
-                    $"({refW}x{refH}, scale={UICanvasScale}, sortOrder={canvas.sortingOrder}, patched={patched})");
+        Log.LogInfo($"[VRCamera] Canvas '{canvas.gameObject.name}' -> WorldSpace ({refW}x{refH}, scale={UICanvasScale}, sortOrder={canvas.sortingOrder}, patched={patched})");
     }
 
-    /// <summary>
-    /// Walks all Graphic children of <paramref name="canvas"/> in hierarchy order
-    /// and replaces each material with a clone that:
-    /// <list type="bullet">
-    ///   <item><description><c>unity_GUIZTestMode = 8</c> (Always) — never occluded by scene geometry.</description></item>
-    ///   <item><description><c>renderQueue = 3000 + tier</c> — explicit painter ordering by hierarchy depth.</description></item>
-    ///   <item><description>Graphics named "background*" → alpha reduced to <c>UIBackgroundAlpha</c> (semi-transparent
-    ///   backdrop so interactive elements remain visible even if HDRP sorts them behind).</description></item>
-    ///   <item><description>All other graphics → <c>_Color</c> multiplied by <c>UIColorBoost</c> to compensate
-    ///   for HDRP tonemapping compressing UI values in the headset.</description></item>
-    /// </list>
-    /// </summary>
-    /// <returns>Number of graphics patched.</returns>
     private int ForceUIZTestAlways(Canvas canvas, bool logQueueMap = true)
     {
-        // ── Disable ALL mask/clip components ──────────────────────────────────────
-        // Unity's Mask component clips children via stencil buffer writes.
-        // HDRP uses the stencil buffer internally; UI stencil masks conflict with it
-        // in WorldSpace, causing masked children to be completely invisible.
-        // RectMask2D uses screen-space scissor rect clipping which produces wrong/zero
-        // rect coordinates in WorldSpace — text inside ScrollRect viewports becomes
-        // completely invisible.  Disable both mask types so nothing gets clipped.
         try
         {
-            var masks = canvas.GetComponentsInChildren<UnityEngine.UI.Mask>(true);
-            foreach (var m in masks)
-            {
-                if (m == null || !m.enabled) continue;
-                m.enabled = false;
-                Log.LogInfo($"[VRCamera] MaskDisabled '{m.gameObject.name}' on '{canvas.gameObject.name}'");
-            }
-        }
-        catch { /* best-effort */ }
-        try
-        {
-            var rm2ds = canvas.GetComponentsInChildren<UnityEngine.UI.RectMask2D>(true);
-            foreach (var rm in rm2ds)
-            {
-                if (rm == null || !rm.enabled) continue;
-                rm.enabled = false;
-                Log.LogInfo($"[VRCamera] RectMask2DDisabled '{rm.gameObject.name}' on '{canvas.gameObject.name}'");
-            }
-        }
-        catch { /* best-effort */ }
+            RelaxMenuCanvasClipping(canvas);
+            RelaxMenuTextMaterials(canvas);
 
-        // ── Force all canvas children onto UILayer so the UI overlay camera sees them ─
-        // Dynamically-created option/settings items spawn on Layer 0 (Default) and are
-        // therefore invisible to the UI overlay camera whose cullingMask = 1 << UILayer.
-        try
-        {
             var transforms = canvas.GetComponentsInChildren<Transform>(true);
             int layerFixed = 0;
             foreach (var t in transforms)
@@ -1405,101 +1703,65 @@ public class VRCamera : MonoBehaviour
                 }
             }
             if (layerFixed > 0)
-                Log.LogInfo($"[VRCamera] LayerFix '{canvas.gameObject.name}': {layerFixed} object(s) → layer {UILayer}");
+                Log.LogInfo($"[VRCamera] LayerFix '{canvas.gameObject.name}': {layerFixed} object(s) -> layer {UILayer}");
         }
-        catch { /* best-effort */ }
+        catch { }
 
         int count = 0;
         try
         {
             var graphics = canvas.GetComponentsInChildren<Graphic>(true);
-
             for (int i = 0; i < graphics.Length; i++)
             {
                 var g = graphics[i];
                 if (g == null) continue;
                 Material orig;
-                try   { orig = g.material; }
+                try { orig = g.material; }
                 catch { continue; }
                 if (orig == null) continue;
 
-                // Classify each element: additive shader, background, text, or generic image.
-                string nm         = g.gameObject.name;
+                string nm = g.gameObject.name;
                 string shaderName = orig.shader?.name ?? "";
-                bool isBg       = nm.IndexOf("background", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isBg = nm.IndexOf("background", StringComparison.OrdinalIgnoreCase) >= 0;
                 bool isAdditive = shaderName.IndexOf("Additive", StringComparison.OrdinalIgnoreCase) >= 0
                                || shaderName.IndexOf("Particle", StringComparison.OrdinalIgnoreCase) >= 0
-                               || shaderName.IndexOf("Add",      StringComparison.OrdinalIgnoreCase) >= 0;
-                bool isText     = !isBg && !isAdditive && IsTextGraphic(g);
-
-                // Key by (origId, boostType): per-element material gives the correct
-                // per-element _Color boost.  No tier in the key — queue is one of three
-                // fixed values so painter order is: bg(3000) < image(3008) < text(3009)
-                // regardless of hierarchy position, ensuring text is never occluded.
-                // boostType: 0=image, 1=text, 2=bg, 3=additive
-                int  boostType = isAdditive ? 3 : (isBg ? 2 : (isText ? 1 : 0));
-                int  origId    = orig.GetInstanceID();
-                int  queue     = isBg ? 3000 : (isText ? 3009 : (isAdditive ? 3001 : 3008));
-                long matKey    = ((long)origId << 2) | (long)boostType;
+                               || shaderName.IndexOf("Add", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isText = !isBg && !isAdditive && IsTextGraphic(g);
+                int boostType = isAdditive ? 3 : (isBg ? 2 : (isText ? 1 : 0));
+                int origId = orig.GetInstanceID();
+                int queue = isBg ? 3000 : (isText ? 3009 : (isAdditive ? 3001 : 3008));
+                long matKey = ((long)origId << 2) | (long)boostType;
 
                 if (!s_uiZTestMats.TryGetValue(matKey, out var mat))
                 {
                     mat = new Material(orig);
                     mat.name = "VRPatch_" + orig.name;
-                    // unity_GUIZTestMode=8 → CompareFunction.Always for UI/Default shader.
-                    // TMP shaders use _ZTestMode instead — set both so all shader families pass.
                     mat.SetInt("unity_GUIZTestMode", 8);
                     try { if (mat.HasProperty("_ZTestMode")) mat.SetInt("_ZTestMode", 8); } catch { }
-                    try { if (mat.HasProperty("_ZTest"))     mat.SetInt("_ZTest",     8); } catch { }
-
+                    try { if (mat.HasProperty("_ZTest")) mat.SetInt("_ZTest", 8); } catch { }
                     if (!isAdditive)
                     {
                         mat.renderQueue = queue;
-                        Color c = mat.color;
                         if (isBg)
-                            mat.color = new Color(c.r, c.g, c.b, UIBackgroundAlpha);
-                        else if (isText)
                         {
-                            // Do NOT override mat.color or _FaceColor — preserve game-authored colours.
-                            // Settings/options panels often use dark text on light backgrounds;
-                            // forcing white makes that text invisible.
-                            try
-                            {
-                                if (mat.HasProperty("_ExposureWeight"))
-                                    mat.SetFloat("_ExposureWeight", 0f);
-                            }
-                            catch { }
+                            Color c = mat.color;
+                            mat.color = new Color(c.r, c.g, c.b, UIBackgroundAlpha);
                         }
-                        else
-                            mat.color = new Color(UIImageBoost, UIImageBoost, UIImageBoost, c.a);
                     }
-                    // additive: keep original renderQueue and colours; only ZTest was set above.
-
                     s_uiZTestMats[matKey] = mat;
                 }
 
                 try { g.material = mat; }
                 catch { continue; }
 
-                // ── Z-nudge: three-tier depth ordering ──────────────────────────────────
-                // HDRP sorts transparent objects back-to-front by camera distance.
-                // We exploit this to guarantee painter order without relying on renderQueue:
-                //   bg    → z = +0.005 (furthest from camera → drawn first  → always behind)
-                //   image → z =  0     (middle distance      → drawn second)
-                //   text  → z = -0.005 (closest to camera    → drawn last   → always in front)
-                //
-                // TextMeshProUGUI bypasses Graphic.material and calls CanvasRenderer.SetMaterial()
-                // directly on every canvas rebuild, so we cannot patch its renderQueue reliably.
-                // The z-nudge is set on the Transform (a one-time persistent change) and is
-                // therefore immune to TMP's internal material management.
                 if (isBg)
                 {
                     try
                     {
                         var rt = g.rectTransform;
                         var lp = rt.localPosition;
-                        if (lp.z < 0.004f)
-                            rt.localPosition = new Vector3(lp.x, lp.y, 0.005f);
+                        float targetZ = ShouldRelaxMenuClipping(canvas) ? 0.03f : 0.005f;
+                        if (lp.z < targetZ - 0.001f) rt.localPosition = new Vector3(lp.x, lp.y, targetZ);
                     }
                     catch { }
                 }
@@ -1509,22 +1771,28 @@ public class VRCamera : MonoBehaviour
                     {
                         var rt = g.rectTransform;
                         var lp = rt.localPosition;
-                        if (lp.z > -0.004f)
-                            rt.localPosition = new Vector3(lp.x, lp.y, -0.005f);
+                        float targetZ = ShouldRelaxMenuClipping(canvas)
+                            ? (IsScrollViewMenuText(g) ? -0.08f : -0.03f)
+                            : -0.005f;
+                        if (lp.z > targetZ + 0.001f) rt.localPosition = new Vector3(lp.x, lp.y, targetZ);
+                    }
+                    catch { }
+                }
+                else if (ShouldRelaxMenuClipping(canvas))
+                {
+                    try
+                    {
+                        var rt = g.rectTransform;
+                        var lp = rt.localPosition;
+                        const float targetZ = 0.01f;
+                        if (lp.z < targetZ - 0.001f) rt.localPosition = new Vector3(lp.x, lp.y, targetZ);
                     }
                     catch { }
                 }
 
-                // Mark this graphic as patched so RescanCanvasAlpha won't apply a second
-                // 30× boost on top of this one.  g.Pointer is the native C++ object address —
-                // stable for the object's lifetime, unlike GetInstanceID() or material.name.
                 s_patchedGraphicPtrs.Add(g.Pointer);
-                s_patchedMats[g.Pointer] = mat; // store so RescanCanvasAlpha can restore if reset
+                s_patchedMats[g.Pointer] = mat;
 
-                // Vertex colour: preserve original RGB for all non-background elements;
-                // only force alpha=1 so fade-animations don't hide graphics or text.
-                // (Forcing white destroyed contrast: solid-colour item rows became white,
-                // making white text invisible against them.)
                 if (!isBg)
                 {
                     try
@@ -1533,22 +1801,16 @@ public class VRCamera : MonoBehaviour
                         if (vc.a < 1f) g.color = new Color(vc.r, vc.g, vc.b, 1f);
                     }
                     catch { }
+                    if (isText) ApplyReadableTextBoost(g);
                 }
                 count++;
             }
         }
         catch (Exception ex)
         {
-            Log.LogWarning($"[VRCamera] ForceUIZTestAlways '{canvas.gameObject.name}': " +
-                           $"{ex.GetType().Name}: {ex.Message}");
+            Log.LogWarning($"[VRCamera] ForceUIZTestAlways '{canvas.gameObject.name}': {ex.GetType().Name}: {ex.Message}");
         }
 
-        // Register any full-screen fade overlay elements so PositionCanvases can zero
-        // their vertex alpha every frame.  We identify them by name ("fade" / "overlay")
-        // OR by being the very last sibling in a large canvas (≥100 graphics).  These
-        // elements are intentionally opaque during loading but invisible during play;
-        // because our WorldSpace conversion freezes their material, the game's tween
-        // may not reach alpha=0 before the user looks at the menu in VR.
         try
         {
             var allG = canvas.GetComponentsInChildren<Graphic>(true);
@@ -1556,8 +1818,6 @@ public class VRCamera : MonoBehaviour
             {
                 if (g == null) continue;
                 string nm = g.gameObject.name;
-                // Only suppress elements explicitly named with "fade" — not "overlay" generics
-                // like HighlightedTextOverlay or Active Overlay which are button state visuals.
                 bool isFade = nm.IndexOf("fade", StringComparison.OrdinalIgnoreCase) >= 0;
                 if (isFade)
                 {
@@ -1565,16 +1825,13 @@ public class VRCamera : MonoBehaviour
                     if (!_managedFades.ContainsKey(gid))
                     {
                         _managedFades[gid] = g;
-                        Log.LogInfo($"[VRCamera] FadeSuppress '{nm}' on '{canvas.gameObject.name}' " +
-                                    $"(cur a={g.color.a:F2})");
+                        Log.LogInfo($"[VRCamera] FadeSuppress '{nm}' on '{canvas.gameObject.name}' (cur a={g.color.a:F2})");
                     }
                 }
             }
         }
-        catch { /* diagnostic only */ }
+        catch { }
 
-        // Diagnostic: log names and assigned queues for first-5 and last-5 elements.
-        // Suppressed on rescans (logQueueMap=false) or if already logged for this canvas.
         int canvasId = canvas.GetInstanceID();
         if (logQueueMap && _queueMapLogged.Add(canvasId))
         {
@@ -1603,39 +1860,15 @@ public class VRCamera : MonoBehaviour
                 }
                 Log.LogInfo(sb.ToString());
             }
-            catch { /* diagnostic only */ }
+            catch { }
         }
 
         return count;
     }
 
-    /// <summary>
-    /// Repositions every managed WorldSpace canvas in front of the current head pose.
-    /// Uses yaw-only rotation so the panel stays upright regardless of head pitch/roll.
-    /// Called from <see cref="LateUpdate"/> after <c>ApplyCameraPose</c> has run.
-    /// </summary>
-    /// <summary>
-    /// Called every LateUpdate.  Two responsibilities:
-    /// <list type="number">
-    ///   <item><description>
-    ///     <b>Fade suppression (every frame)</b> — zero vertex-alpha of any registered
-    ///     "fade overlay" Graphic so the game's loading fade never permanently buries buttons.
-    ///   </description></item>
-    ///   <item><description>
-    ///     <b>One-shot placement</b> — the first time each canvas is seen (once
-    ///     <c>_leftCam</c> has a valid world pose), position it <c>UIDistance</c> metres
-    ///     in front of the head and <em>leave it there</em>.  The player can look around
-    ///     freely; the canvas does not track the head after placement.
-    ///   </description></item>
-    /// </list>
-    /// </summary>
+
     private void PositionCanvases()
     {
-        // ── Every-few-frames: zero fade overlays ─────────────────────────────
-        // Suppresses game fade-to-black graphics that would bury the menu in VR.
-        // Rate-limited to every 4 frames so we don't mark the Canvas dirty every frame
-        // (SetVertexDirty() → full mesh rebuild is expensive at 60 Hz).
-        // 4 frames ≈ 67 ms at 60 fps — brief enough that any flicker is imperceptible.
         if (_managedFades.Count > 0 && (_frameCount % 4) == 0)
         {
             foreach (var kvp in _managedFades)
@@ -1647,9 +1880,6 @@ public class VRCamera : MonoBehaviour
             }
         }
 
-        // ── One-shot: place new canvases in front of current head pose ────────
-        // Requires a valid tracked head pose; deferred until the first LocateViews succeeds
-        // so we don't place canvases at world-origin (0,0,0) before tracking starts.
         if (_leftCam == null || !_posesValid) return;
 
         bool anyUnplaced = false;
@@ -1657,72 +1887,54 @@ public class VRCamera : MonoBehaviour
             if (!_positionedCanvases.Contains(kvp.Key)) { anyUnplaced = true; break; }
         if (!anyUnplaced) return;
 
-        // Compute head pose once for the whole batch.
-        Vector3    headPos = _leftCam.transform.position;
-        float      headYaw = _leftCam.transform.eulerAngles.y;
+        Vector3 headPos = _leftCam.transform.position;
+        float headYaw = _leftCam.transform.eulerAngles.y;
         Quaternion yawOnly = Quaternion.Euler(0f, headYaw, 0f);
-        Vector3    forward = yawOnly * Vector3.forward;
+        Vector3 forward = yawOnly * Vector3.forward;
 
         foreach (var kvp in _managedCanvases)
         {
-            if (_positionedCanvases.Contains(kvp.Key)) continue;
-
             var canvas = kvp.Value;
+            bool isCursorCanvas = _cursorCanvas != null && canvas != null
+                                  && canvas.GetInstanceID() == _cursorCanvas.GetInstanceID();
 
-            // The cursor canvas must follow the head every frame so it stays in view
-            // even after VROrigin moves when the character spawns.  All other canvases
-            // are one-shot placed and never moved again.
-            // Check by name (not reference) because _cursorCanvas may not be assigned yet
-            // on the very first frame the scan adds it to _managedCanvases.
-            bool isCursorCanvas = (canvas != null &&
-                                   canvas.gameObject.name == "VRCursorCanvasInternal");
-            if (isCursorCanvas && _cursorCanvas == null)
-                _cursorCanvas = canvas; // cache early for UpdateControllerPose
+            // Non-cursor canvases (including settings panel): place once then mark positioned.
+            // Cursor canvas: reposition every frame (never marked positioned) so it tracks the head.
             if (!isCursorCanvas)
-                _positionedCanvases.Add(kvp.Key); // mark first so null canvas doesn't retry
+            {
+                if (_positionedCanvases.Contains(kvp.Key)) continue;
+                _positionedCanvases.Add(kvp.Key);
+            }
 
             if (canvas == null) continue;
 
-            // Higher sortingOrder → slightly closer to the viewer (5 mm per step).
-            // Exception: the cursor canvas is placed at exactly the same world depth as
-            // the button-image plane (z=0 relative to canvas centre) so there is zero
-            // stereo parallax between the dot and the button it overlaps.
-            // sortingOrder=100 ensures it renders on top of all game canvases (≤ sortingOrder 10)
-            // when HDRP falls back to sort-order for same-distance transparent objects.
-            float   zNudge = isCursorCanvas ? 0f : -canvas.sortingOrder * 0.005f;
-            Vector3 pos    = headPos
-                           + forward  * (UIDistance + zNudge)
-                           + Vector3.up * UIVerticalOffset;
-
+            // sortingOrder nudge pushes canvases slightly behind UIDistance (higher order = closer).
+            // Cursor canvas sits at exactly UIDistance (zNudge=0) so it's coplanar with the UI.
+            float zNudge = isCursorCanvas ? 0f : -canvas.sortingOrder * 0.005f;
+            Vector3 pos = headPos + forward * (UIDistance + zNudge) + Vector3.up * UIVerticalOffset;
             canvas.transform.position = pos;
             canvas.transform.rotation = yawOnly;
             if (!isCursorCanvas)
-                Log.LogInfo($"[VRCamera] Placed '{canvas.gameObject.name}' at {pos} yaw={headYaw:F1}°");
+                Log.LogInfo($"[VRCamera] Placed '{canvas.gameObject.name}' at {pos} yaw={headYaw:F1}deg");
         }
     }
 
-    // ── Coordinate conversion ─────────────────────────────────────────────────
-
-    // ── Controller laser pointer ──────────────────────────────────────────────
-
     /// <summary>
-    /// Reads the right controller pose, applies OpenXR→Unity coord flip, updates the
-    /// LineRenderer laser beam, and fires a canvas click on trigger press.
+    /// Reads the right controller pose, applies OpenXR-to-Unity coord flip, updates the
+    /// cursor dot, and fires a canvas click on trigger press.
     /// </summary>
     private void UpdateControllerPose(long displayTime)
     {
         if (_rightControllerGO == null) return;
 
-        bool poseOk = OpenXRManager.GetControllerPose(true, displayTime,
-            out Quaternion ori, out Vector3 pos);
+        bool poseOk = OpenXRManager.GetControllerPose(true, displayTime, out Quaternion ori, out Vector3 pos);
 
         _poseFrameCount++;
         if (!poseOk)
         {
             if (_cursorRect != null) try { _cursorRect.gameObject.SetActive(false); } catch { }
-            // Log every 120 frames until pose becomes valid
             if (!_poseEverValid && _poseFrameCount % 120 == 0)
-                Log.LogInfo($"[VRCamera] Controller pose not valid (frame {_poseFrameCount}) — waiting");
+                Log.LogInfo($"[VRCamera] Controller pose not valid (frame {_poseFrameCount}) - waiting");
             return;
         }
 
@@ -1733,45 +1945,20 @@ public class VRCamera : MonoBehaviour
             Log.LogInfo($"[VRCamera] First valid pose: cursorRect={_cursorRect != null} cursorCanvas={_cursorCanvas != null} managedCanvases={_managedCanvases.Count}");
         }
 
-        // OpenXR → Unity coord flip: pos.z *= -1; quat = (-x,-y,z,w)
-        var uPos = new Vector3( pos.x,  pos.y, -pos.z);
+        var uPos = new Vector3(pos.x, pos.y, -pos.z);
         var uOri = new Quaternion(-ori.x, -ori.y, ori.z, ori.w);
 
-        // Controller is in the same LOCAL reference space as the eye cameras.
-        // _cameraOffset is at VROrigin identity, so world = VROrigin.TransformPoint(local).
         _rightControllerGO.transform.position = transform.TransformPoint(uPos);
         _rightControllerGO.transform.rotation = transform.rotation * uOri;
 
-        // ── Cursor dot: ray-cast against managed canvases, place dot at nearest hit ──
-        // ── Cursor dot ────────────────────────────────────────────────────────
-        // VRCursorCanvasInternal is created as ScreenSpaceOverlay at rig build time.
-        // ScanAndConvertCanvases converts it to WorldSpace on its next cycle (~30 frames later).
-        // Once converted, it appears in _managedCanvases and we store the reference here.
-        if (_cursorCanvas == null)
-        {
-            foreach (var kvp in _managedCanvases)
-            {
-                if (kvp.Value != null && kvp.Value.gameObject.name == "VRCursorCanvasInternal")
-                {
-                    _cursorCanvas = kvp.Value;
-                    Log.LogInfo("[VRCamera] CursorCanvas detected — cursor active");
-                    break;
-                }
-            }
-        }
-
+        // Cursor dot: project controller ray onto the cursor canvas plane (always UIDistance
+        // in front of the head), then set anchoredPosition to move the dot within the canvas.
         if (_cursorRect != null && _cursorCanvas != null)
         {
             Vector3 ctrlPos = _rightControllerGO.transform.position;
             Vector3 ctrlFwd = _rightControllerGO.transform.forward;
             var ray = new Ray(ctrlPos, ctrlFwd);
 
-            // Project the controller ray onto the cursor canvas plane.
-            // The cursor canvas is always repositioned 1.5 m in front of the head each frame,
-            // so the ray will always intersect it (unless the controller points exactly
-            // parallel to the canvas surface, which is degenerate).
-            // We no longer gate visibility on "pointing at a menu canvas" — the pointingAtMenu
-            // check was unreliable because canvases may be null/destroyed in _managedCanvases.
             var cursorPlane = new Plane(-_cursorCanvas.transform.forward, _cursorCanvas.transform.position);
             if (cursorPlane.Raycast(ray, out float cd) && cd > 0f)
             {
@@ -1784,23 +1971,17 @@ public class VRCamera : MonoBehaviour
             }
             else
             {
-                // Ray exactly parallel to canvas plane — hide dot.
                 _cursorRect.gameObject.SetActive(false);
-                if (_poseFrameCount <= 5 || (_poseFrameCount % 120) == 0)
-                    Log.LogInfo($"[VRCamera] Cursor: no plane hit (parallel ray?)");
             }
         }
 
-        // Trigger press edge detection → canvas click
         OpenXRManager.GetTriggerState(true, out bool triggerNow);
         bool triggerDown = triggerNow && !_prevTrigger;
         _prevTrigger = triggerNow;
 
         if (triggerDown)
-            TryClickCanvas(_rightControllerGO.transform.position,
-                           _rightControllerGO.transform.forward);
+            TryClickCanvas(_rightControllerGO.transform.position, _rightControllerGO.transform.forward);
     }
-
     /// <summary>
     /// Casts a ray from the right controller into all managed WorldSpace canvases.
     /// Finds the closest canvas plane intersection, uses GraphicRaycaster to resolve
@@ -1820,7 +2001,6 @@ public class VRCamera : MonoBehaviour
         {
             var canvas = kvp.Value;
             if (canvas == null) continue;
-            if (canvas == _cursorCanvas) continue; // cursor canvas is not clickable
             var plane = new Plane(-canvas.transform.forward, canvas.transform.position);
             if (!plane.Raycast(ray, out float dist)) continue;
             if (dist <= 0f) continue;
@@ -1912,8 +2092,7 @@ public class VRCamera : MonoBehaviour
         if (_leftRT  != null) { _leftRT.Release();  Destroy(_leftRT);  }
         if (_rightRT != null) { _rightRT.Release(); Destroy(_rightRT); }
 
-        if (_cursorRect != null)
-            try { Destroy(_cursorRect.gameObject); } catch { }
+        VRSettingsPanel.Destroy();
 
         // Restore any canvases we converted so the desktop view isn't broken
         // if VR is disabled mid-session.
