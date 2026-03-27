@@ -72,6 +72,10 @@
       <HintPath>$(InteropDir)\Unity.RenderPipelines.HighDefinition.Runtime.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(InteropDir)\Unity.TextMeshPro.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <!-- No external Unity XR management packages needed.

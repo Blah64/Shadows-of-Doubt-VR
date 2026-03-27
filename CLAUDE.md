@@ -28,8 +28,10 @@ VRMod/
 ```bash
 cd "E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod"
 dotnet build SoDVR/SoDVR.csproj -c Release
+rm -rf "../BepInEx/plugins/SoDVR"
 cp SoDVR/bin/Release/net6.0/SoDVR.dll "../BepInEx/plugins/SoDVR.dll"
 ```
+**IMPORTANT**: Always use the flat layout (`plugins/SoDVR.dll`), never the subdirectory layout (`plugins/SoDVR/SoDVR.dll`). If both exist, BepInEx may load the wrong one silently.
 Log output: `E:\SteamLibrary\steamapps\common\Shadows of Doubt\BepInEx\LogOutput.log`
 
 ## Working conventions
@@ -85,22 +87,36 @@ It must be disabled before `xrCreateInstance` by setting its `disable_environmen
 See `DisableUnityOpenXRLayer()` in OpenXRManager.cs — reads all layer JSONs from registry
 and sets their `disable_environment` variables.
 
-## CRITICAL: IL2CPP interop pitfalls (learned in Phase 6)
+## CRITICAL: IL2CPP interop pitfalls
 - `GetComponentInParent<Button>()` always returns null in IL2CPP context — do not use for Button detection
-- `Graphic.color` (vertex tint) and `material.color` (`_Color` shader property) are **separate** in HDRP UI
-  - Setting `mat.color.a` alone does NOT make a UI element transparent — must also set `g.color.a`
-  - `g.color = ...` marks the canvas dirty (`SetVertexDirty`) → avoid calling every frame or you cause continuous canvas mesh rebuilds and lag
-- `Resources.FindObjectsOfTypeAll<Canvas>()` is more reliable than `FindObjectsOfType<Canvas>()` in IL2CPP
-- `renderQueue` values (3000–3009) do NOT override HDRP's spherical-distance transparent sort;
-  HDRP ignores fine-grained queue ordering within the Transparent range
+- `Graphic.color` vs `material.color`: setting `mat.color.a` alone does NOT make UI transparent — must also set `g.color.a`
+- `g.color = ...` per-frame marks canvas dirty (`SetVertexDirty`) → continuous rebuild lag; only set once at scan time
+- `renderQueue` in HDRP Transparent: HDRP ignores fine-grained queue ordering; always sorts by spherical distance
+- `Resources.FindObjectsOfTypeAll<Canvas>()` more reliable than `FindObjectsOfType<Canvas>()` in IL2CPP
+- TMP hides `Graphic.color` with `new color` — must use `g.TryCast<TMP_Text>().color` to set vertex color
 
-## Phase 6 UI canvas status (PARTIAL — canvases visible, buttons dark)
-All screen-space canvases are converted to WorldSpace each scan cycle.
-- Canvases placed once in front of head on first valid pose; stay fixed (`_positionedCanvases` HashSet)
-- **Home key** re-centres all canvases
-- FadeOverlay suppressed (rate-limited every 4 frames to avoid canvas rebuild lag)
-- Button brightness still **unresolved**: `mat.color` boost (3×) doesn't help because HDRP UI composites via vertex alpha (`g.color`); buttons are visible but dark
-- Background transparency **unresolved**: `mat.color.a = 0.25f` is ineffective for same reason
+## CRITICAL: HDRP exposure — confirmed broken for per-camera override (2026-03-27)
+**This is the current blocking problem for UI brightness.**
+
+What was tried and confirmed NOT working:
+- `FrameSettingsField.ExposureControl` **never persists** when set per-camera — `ExposureOff` always reads back `False`. Not overridable in HDRP 12 IL2CPP.
+- `FrameSettingsField.Tonemapping` **does** persist — `TonemapOff=True` confirmed on all cameras.
+- `VRExposureOverride` Volume (global, layer 31, EV=0→Fixed, Tonemapping=None, priority=1000) on UI overlay cameras (`volumeLayerMask=1<<31`) is **NOT applied** — confirmed: `fixedExposure=-10` (1024× brightness) produced zero change. Volume path is dead.
+
+**Root cause**: The UI overlay cameras do not run their own HDRP exposure computation. They share/inherit the scene camera's auto-exposure (typically EV≈8–12 for city interiors → exposure multiplier ≈ 1/256–1/4096 → white vertex colours appear near-black).
+
+**What the next session must try** (see HANDOVER.md for full detail):
+1. Try `FrameSettingsField.Postprocess` (master toggle for all post-effects) in `s_VrDisabledFields` — if it persists unlike ExposureControl, it disables exposure as a side-effect
+2. CommandBuffer to overwrite HDRP's 1×1 exposure texture to neutral (log2=0) before the UI camera's post-process pass
+3. Read HDRP's live exposure value via `HDCamera` internals and apply compensating vertex-colour boost
+
+## Phase 6 UI canvas status (PARTIAL)
+- All canvases converted to WorldSpace each 30-frame scan ✓
+- Canvases placed in front of head on first valid pose; stay fixed ✓
+- **Home key** re-centres all canvases ✓
+- TMP text: vertex colour = white via `TMP_Text.color`; SDF shader swapped to `UI/Default` with `_TextureSampleAdd=(1,1,1,0)` — all data confirmed correct by End-key diagnostic dump ✓
+- **Button text too dark** — correct data but exposure darkens output (root cause above)
+- **Options/settings text invisible** — likely a second font not yet shader-swapped when panel first opens; RescanCanvasAlpha catches it within 30 frames but may be incomplete
 - No controller pointer / raycaster yet
 
 ## Known canvas names (from LogOutput.log, 2026-03-26)
@@ -118,5 +134,5 @@ All screen-space canvases are converted to WorldSpace each scan cycle.
 ## History
 - git `1be2b0e` — full VDXR-internal patching approach (archived checkpoint, do not rebase)
 - git `346a6df` — **Phase 5 complete**: standard loader working, stereo image in headset
-- **Phase 6 (current)**: camera positioning ✓, head tracking ✓, UI canvases visible in VR ✓, button brightness unresolved
-- **Phase 7 (next)**: controller input (OpenXR action sets, laser pointer, GraphicRaycaster clicks)
+- **Phase 6 (current)**: camera positioning ✓, head tracking ✓, UI canvases visible in VR ✓, UI brightness broken (both Volume and FrameSettings exposure bypass fail)
+- **Phase 7 (next)**: Fix UI brightness (HANDOVER.md §UI Brightness), then controller input
