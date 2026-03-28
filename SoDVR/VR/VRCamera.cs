@@ -1646,21 +1646,28 @@ public class VRCamera : MonoBehaviour
                 string nm = g.gameObject.name;
                 bool isBg = nm.IndexOf("background", StringComparison.OrdinalIgnoreCase) >= 0;
                 bool isFade = nm.IndexOf("fade", StringComparison.OrdinalIgnoreCase) >= 0;
+                // Only suppress "FadeOverlay" (the menu's permanent black overlay).
+                // Plain "Fade" (GameCanvas transition) must NOT be suppressed — the cutscene
+                // state machine relies on it animating 0→1→0 before showing the video.
+                bool isFadeOverlayRescan = nm.Equals("FadeOverlay", StringComparison.OrdinalIgnoreCase);
                 bool isCutSceneGraphic = nm.IndexOf("cutscene", StringComparison.OrdinalIgnoreCase) >= 0
                                       || nm.IndexOf("video", StringComparison.OrdinalIgnoreCase) >= 0;
                 bool isText = IsTextGraphic(g);
 
                 if (isFade)
                 {
-                    int fid = g.GetInstanceID();
-                    if (!_managedFades.ContainsKey(fid))
+                    if (isFadeOverlayRescan)
                     {
-                        _managedFades[fid] = g;
-                        Log.LogInfo($"[VRCamera] FadeSuppress(rescan) '{nm}' on '{canvasName}'");
+                        int fid = g.GetInstanceID();
+                        if (!_managedFades.ContainsKey(fid))
+                        {
+                            _managedFades[fid] = g;
+                            Log.LogInfo($"[VRCamera] FadeSuppress(rescan) '{nm}' on '{canvasName}'");
+                        }
+                        if (g.color.a > 0f)
+                            g.color = new Color(g.color.r, g.color.g, g.color.b, 0f);
                     }
-                    // Immediately suppress; skip all material/boost work for fade graphics.
-                    if (g.color.a > 0f)
-                        g.color = new Color(g.color.r, g.color.g, g.color.b, 0f);
+                    // Skip material patching for ALL fade-named graphics regardless.
                     continue;
                 }
 
@@ -1878,14 +1885,17 @@ public class VRCamera : MonoBehaviour
                 string shaderName = orig.shader?.name ?? "";
                 bool isBg = nm.IndexOf("background", StringComparison.OrdinalIgnoreCase) >= 0;
                 bool isFadeGraphic = nm.IndexOf("fade", StringComparison.OrdinalIgnoreCase) >= 0;
+                // "FadeOverlay" is the menu's permanent black overlay that must be suppressed.
+                // Plain "Fade" (GameCanvas) is a momentary scene-transition element — do NOT
+                // suppress it; let the game animate it freely so the cutscene state machine works.
+                bool isFadeOverlay = nm.Equals("FadeOverlay", StringComparison.OrdinalIgnoreCase);
                 bool isCutScene = nm.IndexOf("cutscene", StringComparison.OrdinalIgnoreCase) >= 0
                                || nm.IndexOf("video", StringComparison.OrdinalIgnoreCase) >= 0;
-                // Fade overlays and cutscene/video images must not receive material patches or
-                // brightness boosts — we manage fade alpha ourselves, and video textures break
-                // if their material is cloned.
+                // Fade-named and cutscene/video graphics must not receive material patches or
+                // brightness boosts. FadeOverlay is also added to _managedFades to keep alpha=0.
                 if (isFadeGraphic || isCutScene)
                 {
-                    if (isFadeGraphic)
+                    if (isFadeOverlay)
                     {
                         int fid = g.GetInstanceID();
                         if (!_managedFades.ContainsKey(fid))
