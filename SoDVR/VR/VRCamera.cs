@@ -2,6 +2,7 @@ using BepInEx.Logging;
 using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.HighDefinition;
 using UnityEngine.UI;
@@ -51,9 +52,7 @@ public class VRCamera : MonoBehaviour
     // Render throttle: call Camera.Render() every N stereo frames.
     // 1 = every frame (full quality). 2 = every other frame (half GPU load, slight judder).
     // The swapchain copy still runs every frame, so head tracking stays smooth via ATW.
-    // Render every 2nd frame — ATW in the headset compensates for the skipped
-    // frame with zero perceived quality loss while halving GPU load.
-    private const int RenderEveryNFrames = 2;
+    private const int RenderEveryNFrames = 1;
 
     // ── UI / Canvas constants ─────────────────────────────────────────────────
     private const float UIDistance       = 2.0f;    // metres in front of head
@@ -111,6 +110,14 @@ public class VRCamera : MonoBehaviour
     // ── Controller / cursor dot ──────────────────────────────────────────────
     private GameObject?   _rightControllerGO;
     private GameObject?   _leftControllerGO;
+
+    // ── Scene-change guard ────────────────────────────────────────────────────
+    // When Unity loads a new scene (save load, new game) we stop calling
+    // ScanAndConvertCanvases for 120 frames.  This gives SaveStateController
+    // and other scene-init code a clean window before we start touching canvases
+    // and camera components — the source of the "Can't remove Rigidbody" crash.
+    private int _lastSceneHandle;
+    private int _sceneLoadGrace;   // frames remaining in the grace period
 
     // ── Game camera deferred disable ─────────────────────────────────────────
     // We delay calling cam.enabled=false by several frames so that scene-load
@@ -202,10 +209,27 @@ public class VRCamera : MonoBehaviour
         // Always drain the event queue so VDXR can advance the session state machine.
         OpenXRManager.PollEventsPublic();
 
+        // Detect scene changes and apply a grace period during which we skip
+        // ScanAndConvertCanvases.  This prevents us from touching canvas/camera
+        // components while SaveStateController is reconstructing the physics hierarchy.
+        try
+        {
+            int sh = SceneManager.GetActiveScene().handle;
+            if (_lastSceneHandle != 0 && sh != _lastSceneHandle)
+            {
+                _sceneLoadGrace = 120;  // ~2 s at 60 fps
+                _canvasTick     = 0;
+                _movementDiscoveryDone = false;
+                Log.LogInfo($"[VRCamera] Scene changed (handle {_lastSceneHandle}→{sh}) — canvas scan paused for 120 frames.");
+            }
+            _lastSceneHandle = sh;
+        }
+        catch { }
+        if (_sceneLoadGrace > 0) _sceneLoadGrace--;
+
         // Scan for new screen-space canvases and convert them to WorldSpace.
-        // Runs unconditionally (before and after stereo is ready) so the main menu
-        // and loading screens are picked up even while the headset session is starting.
-        if (++_canvasTick >= UICanvasScanRate)
+        // Skipped during the post-scene-load grace period.
+        if (++_canvasTick >= UICanvasScanRate && _sceneLoadGrace == 0)
         {
             _canvasTick = 0;
             try { ScanAndConvertCanvases(); }
