@@ -106,6 +106,18 @@ public class VRCamera : MonoBehaviour
 
     // ── Controller / cursor dot ──────────────────────────────────────────────
     private GameObject?   _rightControllerGO;
+    private GameObject?   _leftControllerGO;
+
+    // ── Snap turn ─────────────────────────────────────────────────────────────
+    private const float SnapTurnAngle    = 30f;   // degrees per snap
+    private const float SnapTurnDeadZone = 0.6f;  // stick threshold to trigger
+    private const float SnapTurnRearm    = 0.3f;  // stick must drop below this to re-arm
+    private const float SnapTurnCooldown = 0.25f; // seconds between snaps
+    private float _snapCooldown;
+    private bool  _snapArmed = true;
+
+    // ── Movement discovery ────────────────────────────────────────────────────
+    private bool _movementDiscoveryDone;
     // Cursor: ScreenSpaceOverlay canvas "VRCursorCanvasInternal" created at rig-build time.
     // ScanAndConvertCanvases converts it to WorldSpace via the normal pipeline — giving it proper
     // HDRP registration and the ZTest Always material patch from RescanCanvasAlpha.
@@ -464,7 +476,12 @@ public class VRCamera : MonoBehaviour
         {
             OpenXRManager.SyncActions();
             UpdateControllerPose(_displayTime);
+            UpdateSnapTurn();
         }
+
+        // One-shot movement system discovery (runs once after stereo is ready and game cam found)
+        if (!_movementDiscoveryDone && _gameCam != null)
+            DiscoverMovementSystem();
     }
 
     private void BuildCameraRig()
@@ -509,6 +526,11 @@ public class VRCamera : MonoBehaviour
         ctrlGO.layer = UILayer;
         ctrlGO.transform.SetParent(_cameraOffset, false);
         _rightControllerGO = ctrlGO;
+
+        var leftCtrlGO = new GameObject("LeftController");
+        leftCtrlGO.layer = UILayer;
+        leftCtrlGO.transform.SetParent(_cameraOffset, false);
+        _leftControllerGO = leftCtrlGO;
 
         // Cursor dot: ScreenSpaceOverlay canvas created here, converted to WorldSpace by
         // ScanAndConvertCanvases — same pipeline as all game canvases, giving HDRP registration.
@@ -2212,6 +2234,113 @@ public class VRCamera : MonoBehaviour
                     VRSettingsPanel.Scroll(-ty * scrollRate); // negative: stick up → scroll up (lower y)
             }
         }
+
+        // Left controller pose
+        if (_leftControllerGO != null &&
+            OpenXRManager.GetControllerPose(false, displayTime, out Quaternion lOri, out Vector3 lPos))
+        {
+            var ulPos = new Vector3(lPos.x, lPos.y, -lPos.z);
+            var ulOri = new Quaternion(-lOri.x, -lOri.y, lOri.z, lOri.w);
+            _leftControllerGO.transform.position = transform.TransformPoint(ulPos);
+            _leftControllerGO.transform.rotation = transform.rotation * ulOri;
+        }
+    }
+
+    /// <summary>
+    /// Rotates VROrigin around Y by ±SnapTurnAngle when right stick X crosses the dead-zone.
+    /// Skipped while the VR settings panel is open (right stick Y is used for scrolling there).
+    /// </summary>
+    private void UpdateSnapTurn()
+    {
+        _snapCooldown -= Time.deltaTime;
+
+        // Don't snap while settings panel is open (right stick scrolls it instead)
+        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+
+        if (!OpenXRManager.GetThumbstickState(true, out float tx, out float _)) return;
+
+        float absTx = Mathf.Abs(tx);
+
+        // Re-arm when stick returns to centre
+        if (!_snapArmed && absTx < SnapTurnRearm)
+        {
+            _snapArmed = true;
+            return;
+        }
+
+        if (_snapArmed && absTx > SnapTurnDeadZone && _snapCooldown <= 0f)
+        {
+            float angle = Mathf.Sign(tx) * SnapTurnAngle;
+            transform.Rotate(Vector3.up, angle, Space.World);
+            _snapCooldown = SnapTurnCooldown;
+            _snapArmed    = false;
+            Log.LogInfo($"[VRCamera] Snap turn {angle:+0;-0}° (stick={tx:F2})");
+        }
+    }
+
+    /// <summary>
+    /// One-shot: logs Rewired action names and walks up from the game camera to find
+    /// CharacterController / Rigidbody / RigidbodyFirstPersonController.
+    /// Results are read from LogOutput.log to choose the locomotion approach.
+    /// </summary>
+    private void DiscoverMovementSystem()
+    {
+        _movementDiscoveryDone = true;
+
+        // 1. Enumerate all Rewired actions (index loop — IL2CPP IList<T> has no GetEnumerator)
+        try
+        {
+            var actions = Rewired.ReInput.mapping.Actions;
+            if (actions != null)
+            {
+                // Cast to Il2CppSystem list to get Count
+                var list = actions.TryCast<Il2CppSystem.Collections.Generic.List<Rewired.InputAction>>();
+                int cnt = list != null ? list.Count : -1;
+                Log.LogInfo($"[Movement] Rewired actions (cnt={cnt}):");
+                if (list != null)
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        var a = list[i];
+                        Log.LogInfo($"[Movement]   id={a?.id} name='{a?.name}' type={a?.type}");
+                    }
+            }
+            else Log.LogWarning("[Movement] ReInput.mapping.Actions is null");
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] Actions enum: {ex.Message}"); }
+
+        // 2. Rewired player 0 info
+        try
+        {
+            var player = Rewired.ReInput.players.GetPlayer(0);
+            Log.LogInfo($"[Movement] Rewired player0: name='{player?.name}' id={player?.id}");
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] Player0: {ex.Message}"); }
+
+        // 3. Walk up from game camera to find CharacterController / Rigidbody
+        try
+        {
+            var t = _gameCam;
+            for (int i = 0; i < 10 && t != null; i++)
+            {
+                var cc = t.GetComponent<CharacterController>();
+                var rb = t.GetComponent<Rigidbody>();
+                Log.LogInfo($"[Movement] Ancestor[{i}] '{t.gameObject.name}': CC={cc != null} RB={rb != null}");
+                if (cc != null || rb != null) break;
+                t = t.parent;
+            }
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] Walk-up: {ex.Message}"); }
+
+        // 4. FindObjectOfType for the FPS controllers
+        try
+        {
+            var cc = FindObjectOfType<CharacterController>();
+            if (cc != null)
+                Log.LogInfo($"[Movement] FindObjectOfType<CC>: GO='{cc.gameObject.name}' pos={cc.transform.position}");
+            else
+                Log.LogInfo("[Movement] FindObjectOfType<CC>: not found");
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] FindCC: {ex.Message}"); }
     }
     /// <summary>
     /// Casts a ray from the right controller into all managed WorldSpace canvases.
