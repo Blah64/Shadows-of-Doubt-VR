@@ -30,23 +30,36 @@ public static class VRSettingsPanel
     public static int         CanvasInstanceId { get; private set; }
     public static GameObject? RootGO           { get; private set; }
 
-    private static Action<int>? _removeFromPositioned;
-    private static GameObject?  _graphicsPane;
-    private static GameObject?  _generalPane;
-    private static Image?       _graphicsTabImg;
-    private static Image?       _generalTabImg;
+    private static Action<int>?    _removeFromPositioned;
+    private static RectTransform?  _graphicsPaneRT;
+    private static RectTransform?  _generalPaneRT;
+    private static CanvasGroup?    _graphicsGroup;
+    private static CanvasGroup?    _generalGroup;
+    private static Image?          _graphicsTabImg;
+    private static Image?          _generalTabImg;
 
-    private static readonly Color ColTabActive   = new(0.18f, 0.43f, 0.71f, 1f);
-    private static readonly Color ColTabInactive = new(0.16f, 0.16f, 0.25f, 1f);
-    private static readonly Color ColBtnOn       = new(0.18f, 0.60f, 0.18f, 1f);
-    private static readonly Color ColBtnOff      = new(0.36f, 0.36f, 0.36f, 1f);
-    private static readonly Color ColNavBtn      = new(0.22f, 0.22f, 0.38f, 1f);
+    // Image colour refresh — called in Show() to re-apply toggle states and static colors.
+    private static readonly List<(Image img, TextMeshProUGUI txt, Func<bool> getter)> _toggleRefs    = new();
+    private static readonly List<(Image img, Color col)>                               _staticImgRefs = new();
+
+    // Panel image vertex tints — keep in [0,1] range.
+    // VRCamera.ApplyReadableImageBoost boosts each Image's material._Color by ×4 once,
+    // so the GPU sees: final_HDR = vertex_color × mat_color = tint × (4,4,4,1).
+    // E.g. ColBtnOff (0.85,0.85,0.85) × 4 ≈ (3.4,3.4,3.4) — bright enough to survive
+    // HDRP auto-exposure, the same way TMP_Text vertex colours do after ApplyReadableTextBoost.
+    private static readonly Color ColTabActive   = new(0.50f, 0.85f, 1.00f, 1f); // cyan-blue
+    private static readonly Color ColTabInactive = new(0.55f, 0.55f, 0.90f, 1f); // purple
+    private static readonly Color ColBtnOn       = new(0.70f, 1.00f, 0.70f, 1f); // green
+    private static readonly Color ColBtnOff      = new(0.85f, 0.85f, 0.85f, 1f); // light grey
+    private static readonly Color ColNavBtn      = new(0.65f, 0.75f, 1.00f, 1f); // lavender
 
     // ── Init ──────────────────────────────────────────────────────────────────
 
-    public static GameObject? Init(HashSet<int> ownedCanvasIds, Action<int> removeFromPositioned)
+    public static GameObject? Init(Action<int> removeFromPositioned)
     {
         _removeFromPositioned = removeFromPositioned;
+        _toggleRefs.Clear();
+        _staticImgRefs.Clear();
         try
         {
             // ── Canvas ────────────────────────────────────────────────────────
@@ -58,7 +71,8 @@ public static class VRSettingsPanel
             cv.renderMode   = RenderMode.ScreenSpaceOverlay;
             cv.sortingOrder = 50;
             CanvasInstanceId = cv.GetInstanceID();
-            ownedCanvasIds.Add(CanvasInstanceId);
+            // NOT added to ownedCanvasIds — RescanCanvasAlpha applies ZTest Always patch,
+            // bypassing HDRP auto-exposure so panel graphics render at full brightness.
 
             var scaler = root.AddComponent<CanvasScaler>();
             scaler.uiScaleMode         = CanvasScaler.ScaleMode.ScaleWithScreenSize;
@@ -87,7 +101,8 @@ public static class VRSettingsPanel
             closeBtnRT.anchorMin = new Vector2(1f, 1f); closeBtnRT.anchorMax = new Vector2(1f, 1f);
             closeBtnRT.pivot = new Vector2(1f, 1f); closeBtnRT.sizeDelta = new Vector2(80f, 56f);
             closeBtnRT.anchoredPosition = new Vector2(-8f, -8f);
-            closeBtnImg.color = new Color(0.55f, 0.13f, 0.13f, 1f);
+            closeBtnImg.color = new Color(1.00f, 0.45f, 0.40f, 1f); // red tint (mat ×4 → HDR)
+            _staticImgRefs.Add((closeBtnImg, new Color(1.00f, 0.45f, 0.40f, 1f)));
             closeBtnGO.AddComponent<Button>().onClick.AddListener(new Action(Hide));
             var closeLblGO   = MakeGO("CloseLabel", closeBtnGO.transform);
             var closeLblRT   = closeLblGO.AddComponent<RectTransform>();
@@ -115,8 +130,13 @@ public static class VRSettingsPanel
             // Scrolling done by shifting content.anchoredPosition.y via ▲/▼ buttons.
             var (graphicsPaneGO, graphicsContent) = MakeScrollablePane("GraphicsPane", root.transform, -126f);
             var (generalPaneGO,  generalContent)  = MakeScrollablePane("GeneralPane",  root.transform, -126f);
-            _graphicsPane = graphicsPaneGO;
-            _generalPane  = generalPaneGO;
+            _graphicsPaneRT = graphicsPaneGO.GetComponent<RectTransform>();
+            _generalPaneRT  = generalPaneGO.GetComponent<RectTransform>();
+            _graphicsGroup  = graphicsPaneGO.AddComponent<CanvasGroup>();
+            _generalGroup   = generalPaneGO.AddComponent<CanvasGroup>();
+            // Start with General pane hidden — shift off-canvas via localPosition.
+            // VRCamera.ApplyReadableImageBoost handles Image brightness; no alpha tricks needed.
+            SetPaneVisible(_generalPaneRT, _generalGroup, false);
 
             // ── Graphics tab rows ─────────────────────────────────────────────
             float gy = TOP_PAD;
@@ -258,8 +278,6 @@ public static class VRSettingsPanel
 
             // Start with Graphics tab active
             SetTabVisual(true);
-            _graphicsPane.SetActive(true);
-            _generalPane.SetActive(false);
 
             RootGO = root;
             root.SetActive(false);  // hidden by default — F10 to open
@@ -279,6 +297,11 @@ public static class VRSettingsPanel
     {
         if (RootGO == null) return;
         RootGO.SetActive(true);
+        // Re-apply toggle states and static colors in case they changed while hidden.
+        RefreshColors();
+        // Re-enforce tab pane visibility. Graphics tab shown, General tab off-canvas.
+        SetPaneVisible(_graphicsPaneRT, _graphicsGroup, true);
+        SetPaneVisible(_generalPaneRT,  _generalGroup,  false);
         _removeFromPositioned?.Invoke(CanvasInstanceId);
         Log.LogInfo("[VRSettingsPanel] Shown.");
     }
@@ -296,11 +319,31 @@ public static class VRSettingsPanel
         if (RootGO.activeSelf) Hide(); else Show();
     }
 
+    private static void RefreshColors()
+    {
+        foreach (var (img, txt, getter) in _toggleRefs)
+        {
+            if (img == null || txt == null) continue;
+            try { SetToggleVisual(img, txt, getter()); } catch { }
+        }
+        foreach (var (img, col) in _staticImgRefs)
+        {
+            if (img != null) img.color = col;
+        }
+        SetTabVisual(true); // always open on Graphics tab
+    }
+
     public static void Destroy()
     {
         if (RootGO == null) return;
         try { UnityEngine.Object.Destroy(RootGO); } catch { }
         RootGO = null;
+        _graphicsPaneRT = null;
+        _generalPaneRT  = null;
+        _graphicsGroup  = null;
+        _generalGroup   = null;
+        _toggleRefs.Clear();
+        _staticImgRefs.Clear();
     }
 
     // ── Tab switching ─────────────────────────────────────────────────────────
@@ -308,17 +351,31 @@ public static class VRSettingsPanel
     private static void ActivateGraphicsTab()
     {
         SetTabVisual(true);
-        _graphicsPane?.SetActive(true);
-        _generalPane?.SetActive(false);
+        SetPaneVisible(_graphicsPaneRT, _graphicsGroup, true);
+        SetPaneVisible(_generalPaneRT,  _generalGroup,  false);
         Log.LogInfo("[VRSettingsPanel] Graphics tab active.");
     }
 
     private static void ActivateGeneralTab()
     {
         SetTabVisual(false);
-        _graphicsPane?.SetActive(false);
-        _generalPane?.SetActive(true);
+        SetPaneVisible(_graphicsPaneRT, _graphicsGroup, false);
+        SetPaneVisible(_generalPaneRT,  _generalGroup,  true);
         Log.LogInfo("[VRSettingsPanel] General tab active.");
+    }
+
+    // Hides/shows a pane by shifting it off-canvas (localPosition.x = 9999 when hidden).
+    // VRCamera's RescanCanvasAlpha resets CanvasGroup.alpha to 1 every 30 frames on other
+    // canvases, but the isVrPanel bypass means our CanvasGroups are left alone.
+    // Visibility is purely positional — no alpha hacks needed.
+    private static void SetPaneVisible(RectTransform? rt, CanvasGroup? cg, bool visible)
+    {
+        if (rt != null)
+        {
+            var lp = rt.localPosition;
+            rt.localPosition = new Vector3(visible ? 0f : 9999f, lp.y, lp.z);
+        }
+        if (cg != null) { cg.interactable = visible; cg.blocksRaycasts = visible; }
     }
 
     private static void SetTabVisual(bool graphicsActive)
@@ -372,6 +429,7 @@ public static class VRSettingsPanel
         rt.sizeDelta = new Vector2(55f, 55f);
         rt.anchoredPosition = new Vector2(-5f, up ? -5f : 5f);
         img.color = ColNavBtn;
+        _staticImgRefs.Add((img, ColNavBtn));
 
         var lblGO = MakeGO("Lbl", go.transform);
         var lblRT = lblGO.AddComponent<RectTransform>();
@@ -435,6 +493,7 @@ public static class VRSettingsPanel
         bool curVal = false;
         try { curVal = getter(); } catch { }
         SetToggleVisual(btnImg, btnTxt, curVal);
+        _toggleRefs.Add((btnImg, btnTxt, getter));
 
         btnGO.AddComponent<Button>().onClick.AddListener(new Action(() =>
         {
@@ -475,6 +534,7 @@ public static class VRSettingsPanel
         prevRT.pivot = new Vector2(0.5f, 0.5f); prevRT.sizeDelta = new Vector2(50f, ROW_H - 12f);
         prevRT.anchoredPosition = new Vector2(-213f, 0f);
         prevImg.color = ColNavBtn;
+        _staticImgRefs.Add((prevImg, ColNavBtn));
         AddNavBtnLabel(prevGO.transform, "\u25C4");
 
         var valGO   = MakeGO("Val", rowGO.transform);
@@ -493,6 +553,7 @@ public static class VRSettingsPanel
         nextRT.pivot = new Vector2(0.5f, 0.5f); nextRT.sizeDelta = new Vector2(50f, ROW_H - 12f);
         nextRT.anchoredPosition = new Vector2(-33f, 0f);
         nextImg.color = ColNavBtn;
+        _staticImgRefs.Add((nextImg, ColNavBtn));
         AddNavBtnLabel(nextGO.transform, "\u25BA");
 
         int curIdx = 0;

@@ -82,12 +82,10 @@
        OpenXR is bootstrapped via native UnityOpenXR.dll + subsystem manifest (handled by preloader).
        XRDisplaySubsystem / XRSettings are accessed through the game's own UnityEngine.XRModule. -->
 
-  <!-- Post-build: copy to BepInEx plugins -->
+  <!-- Post-build: copy to BepInEx plugins (flat layout — subdirectory layout causes
+       BepInEx to load two copies and silently run the wrong one). -->
   <Target Name="DeployPlugin" AfterTargets="Build">
-    <PropertyGroup>
-      <PluginDir>$(GameDir)\BepInEx\plugins\SoDVR</PluginDir>
-    </PropertyGroup>
-    <MakeDir Directories="$(PluginDir)" />
-    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="$(PluginDir)" />
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll"
+          DestinationFiles="$(GameDir)\BepInEx\plugins\$(AssemblyName).dll" />
   </Target>
 </Project>

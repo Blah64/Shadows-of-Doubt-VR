@@ -62,7 +62,11 @@ public class VRCamera : MonoBehaviour
     // Makes the canvas backdrop semi-transparent so buttons and text show through it
     // even when HDRP's distance sort happens to render the background last.
     private const float UIBackgroundAlpha = 0.25f;
-    private const float UITextBrightnessBoost = 4.0f;
+    private const float UITextBrightnessBoost  = 4.0f;
+    // Images can't hold HDR vertex colours (Color32 clamps to 1) — only their material
+    // _Color can carry the HDR boost.  TMP gets ×4 vertex AND ×4 material → effective ×16,
+    // so Images need UITextBrightnessBoost² to match.
+    private const float UIImageBrightnessBoost = UITextBrightnessBoost * UITextBrightnessBoost;
 
     // Per-frame state
     private long  _displayTime;
@@ -110,6 +114,7 @@ public class VRCamera : MonoBehaviour
     // The dot moves via anchoredPosition (2D) inside this fixed-distance canvas.
     private Canvas?        _cursorCanvas;   // VRCursorCanvasInternal once scan converts it
     private RectTransform? _cursorRect;     // the dot's RectTransform inside _cursorCanvas
+    private Canvas?        _menuCanvasRef;  // MenuCanvas — hidden while VR settings panel is open
     private bool        _prevTrigger;
     private int         _poseFrameCount;
     private bool        _poseEverValid;
@@ -132,7 +137,13 @@ public class VRCamera : MonoBehaviour
     // Version stamp — bump to invalidate s_uiZTestMats cache and force material rebuild.
     private const int UIMaterialVersion = 3;
     private static readonly HashSet<int> s_shaderSwappedMats = new();
-    private static readonly HashSet<IntPtr> s_textBoostedGraphics = new();
+    private static readonly HashSet<IntPtr> s_textBoostedGraphics  = new();
+    private static readonly HashSet<IntPtr> s_imageBoostedGraphics = new();
+    // Tracks material instance IDs that have been brightness-boosted for Images.
+    // Multiple Image components share the same ZTest-clone material — without this
+    // guard each graphic would re-boost the shared material, compounding ×4 per
+    // Image and producing extreme / broken colours.
+    private static readonly HashSet<int> s_imageBoostedMats = new();
     private static readonly HashSet<int> s_menuMaskRelaxedCanvases = new();
     private static readonly HashSet<int> s_menuMaskabilityRelaxed = new();
     private static readonly Dictionary<int, Material> s_menuTmpReadableMats = new();
@@ -540,7 +551,6 @@ public class VRCamera : MonoBehaviour
         try
         {
             _settingsPanelGO = VRSettingsPanel.Init(
-                _ownedCanvasIds,
                 id => _positionedCanvases.Remove(id));
             Log.LogInfo("[VRCamera] VRSettingsPanel.Init complete.");
         }
@@ -775,6 +785,14 @@ public class VRCamera : MonoBehaviour
 
             ConvertCanvasToWorldSpace(canvas);
             _managedCanvases[id] = canvas;
+
+            // Redirect the game's "Settings" button to open our VR Settings panel instead.
+            // Also cache a reference so PositionCanvases can hide the menu while VR panel is open.
+            if (cname == "MenuCanvas")
+            {
+                _menuCanvasRef = canvas;
+                PatchMenuSettingsButton(canvas);
+            }
         }
 
         foreach (var kvp in _managedCanvases)
@@ -875,6 +893,51 @@ public class VRCamera : MonoBehaviour
                     crMat.color = BoostRgb(crMat.color, UITextBrightnessBoost);
                 if (crMat.HasProperty("_FaceColor"))
                     crMat.SetColor("_FaceColor", BoostRgb(crMat.GetColor("_FaceColor"), UITextBrightnessBoost));
+            }
+        }
+        catch { }
+    }
+
+    // Boosts the material _Color of non-text, non-background Image graphics by
+    // UITextBrightnessBoost so they survive HDRP auto-exposure.
+    // Unity UI vertex colours (image.color) are Color32 and clamp to [0,1] before
+    // reaching the GPU — only the material's _Color float4 property can hold HDR values.
+    // The vertex colour (set by RefreshColors) is then multiplied against this HDR
+    // material colour to produce the final on-screen HDR tint.
+    private void ApplyReadableImageBoost(Graphic g)
+    {
+        if (g == null || IsTextGraphic(g)) return;
+        if (!s_imageBoostedGraphics.Add(g.Pointer)) return; // one-shot per graphic
+
+        try
+        {
+            var mat = g.material;
+            // Gate on material instance ID — multiple Graphics share the same ZTest-clone
+            // material, so without this guard each one would compound the ×4 boost
+            // (4^N after N images → broken/black screen).
+            if (mat != null && mat.HasProperty("_Color") && s_imageBoostedMats.Add(mat.GetInstanceID()))
+            {
+                var c = mat.color;
+                // Boost RGB only — preserve original alpha so transparent overlays
+                // (vignettes, glow, decorative borders) stay transparent.
+                mat.color = new Color(c.r * UIImageBrightnessBoost,
+                                      c.g * UIImageBrightnessBoost,
+                                      c.b * UIImageBrightnessBoost,
+                                      c.a);
+            }
+        }
+        catch { }
+
+        try
+        {
+            var crMat = g.canvasRenderer.GetMaterial(0);
+            if (crMat != null && crMat.HasProperty("_Color") && s_imageBoostedMats.Add(crMat.GetInstanceID()))
+            {
+                var c = crMat.color;
+                crMat.color = new Color(c.r * UIImageBrightnessBoost,
+                                        c.g * UIImageBrightnessBoost,
+                                        c.b * UIImageBrightnessBoost,
+                                        c.a);
             }
         }
         catch { }
@@ -1523,14 +1586,20 @@ public class VRCamera : MonoBehaviour
 
             try
             {
-                var groups = canvas.GetComponentsInChildren<CanvasGroup>(true);
-                foreach (var cg in groups)
+                // Skip CanvasGroupFix for the VR Settings panel — its pane CanvasGroups are
+                // intentionally set to interactable=false (not alpha=0) and must not be reset.
+                bool isVrPanel = canvas.GetInstanceID() == VRSettingsPanel.CanvasInstanceId;
+                if (!isVrPanel)
                 {
-                    if (cg == null) continue;
-                    if (cg.alpha < 0.99f)
+                    var groups = canvas.GetComponentsInChildren<CanvasGroup>(true);
+                    foreach (var cg in groups)
                     {
-                        Log.LogInfo($"[VRCamera] CanvasGroupFix '{cg.gameObject.name}' on '{canvasName}': {cg.alpha:F2}->1");
-                        cg.alpha = 1f;
+                        if (cg == null) continue;
+                        if (cg.alpha < 0.99f)
+                        {
+                            Log.LogInfo($"[VRCamera] CanvasGroupFix '{cg.gameObject.name}' on '{canvasName}': {cg.alpha:F2}->1");
+                            cg.alpha = 1f;
+                        }
                     }
                 }
             }
@@ -1644,6 +1713,7 @@ public class VRCamera : MonoBehaviour
                     }
                     catch { }
                     if (isText) ApplyReadableTextBoost(g);
+                    else        ApplyReadableImageBoost(g);
                 }
             }
 
@@ -1682,6 +1752,46 @@ public class VRCamera : MonoBehaviour
         catch (Exception ex) { Log.LogWarning($"[VRCamera] GraphicRaycaster setup: {ex.Message}"); }
 
         Log.LogInfo($"[VRCamera] Canvas '{canvas.gameObject.name}' -> WorldSpace ({refW}x{refH}, scale={UICanvasScale}, sortOrder={canvas.sortingOrder}, patched={patched})");
+    }
+
+    // Finds buttons in MenuCanvas whose label text equals "Settings" and replaces their
+    // onClick listener to open the VR Settings panel. Called once per MenuCanvas instance.
+    // Cannot use GetComponentInParent<Button>() in IL2CPP — walks parents manually.
+    private void PatchMenuSettingsButton(Canvas menuCanvas)
+    {
+        try
+        {
+            var texts = menuCanvas.GetComponentsInChildren<TMP_Text>(true);
+            int patched = 0;
+            foreach (var t in texts)
+            {
+                if (t == null) continue;
+                string? s = t.text;
+                if (s == null) continue;
+                if (!s.Equals("Settings", StringComparison.OrdinalIgnoreCase)) continue;
+
+                // Walk up the parent chain to find the Button (IL2CPP GetComponentInParent is broken).
+                Button? btn = null;
+                var tr = t.transform;
+                for (int i = 0; i < 5 && tr != null; i++)
+                {
+                    btn = tr.gameObject.GetComponent<Button>();
+                    if (btn != null) break;
+                    tr = tr.parent;
+                }
+                if (btn == null) continue;
+
+                btn.onClick.RemoveAllListeners();
+                btn.onClick.AddListener(new Action(VRSettingsPanel.Toggle));
+                patched++;
+                Log.LogInfo($"[VRCamera] Patched Settings button '{t.gameObject.name}'");
+            }
+            Log.LogInfo($"[VRCamera] PatchMenuSettingsButton: {patched} button(s) redirected to VR panel");
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"[VRCamera] PatchMenuSettingsButton failed: {ex.Message}");
+        }
     }
 
     private int ForceUIZTestAlways(Canvas canvas, bool logQueueMap = true)
@@ -1802,6 +1912,7 @@ public class VRCamera : MonoBehaviour
                     }
                     catch { }
                     if (isText) ApplyReadableTextBoost(g);
+                    else        ApplyReadableImageBoost(g);
                 }
                 count++;
             }
@@ -1878,6 +1989,20 @@ public class VRCamera : MonoBehaviour
                 if (fg.color.a > 0f)
                     fg.color = new Color(fg.color.r, fg.color.g, fg.color.b, 0f);
             }
+        }
+
+        // Hide MenuCanvas while VR settings panel is open so it doesn't bleed through
+        // behind the panel and confuse cursor tracking.
+        if (_menuCanvasRef != null)
+        {
+            try
+            {
+                bool vrOpen = VRSettingsPanel.RootGO?.activeSelf == true;
+                _menuCanvasRef.enabled = !vrOpen;
+                var mgr = _menuCanvasRef.GetComponent<GraphicRaycaster>();
+                if (mgr != null) mgr.enabled = !vrOpen;
+            }
+            catch { }
         }
 
         if (_leftCam == null || !_posesValid) return;
