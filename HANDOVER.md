@@ -1,7 +1,7 @@
 # SoDVR — Technical Handover
 
-**Date**: 2026-03-27
-**Phase**: 8 — VR Settings Panel (Phase 0 confirmed, Phase 1 next)
+**Date**: 2026-03-28
+**Phase**: 9 — Movement (thumbstick locomotion, snap turn, interact bindings)
 
 ---
 
@@ -28,17 +28,23 @@
 - Controller visible as `RightController` GameObject under VROrigin ✓
 - Trigger fires `ExecuteEvents` pointer-click on closest WorldSpace canvas plane hit ✓
 - **Cursor dot** (`VRCursorCanvasInternal`) visible on all screens ✓
-  - ScreenSpaceOverlay canvas → converted via normal pipeline → HDRP-registered + ZTest Always
+  - NOT in `_ownedCanvasIds` → `RescanCanvasAlpha` applies ZTest Always material patch
   - `DontDestroyOnLoad` — survives loading→menu scene transition
-  - NOT in `_ownedCanvasIds` → `RescanCanvasAlpha` applies ZTest Always material patch (bypasses exposure darkening)
-  - Dot moves via `anchoredPosition` (2D projection onto canvas plane at `UIDistance`)
-  - `_cursorCanvas` cached in `BuildCameraRig`; `_cursorRect` via `AddComponent<Image>()` + `GetComponent<RectTransform>()`
+  - Dot moves via `anchoredPosition` (2D projection onto canvas plane)
+  - `_cursorAimDepth` tracks depth of nearest active aimed-at canvas (hidden canvases excluded via `activeSelf` check)
 
-### Phase 8 — VR Settings Panel (IN PROGRESS)
-- Phase 0 test canvas (`VRSettingsPanelInternal`, F10 to toggle) confirmed visible in headset ✓
-- Panel created as ScreenSpaceOverlay → converted by scan pipeline, registered in `_ownedCanvasIds`
-- `DontDestroyOnLoad` on panel GO ✓
-- **Next**: Phase 1 — extract panel into `SoDVR/VR/VRSettingsPanel.cs` per PLAN-Claude.md
+### Phase 8 — VR Settings Panel (COMPLETE, git `12172ad`)
+- `SoDVR/VR/VRSettingsPanel.cs` owns canvas, layout, all settings logic ✓
+- **F10** or **main menu Settings button** opens/closes the panel ✓
+- 4 tabs fully wired:
+  - **Graphics**: VSync, Depth Blur, Dithering, Screen Space Refl., AA Mode/Quality, Dynamic Resolution, DLSS, Frame Cap, UI Scale
+  - **Audio**: Master volume (FMOD bus:/), per-channel VCA volumes (7 channels), Music toggle, Licensed Music, Bass Reduction, Hyperacusis
+  - **Controls**: Always Run, Toggle Run, Control Auto-Switch, Control Hints, Invert X/Y, Force Feedback, mouse/controller sensitivity & smoothing, virtual cursor sensitivity
+  - **General**: FOV, Head Bob, Rain Detail, Draw Distance, Game Difficulty, Text Speed, Word-by-Word Text
+- MenuCanvas hidden (canvas.enabled=false + GraphicRaycaster.enabled=false) while VR panel open ✓
+  - State-tracked (`_menuCanvasHidden`) to avoid per-frame material rebuild crash
+- Settings button intercept via `TryClickCanvas` GO instance ID comparison ✓
+- Sensitivity/smoothing floats are PlayerPrefs-only (restart required) — accepted limitation
 
 ---
 
@@ -63,7 +69,7 @@ Must be disabled before `xrCreateInstance` — see `DisableUnityOpenXRLayer()` i
 
 ## BLOCKING ISSUE: UI Brightness
 
-### Confirmed root cause (2026-03-27)
+### Confirmed root cause
 WorldSpace UI rendered by the HDRP overlay cameras is darkened by HDRP's scene auto-exposure. The scene cameras compute EV≈8–12 for the city environment (multiplier ≈ 1/256 to 1/4096). The UI overlay cameras inherit this exposure rather than computing their own, so unlit white vertex colours appear near-black in the headset.
 
 ### What was tried and CONFIRMED NOT WORKING
@@ -71,124 +77,116 @@ WorldSpace UI rendered by the HDRP overlay cameras is darkened by HDRP's scene a
 |----------|--------|
 | `FrameSettingsField.ExposureControl = false` per camera | Does not persist — `ExposureOff` always reads back `False`. Not overridable in HDRP 12 per-camera FS. |
 | `FrameSettingsField.Tonemapping = false` | **Works** — `TonemapOff=True` confirmed on all cameras. |
-| VRExposureOverride Volume (EV=0 Fixed, Tonemapping=None, layer 31, priority 1000, `volumeLayerMask=1<<31` on UI cameras) | Volume is **not applied** — confirmed: changing `fixedExposure` to `-10` (1024× boost) produced zero visible change. |
-| `HDAdditionalCameraData.clearColorMode = None` | Added; uncertain if effective for compositing. |
+| VRExposureOverride Volume (EV=0 Fixed, Tonemapping=None, layer 31, priority 1000) | Volume is **not applied** — confirmed: changing `fixedExposure` to `-10` produced zero visible change. |
 
-### State of current code (VRCamera.cs)
-- Scene cameras: `cullingMask = ~(1<<UILayer)`, `ExposureOff=False` (unavoidable), `TonemapOff=True`
-- UI overlay cameras: `cullingMask = 1<<UILayer`, `clearColorMode=None`, `volumeLayerMask=1<<31`, `TonemapOff=True`, `ExposureOff=False` (unavoidable)
-- VRExposureOverride volume: still present but ineffective (currently has `fixedExposure=-10` from last diagnostic test — should be reverted to `0` if the approach is abandoned)
-- TMP text: vertex colour = white, shader = UI/Default, TSA=(1,1,1,0) — all data confirmed correct
-
-### Recommended fix approaches (next session)
+### Recommended fix approaches (next session that tackles this)
 
 **Option A — `FrameSettingsField.Postprocess` master toggle (try first, 5 min)**
-Add `FrameSettingsField.Postprocess` to `s_VrDisabledFields` alongside Tonemapping, ExposureControl, etc.
-If this field persists (unlike ExposureControl), it disables ALL post-processing including exposure as a side-effect.
-Check log for `ExposureOff=True` after adding it.
+Add `FrameSettingsField.Postprocess` to `s_VrDisabledFields`. If this field persists (unlike ExposureControl), it disables ALL post-processing including exposure.
 
-```csharp
-// In s_VrDisabledFields array, add:
-FrameSettingsField.Postprocess,   // may disable entire post-process stack incl. exposure
-```
-Also add to the UI camera disabled-fields array inside `CreateUIOverlayCam`.
+**Option B — Overwrite HDRP's exposure texture via CommandBuffer**
+HDRP stores the current frame's exposure as a 1×1 RFloat texture in `HDCamera` history.
+A CommandBuffer can overwrite this to neutral before the post-process pass.
 
-**Option B — Overwrite HDRP's exposure texture via CommandBuffer (medium complexity)**
-HDRP stores the current frame's exposure as a 1×1 RFloat texture in the `HDCamera` history.
-A CommandBuffer can overwrite this to neutral (1.0 linear = log2 value 0) before the post-process pass.
-
-```csharp
-// In CreateUIOverlayCam, after creating HDAdditionalCameraData:
-var cb = new CommandBuffer { name = "ForceNeutralExposure" };
-// Access HDRP's exposure texture:
-//   var hdCam = HDCamera.GetOrCreate(cam);
-//   var expRT = hdCam.GetCurrentFrameRT((int)HDCameraFrameHistoryType.Exposure);
-// Blit a 1×1 white texture (= linear 1.0 = neutral exposure) into expRT:
-//   cb.Blit(Texture2D.whiteTexture, expRT);
-cam.AddCommandBuffer(CameraEvent.BeforeImageEffects, cb);
-```
-The exact HDCamera API path needs investigation in the HDRP 12 IL2CPP interop DLLs.
-
-**Option C — Remove UI overlay cameras; add layer 5 to scene cameras; rely on TonemapOff**
-Remove `_leftUICam`/`_rightUICam`. Add `(1 << UILayer)` back into scene camera `cullingMask`.
-Since `TonemapOff=True` already works on scene cameras, test whether removing tonemapping alone
-is sufficient to get readable UI (tonemapping was compressing bright values; exposure was also
-darkening, but maybe the combined effect was tolerable or exposure is not as extreme as estimated).
-This simplifies the architecture and may work if scene EV is moderate.
+**Option C — Remove UI overlay cameras; add layer 5 to scene cameras**
+Since `TonemapOff=True` works, test whether exposure alone makes text unreadable or if the combined effect is tolerable. Simplifies architecture.
 
 **Option D — Read live exposure and boost vertex colours to compensate**
-In `Update()`, use `HDCamera.GetOrCreate(_leftCam)` to get the current exposure value.
-Compute `boost = 1 / currentExposure`. Each scan cycle apply `tmp.color = Color.white * boost`
-for all text elements (clamped, but if boost > 1 the LDR clamp gives white).
-Rate-limit to once per scan (every 30 frames) to avoid rebuild lag.
+`HDCamera.GetOrCreate(_leftCam)` → current exposure value → `boost = 1/exposure` → apply to TMP vertex colours each scan cycle (rate-limited).
 
 ---
 
-## Options Panel Text Invisible (secondary issue)
-
-### Root cause
-The options/settings panel is a child hierarchy within MenuCanvas that is initially inactive.
-When `ForceUIZTestAlways` runs at canvas scan time, inactive TMP elements get `g.material = VRPatch_clone`.
-When the panel opens (activates), TMP rebuilds the text and may call `CanvasRenderer.SetMaterial`
-with a font-asset material whose shader has NOT been swapped to UI/Default yet (different font from
-the main menu buttons).
-
-`RescanCanvasAlpha` (runs every 30 frames) will catch this on the next cycle and swap the shader.
-The text should appear within ~0.5 s of the panel opening. If it never appears, the issue is
-that TMP is overriding with a material variation instance that is not being tracked.
-
-### Diagnostic
-On End key press with options panel open, check the dump for options text elements:
-- `crShader=null` → TMP hasn't rendered yet; wait one more rescan cycle
-- `crShader=TextMeshPro/Distance Field` → swap hasn't fired yet for this instance
-- `crShader=UI/Default` → shader is correct; problem is purely exposure
-
----
-
-## IL2CPP Interop Pitfalls
+## IL2CPP Interop Pitfalls (full list)
 
 | Pitfall | Detail |
 |---------|--------|
-| `GetComponentInParent<Button>()` | Always returns null in IL2CPP — never use for Button detection |
-| `Graphic.color` vs `mat.color` | Separate in HDRP UI. `mat.color.a` alone does not make UI transparent. Must set `g.color.a`. |
-| `g.color = ...` per-frame | Calls `SetVertexDirty()` → canvas mesh rebuild → serious lag at 60 Hz. Rate-limit or avoid. |
-| `renderQueue` in HDRP Transparent | HDRP ignores fine-grained queue values within Transparent range; always sorts by spherical distance. |
-| `FindObjectsOfType<Canvas>()` | Less reliable in IL2CPP. Use `Resources.FindObjectsOfTypeAll<Canvas>()`. |
-| `TMP_Text.color` vs `Graphic.color` | TMP overrides `Graphic.color` with `new color` — the base setter is ignored. Must cast to `TMP_Text` and set `.color` directly. |
-| `FrameSettingsField.ExposureControl` | Cannot be overridden per-camera in HDRP 12 IL2CPP. Bit never persists. |
-| `AddComponent<RectTransform>()` on new GO | Returns **null** in IL2CPP — the GO already has a Transform. Instead: `AddComponent<Image>()` first, then `GetComponent<RectTransform>()`. |
-| `DontDestroyOnLoad` on VRMod GOs | **Required** for any VRMod-created canvas or panel. The loading→menu scene transition destroys all non-persistent objects, invalidating cached Canvas/RectTransform references silently. |
-| Duplicate `plugins/SoDVR.dll` | BepInEx loads two copies if both `plugins/SoDVR.dll` and `plugins/SoDVR/SoDVR.dll` exist. Use `powershell.exe -Command "Remove-Item -Recurse -Force 'path\SoDVR'"` to clean up; `rm -rf` in bash may silently fail on Windows. |
+| `GetComponentInParent<Button>()` | Always returns null in IL2CPP — walk up transform hierarchy manually |
+| `AddListener` on `new Button.ButtonClickedEvent()` | Silently fails in IL2CPP — use `TryClickCanvas` GO instance ID intercept pattern instead |
+| `btn.GetInstanceID()` | Returns COMPONENT id, not GO id — use `btn.gameObject.GetInstanceID()` for GO comparisons |
+| `btn.onClick = new Button.ButtonClickedEvent()` | DOES kill persistent (prefab-baked) listeners — use to suppress game button default behaviour |
+| `Graphic.color` vs `mat.color` | Separate in HDRP UI — must set both for transparency. `mat.color.a` alone does nothing. |
+| `g.color = ...` per-frame | Calls `SetVertexDirty()` → canvas mesh rebuild → serious lag. Rate-limit or avoid. |
+| `Resources.FindObjectsOfTypeAll<Canvas>()` | More reliable than `FindObjectsOfType` in IL2CPP |
+| `TMP_Text.color` vs `Graphic.color` | TMP overrides base `Graphic.color` — must cast to `TMP_Text` and set `.color` directly |
+| `FrameSettingsField.ExposureControl` | Cannot be overridden per-camera in HDRP 12 IL2CPP — bit never persists |
+| `AddComponent<RectTransform>()` on new GO | Returns null — GO already has Transform. Use `AddComponent<Image>()` first, then `GetComponent<RectTransform>()` |
+| `DontDestroyOnLoad` on VRMod GOs | **Required** — loading→menu scene transition destroys all non-persistent objects |
+| `canvas.enabled` per-frame toggle | Causes Unity to rebuild all canvas materials every frame → floods material instances → crash. Always state-track changes. |
+| `AudioListener.volume` | Has zero effect on FMOD audio — use `FMODUnity.RuntimeManager.GetBus("bus:/").setVolume(float)` |
 
 ---
 
-## Phase 8 — VR Settings Panel (CURRENT WORK)
+## FMOD Audio API (confirmed working)
 
-See `PLAN-Claude.md` for the complete phase plan (Phases 0–4).
+```csharp
+// Master volume
+FMODUnity.RuntimeManager.GetBus("bus:/").setVolume(vol);   // float 0..1
+PlayerPrefs.SetFloat("masterVolume", vol); PlayerPrefs.Save();
 
-### Status
-- **Phase 0** (visibility proof): `VRSettingsPanelInternal` test canvas confirmed visible ✓
-- **Phase 1** (skeleton panel): **TODO** — extract into `SoDVR/VR/VRSettingsPanel.cs`
+// Per-channel VCA (same pattern for all)
+FMODUnity.RuntimeManager.GetVCA("vca:/Soundtrack").setVolume(vol);
+PlayerPrefs.SetFloat("musicVolume", vol); PlayerPrefs.Save();
 
-### Phase 1 deliverables (per PLAN-Claude.md)
-- New file `SoDVR/VR/VRSettingsPanel.cs` — owns canvas, layout, settings logic
-- Dark semi-transparent background, title "VR Settings", Close button
-- Two tab buttons: **Graphics** | **General**
-- 3–4 hardcoded rows per tab as layout proof (no scroll view yet)
-- F10 toggles visibility
-- `VRCamera` additions: ≤30 lines — call `VRSettingsPanel.Init()`, add canvas ID to `_ownedCanvasIds`, wire F10
+// Music toggle (updates in-memory GameSetting + PlayerPrefs)
+SetFamilyA("music", v);   // via PlayerPrefsController.OnToggleChanged
 
-### Canvas creation rules (learned from Phase 0 + cursor dot work)
-- Create as `ScreenSpaceOverlay` → let `ScanAndConvertCanvases` convert → HDRP-registered automatically
-- `DontDestroyOnLoad` on the root GO — **mandatory**
-- Register canvas instance ID in `_ownedCanvasIds` immediately after `AddComponent<Canvas>()` — before scan runs
-- `_ownedCanvasIds` gates `RescanCanvasAlpha` only; `PositionCanvases` still places owned canvases normally (placed once via `_positionedCanvases`, re-placed on F10 by removing from `_positionedCanvases`)
-- Add `CanvasScaler` with `referenceResolution = (900, 700)` so `ConvertCanvasToWorldSpace` uses the right size
-- Assert `GraphicRaycaster` exists after conversion (added by `ConvertCanvasToWorldSpace`, but confirm)
+// Bass reduction / Hyperacusis (triggers FMOD snapshot internally)
+Game.Instance.SetBassReduction(v ? 1 : 0);
+Game.Instance.SetHyperacusisFilter(v ? 1 : 0);
+```
 
-### Setting families (for Phase 2 wiring)
-See `PLAN-Claude.md §Setting families and write paths` for complete API.
-Key families: A (`OnToggleChanged` + `SessionData` guard), B (`Game.Instance.SetXxx` + `PlayerPrefs.Save`), C (enum setter), D (float setter), E (frame cap compound), F (DLSS special), G (resolution, deferred).
+VCA paths confirmed from Master Bank.strings.bank:
+`vca:/Soundtrack`, `vca:/Ambience`, `vca:/Weather`, `vca:/Footsteps`, `vca:/Notifications`, `vca:/PA System`, `vca:/Other SFX`
+
+FMODUnity.dll is in `BepInEx/interop/` — referenced in `SoDVR.csproj`.
+
+---
+
+## Settings Panel Button Intercept Pattern
+
+The game's Settings button has a persistent (prefab-baked) onClick listener that `RemoveAllListeners()` cannot remove. Pattern to suppress it and replace with our handler:
+
+```csharp
+// 1. Kill persistent listener by replacing the entire event object
+btn.onClick = new Button.ButtonClickedEvent();
+// 2. Store the button GO's instance ID (NOT btn.GetInstanceID() — that's component id)
+_menuSettingsBtnId = btn.gameObject.GetInstanceID();
+
+// 3. In TryClickCanvas, before ExecuteEvents:
+var tr = go?.transform;
+for (int i = 0; i < 5 && tr != null; i++)
+{
+    if (tr.gameObject.GetInstanceID() == _menuSettingsBtnId)
+    {
+        VRSettingsPanel.Toggle();
+        return;
+    }
+    tr = tr.parent;
+}
+```
+
+---
+
+## Phase 9 — Movement (NEXT)
+
+### Goal
+Thumbstick locomotion and snap-turn so the player can move around in VR without keyboard.
+
+### Required OpenXR bindings (add to OpenXRManager.cs)
+- Left thumbstick X/Y → character movement (forward/back/strafe)
+- Right thumbstick X → snap turn (configurable degrees, e.g. 30°)
+- Left controller grip or A button → jump / interact
+- Right controller B button → sprint (or map to alwaysRun)
+
+### Architecture approach
+- Add left controller pose tracking (same pattern as right controller in Phase 7)
+- Add thumbstick action bindings in `CreateActionSets()` / `SuggestBindings()` / `SyncActions()`
+- In `Update()`, read thumbstick values and call into Rewired player input OR directly move the character transform
+- Snap turn: rotate VROrigin around Y by ±N degrees when thumbstick crosses threshold; add dead-zone and cooldown to prevent continuous spinning
+
+### Key unknowns
+- How the game's character controller works (Rewired vs direct transform) — may need to read `Plugin.cs` and find the player GO
+- Whether injecting movement via Rewired player `SetAxisValue` or via direct transform is more compatible with the game's physics
 
 ---
 
@@ -196,23 +194,23 @@ Key families: A (`OnToggleChanged` + `SessionData` guard), B (`Game.Instance.Set
 
 | File | Purpose |
 |------|---------|
-| `VRMod/SoDVR/OpenXRManager.cs` | OpenXR init, session, swapchain, frame loop — add action sets here |
-| `VRMod/SoDVR/VR/VRCamera.cs` | Stereo render loop, UI canvas management — add controller pose + laser here |
+| `VRMod/SoDVR/OpenXRManager.cs` | OpenXR init, session, swapchain, frame loop, action sets |
+| `VRMod/SoDVR/VR/VRCamera.cs` | Stereo render loop, UI canvas management, controller click |
+| `VRMod/SoDVR/VR/VRSettingsPanel.cs` | VR Settings panel — 4 tabs, all settings wired |
 | `VRMod/SoDVR/Plugin.cs` | BepInEx entry point — do not change |
+| `VRMod/PLAN-2.md` | Phase 8 plan + full settings API reference |
 | `BepInEx/plugins/SoDVR.dll` | Deployed plugin (flat layout only) |
 | `BepInEx/LogOutput.log` | Runtime log |
-| `VRMod/CLAUDE.md` | Claude project instructions (always loaded) |
-| `VRMod/HANDOVER.md` | This file |
 
 ---
 
 ## Phase Roadmap
 
-- [x] Phase 1–4: OpenXR init, session, swapchain (VDXR patch approach, archived `1be2b0e`)
-- [x] **Phase 5**: Standard loader → real swapchain textures → stereo image in headset (`346a6df`)
-- [x] **Phase 6**: Camera positioning, head tracking, UI canvases visible in VR
-- [x] **Phase 7**: Controller pose + trigger click + cursor dot visible on all screens
-- [ ] **Phase 8 (current)**: VR Settings Panel (Phase 0 done, Phase 1–4 per PLAN-Claude.md)
-- [ ] Phase 9: Movement (thumbstick → character move/rotate), jump, interact bindings
-- [ ] Phase 10: Comfort options (vignette, snap-turn, IPD)
-- [ ] Phase 11: Polish, performance tuning
+- [x] Phase 5: Standard loader → real swapchain textures → stereo image in headset (`346a6df`)
+- [x] Phase 6: Camera positioning, head tracking, UI canvases visible in VR
+- [x] Phase 7: Controller pose + trigger click + cursor dot visible on all screens
+- [x] **Phase 8**: VR Settings Panel — 4 tabs, all settings wired, FMOD audio, Settings button intercept (`12172ad`)
+- [ ] **Phase 9 (next)**: Movement — thumbstick locomotion, snap turn, jump, interact bindings
+- [ ] Phase 10: Comfort options (vignette, snap-turn degrees, IPD, dominant hand)
+- [ ] Phase 11: Left controller full tracking + dual-hand interactions
+- [ ] Phase 12: Polish, performance tuning, UI brightness fix

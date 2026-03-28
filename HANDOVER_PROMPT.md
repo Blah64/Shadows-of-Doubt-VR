@@ -7,47 +7,43 @@ The mod is called SoDVR. Read the project instructions and handover doc first:
 
 - `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\CLAUDE.md`
 - `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\HANDOVER.md`
-- `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\PLAN-Claude.md`
 
-Then read the main source file:
+Then read the main source files:
 
 - `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\VR\VRCamera.cs`
-
-We are starting **Phase 8: VR Settings Panel — Phase 1 (skeleton panel)**.
+- `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\OpenXRManager.cs`
 
 What is working:
 - Stereo rendering in headset ✓
 - Head tracking ✓
 - All game UI canvases visible in VR (WorldSpace conversion pipeline) ✓
-- Right controller pose tracked, trigger fires click events ✓
-- Cursor dot visible on all screens (survives scene transitions) ✓
-- Phase 0 test canvas (`VRSettingsPanelInternal`, F10 to toggle) confirmed visible ✓
+- Right controller pose tracked, trigger fires click events, cursor dot visible ✓
+- VR Settings panel (F10 or main menu Settings button): 4 tabs, all settings wired ✓
+  - Audio volumes work via FMOD APIs (GetBus/GetVCA on RuntimeManager)
+  - MenuCanvas hides while VR panel is open
 
-What to build next (Phase 1 per PLAN-Claude.md):
-- New file `SoDVR/VR/VRSettingsPanel.cs` that owns the canvas, layout, and all settings logic
-- Dark semi-transparent background panel (900×700 reference resolution)
-- Title "VR Settings", Close button
-- Two tab buttons: **Graphics** | **General**
-- 3–4 hardcoded placeholder rows per tab (no scroll view)
-- F10 still toggles visibility
-- VRCamera additions ≤30 lines: call `VRSettingsPanel.Init()`, add canvas ID to `_ownedCanvasIds`, wire F10
+What to build next (Phase 9):
+- Left controller pose tracking (same action set pattern as right controller)
+- Thumbstick locomotion: left stick → character movement (forward/back/strafe)
+- Snap turn: right stick X → rotate VROrigin by ±N degrees with dead-zone and cooldown
+- Optional: grip/button bindings for jump and interact
 
 Key constraints from HANDOVER.md:
-- Canvas must be created as `ScreenSpaceOverlay`, then `ScanAndConvertCanvases` converts it (gives HDRP registration)
-- `DontDestroyOnLoad` on the root GO — mandatory, scene transition destroys non-persistent objects
-- Register canvas ID in `_ownedCanvasIds` immediately after `AddComponent<Canvas>()` — before scan fires
-- `_cursorRect`: always `AddComponent<Image>()` first, then `GetComponent<RectTransform>()` — `AddComponent<RectTransform>()` returns null in IL2CPP
-- `CanvasScaler` with `referenceResolution=(900,700)` so conversion uses the right size
-- `_ownedCanvasIds` gates `RescanCanvasAlpha` only; `PositionCanvases` still places owned canvases once
+- OpenXR action sets are in `OpenXRManager.cs` — add left controller bindings there
+- No coroutines — everything drives via `Update()`/`LateUpdate()`
+- IL2CPP: `GetComponentInParent<Button>()` always null; `AddListener` on new `ButtonClickedEvent` unreliable (use TryClickCanvas intercept pattern)
+- `btn.GetInstanceID()` = component id; always use `btn.gameObject.GetInstanceID()` for GO comparisons
+- `DontDestroyOnLoad` required on all VRMod-created GameObjects
 
 Build and deploy with:
 ```
 cd "E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod"
 dotnet build SoDVR/SoDVR.csproj -c Release
-cp SoDVR/bin/Release/net6.0/SoDVR.dll "../BepInEx/plugins/SoDVR.dll"
 ```
+(Post-build step in csproj auto-copies to BepInEx/plugins/SoDVR.dll)
+
 When I say "done" it means I've run the game and the log is ready at:
 `E:\SteamLibrary\steamapps\common\Shadows of Doubt\BepInEx\LogOutput.log`
 Always read it immediately.
 
-Start by reading the four files above, then propose the implementation plan for Phase 1.
+Start by reading the four files above, then propose the implementation plan for Phase 9.

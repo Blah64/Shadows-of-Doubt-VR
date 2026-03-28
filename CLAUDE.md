@@ -112,6 +112,19 @@ What was tried and confirmed NOT working:
 2. CommandBuffer to overwrite HDRP's 1×1 exposure texture to neutral (log2=0) before the UI camera's post-process pass
 3. Read HDRP's live exposure value via `HDCamera` internals and apply compensating vertex-colour boost
 
+## CRITICAL: IL2CPP Button / event additional pitfalls
+- `AddListener` on a **freshly-created** `new Button.ButtonClickedEvent()` is unreliable in IL2CPP — the listener silently fails to fire. Instead, intercept clicks in `TryClickCanvas` by comparing `tr.gameObject.GetInstanceID()` against a stored button GO id.
+- `btn.GetInstanceID()` returns the **component** instance ID, NOT the GameObject ID. For GO comparisons always use `btn.gameObject.GetInstanceID()`.
+- `btn.onClick = new Button.ButtonClickedEvent()` DOES kill persistent (prefab-baked) listeners — use this to suppress a game button's default behaviour.
+
+## CRITICAL: FMOD audio (confirmed working)
+- `AudioListener.volume` has **zero effect** on FMOD sounds — game audio is entirely FMOD.
+- Master volume: `FMODUnity.RuntimeManager.GetBus("bus:/").setVolume(float 0–1)` ✓
+- Per-channel VCA: `FMODUnity.RuntimeManager.GetVCA("vca:/Soundtrack").setVolume(float)` ✓ (same pattern for all VCA paths)
+- VCA paths confirmed from strings bank: `vca:/Soundtrack`, `vca:/Ambience`, `vca:/Weather`, `vca:/Footsteps`, `vca:/Notifications`, `vca:/PA System`, `vca:/Other SFX`
+- `FMODUnity.dll` is in `BepInEx/interop/` and must be referenced in `SoDVR.csproj` ✓
+- Music toggle: `SetFamilyA("music", bool)` updates both in-memory `GameSetting.intValue` AND PlayerPrefs ✓
+
 ## Phase 6 UI canvas status (COMPLETE)
 - All canvases converted to WorldSpace each 30-frame scan ✓
 - Canvases placed in front of head on first valid pose; stay fixed ✓
@@ -127,10 +140,14 @@ What was tried and confirmed NOT working:
   - `DontDestroyOnLoad` on cursor GO — survives loading→menu scene transition
   - Dot moves via `anchoredPosition` (2D projection onto canvas plane at `UIDistance`)
   - `_cursorCanvas` cached directly at `BuildCameraRig` time — never rely on name-lookup in `PositionCanvases`
+- **Cursor depth** tracks nearest active aimed-at canvas (`_cursorAimDepth`); hidden canvases excluded via `activeSelf` check
 
-## Phase 8 (current): VR Settings Panel
-- Phase 0 test canvas (`VRSettingsPanelInternal`, F10 to toggle) confirmed visible ✓
-- **Next**: Phase 1 — extract into `VRSettingsPanel.cs` with two tabs, per PLAN-Claude.md
+## Phase 8 — VR Settings Panel (COMPLETE)
+- `SoDVR/VR/VRSettingsPanel.cs` — full panel with 4 tabs, all settings wired ✓
+- **F10** or **main menu Settings button** opens/closes the VR panel ✓
+- MenuCanvas hidden (canvas.enabled=false) while VR panel open; state-tracked to avoid per-frame material rebuilds ✓
+- 4 tabs: **Graphics** (VSync, Depth Blur, AA, DLSS, Frame Cap, UI Scale, …) | **Audio** (Master, VCAs, toggles) | **Controls** (run/invert/sensitivity) | **General** (FOV, Head Bob, Difficulty, …)
+- Settings that only write PlayerPrefs (sensitivity/smoothing) require restart to apply — accepted limitation
 
 ## Known canvas names (from LogOutput.log, 2026-03-26)
 | Canvas | Elements | Notes |
@@ -149,4 +166,5 @@ What was tried and confirmed NOT working:
 - git `346a6df` — **Phase 5 complete**: standard loader working, stereo image in headset
 - **Phase 6 complete**: camera positioning ✓, head tracking ✓, UI canvases visible in VR ✓
 - **Phase 7 complete**: controller pose ✓, trigger click ✓, cursor dot visible on all screens ✓
-- **Phase 8 (current)**: VR settings panel — Phase 0 test canvas confirmed ✓, Phase 1 next
+- **Phase 8 complete**: VR settings panel ✓ — 4 tabs, all settings wired, FMOD audio, Settings button intercept
+- **Phase 9 (next)**: Movement — thumbstick locomotion, snap turn, jump, interact bindings
