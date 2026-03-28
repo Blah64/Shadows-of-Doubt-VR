@@ -51,13 +51,17 @@ public class VRCamera : MonoBehaviour
     // Render throttle: call Camera.Render() every N stereo frames.
     // 1 = every frame (full quality). 2 = every other frame (half GPU load, slight judder).
     // The swapchain copy still runs every frame, so head tracking stays smooth via ATW.
-    private const int RenderEveryNFrames = 1;
+    // Render every 2nd frame — ATW in the headset compensates for the skipped
+    // frame with zero perceived quality loss while halving GPU load.
+    private const int RenderEveryNFrames = 2;
 
     // ── UI / Canvas constants ─────────────────────────────────────────────────
     private const float UIDistance       = 2.0f;    // metres in front of head
     private const float UIVerticalOffset = 0.0f;    // metres up/down from eye level
     private const float UICanvasScale    = 0.0015f; // world-units per canvas pixel (1920px → 2.88 m wide)
-    private const int   UICanvasScanRate = 30;      // Unity frames between canvas scans
+    // Scan rate reduced from 30 → 90 frames: the game can spawn hundreds of
+    // map-component canvases; scanning them all at 2 Hz caused freezes.
+    private const int   UICanvasScanRate = 90;      // Unity frames between canvas scans
     // Alpha applied to any Graphic whose GameObject name contains "background".
     // Makes the canvas backdrop semi-transparent so buttons and text show through it
     // even when HDRP's distance sort happens to render the background last.
@@ -737,7 +741,11 @@ public class VRCamera : MonoBehaviour
 
             if ((_frameCount % RenderEveryNFrames) == 0)
             {
-                Canvas.ForceUpdateCanvases();
+                // ForceUpdateCanvases every 4 rendered frames (~8 Unity frames at
+                // RenderEveryNFrames=2).  With 700+ map canvases this was causing
+                // a full mesh-rebuild storm every frame and freezing the game.
+                if ((_frameCount % (RenderEveryNFrames * 4)) == 0)
+                    Canvas.ForceUpdateCanvases();
 
                 GL.invertCulling = true;
                 _leftCam.Render();
@@ -882,6 +890,14 @@ public class VRCamera : MonoBehaviour
                 int nid = nc.GetInstanceID();
                 if (nid == root.GetInstanceID()) continue;
                 if (_managedCanvases.ContainsKey(nid)) continue;
+
+                // Skip dynamically-instantiated prefab canvases (name contains "(Clone)").
+                // The game spawns hundreds of these for map components (MapButtonComponent,
+                // MapLayer, MapDuctComponent etc.); tracking them inflates _managedCanvases
+                // to 700+ entries and makes every RescanCanvasAlpha pass and
+                // Canvas.ForceUpdateCanvases() catastrophically expensive.
+                string ncName = nc.gameObject.name ?? "";
+                if (ncName.IndexOf("(Clone)", StringComparison.OrdinalIgnoreCase) >= 0) continue;
 
                 int patched = ForceUIZTestAlways(nc, logQueueMap: true);
                 _managedCanvases[nid] = nc;
