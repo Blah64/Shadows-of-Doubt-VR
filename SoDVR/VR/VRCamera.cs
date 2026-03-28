@@ -108,6 +108,13 @@ public class VRCamera : MonoBehaviour
     private GameObject?   _rightControllerGO;
     private GameObject?   _leftControllerGO;
 
+    // ── Game camera deferred disable ─────────────────────────────────────────
+    // We delay calling cam.enabled=false by several frames so that scene-load
+    // code (SaveStateController:LoadSaveState) has time to finish using the
+    // camera before we interfere with it.
+    private Camera? _gameCamPending;       // found but not yet disabled
+    private int     _gameCamDisableDelay;  // frames remaining before disable
+
     // ── Snap turn ─────────────────────────────────────────────────────────────
     private const float SnapTurnAngle    = 30f;   // degrees per snap
     private const float SnapTurnDeadZone = 0.6f;  // stick threshold to trigger
@@ -441,6 +448,21 @@ public class VRCamera : MonoBehaviour
         if (_gameCam == null && (_frameCount % 60) == 0) TryFindGameCamera();
         if (_gameCam != null) transform.position = _gameCam.position;
 
+        // Deferred camera disable: fire after the countdown reaches zero.
+        // This gives scene-load code (SaveStateController etc.) several frames to
+        // complete before we disable the camera they may depend on.
+        if (_gameCamPending != null && _gameCamDisableDelay > 0)
+        {
+            _gameCamDisableDelay--;
+            if (_gameCamDisableDelay == 0)
+            {
+                try { _gameCamPending.enabled = false; }
+                catch { }
+                Log.LogInfo($"[VRCamera] Game camera disabled (deferred): '{_gameCamPending.gameObject.name}'");
+                _gameCamPending = null;
+            }
+        }
+
         _displayTime = OpenXRManager.FrameWaitPublic(out int waitRc);
         if (waitRc < 0)
         {
@@ -593,17 +615,23 @@ public class VRCamera : MonoBehaviour
         Log.LogInfo($"[VRCamera] Rig built: {w}x{h} ARGB32");
     }
 
-    // Search all active cameras for one that is not one of ours.
-    // Disables it so it does not render independently, and tracks its transform.
+    // Search active cameras for the game's "Main Camera".
+    // Only accepts cameras explicitly named "Main Camera" — avoids disabling
+    // scene-load helper cameras or NPC cameras that appear transiently.
+    // The disable is deferred by 10 frames so SaveStateController:LoadSaveState
+    // has time to complete before the camera is taken offline.
     private void TryFindGameCamera()
     {
         foreach (var cam in Camera.allCameras)
         {
             if (cam == _leftCam || cam == _rightCam) continue;
             if (!cam.gameObject.activeInHierarchy) continue;
-            _gameCam = cam.transform;
-            cam.enabled = false;
-            Log.LogInfo($"[VRCamera] Found game camera: '{cam.gameObject.name}' pos={cam.transform.position}");
+            // Only accept the primary game camera; skip setup/NPC cameras.
+            if (!cam.gameObject.name.Equals("Main Camera", StringComparison.OrdinalIgnoreCase)) continue;
+            _gameCam          = cam.transform;
+            _gameCamPending   = cam;
+            _gameCamDisableDelay = 10; // ~10 frames at 60 fps ≈ 167 ms grace period
+            Log.LogInfo($"[VRCamera] Found game camera: '{cam.gameObject.name}' pos={cam.transform.position} (disable in 10 frames)");
             transform.position = _gameCam.position;
             return;
         }
