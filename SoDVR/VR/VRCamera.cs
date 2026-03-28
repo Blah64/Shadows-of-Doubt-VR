@@ -697,6 +697,16 @@ public class VRCamera : MonoBehaviour
                 return;
             }
 
+            // Skip full renders when the game camera is absent (scene transition / world
+            // generation).  The GPU is saturated by city-gen work; Camera.Render() on top
+            // of that causes DXGI_ERROR_DEVICE_REMOVED.  ATW holds the last valid frame in
+            // the headset so the transition is invisible to the user.
+            if (_gameCam == null)
+            {
+                OpenXRManager.FrameEndEmpty(_displayTime);
+                return;
+            }
+
             if ((_frameCount % RenderEveryNFrames) == 0)
             {
                 Canvas.ForceUpdateCanvases();
