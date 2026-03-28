@@ -53,7 +53,7 @@ public static class OpenXRManager
     private static IntPtr _pfnCreateActionSpace, _pfnAttachSessionActionSets;
     private static IntPtr _pfnSyncActions, _pfnLocateSpace, _pfnGetActionStateBoolean;
     private static IntPtr _pfnGetActionStateVector2f;
-    private static ulong  _actionSet, _poseAction, _triggerAction, _thumbAction;
+    private static ulong  _actionSet, _poseAction, _triggerAction, _thumbAction, _menuButtonAction;
     private static ulong  _rightAimSpace, _leftAimSpace;
     private static ulong  _rightHandPath, _leftHandPath;
     public  static bool   ActionSetsReady { get; private set; }
@@ -1300,27 +1300,29 @@ public static class OpenXRManager
         return path;
     }
 
-    private static ulong CreateAction(string name, string localName, int actionType, ulong path0, ulong path1)
+    // path1 == 0 → single-subaction action (count=1, only path0 is written).
+    private static ulong CreateAction(string name, string localName, int actionType, ulong path0, ulong path1 = 0)
     {
         if (_pfnCreateAction == IntPtr.Zero || _actionSet == 0) return 0;
         // XrActionCreateInfo: type(29)+pad(4)+next(8)+name[64]+actionType(4)+count(4)+paths*(8)+localName[128] = 224 bytes
         const int sz = 224;
+        int pathCount  = path1 == 0 ? 1 : 2;
         IntPtr info    = Marshal.AllocHGlobal(sz);
-        IntPtr pathArr = Marshal.AllocHGlobal(16);
+        IntPtr pathArr = Marshal.AllocHGlobal(pathCount * 8);
         try
         {
             for (int i = 0; i < sz; i++) Marshal.WriteByte(info, i, 0);
-            Marshal.WriteInt32(info,  0, 29);           // XR_TYPE_ACTION_CREATE_INFO
-            WriteAsciiString (info, 16, name);          // actionName[64]  at +16
-            Marshal.WriteInt32(info, 80, actionType);   // actionType       at +80
-            Marshal.WriteInt32(info, 84, 2);            // countSubactionPaths at +84
+            Marshal.WriteInt32(info,  0, 29);               // XR_TYPE_ACTION_CREATE_INFO
+            WriteAsciiString (info, 16, name);              // actionName[64]  at +16
+            Marshal.WriteInt32(info, 80, actionType);       // actionType       at +80
+            Marshal.WriteInt32(info, 84, pathCount);        // countSubactionPaths at +84
             Marshal.WriteInt64(pathArr, 0, (long)path0);
-            Marshal.WriteInt64(pathArr, 8, (long)path1);
-            Marshal.WriteIntPtr(info, 88, pathArr);     // subactionPaths*  at +88
-            WriteAsciiString (info, 96, localName);     // localizedName[128] at +96
+            if (path1 != 0) Marshal.WriteInt64(pathArr, 8, (long)path1);
+            Marshal.WriteIntPtr(info, 88, pathArr);         // subactionPaths*  at +88
+            WriteAsciiString (info, 96, localName);         // localizedName[128] at +96
             int rc = Marshal.GetDelegateForFunctionPointer<XrCreateActionDelegate>
                 (_pfnCreateAction)(_actionSet, info, out ulong action);
-            Log.LogInfo($"  xrCreateAction('{name}') type={actionType} rc={rc} action=0x{action:X}");
+            Log.LogInfo($"  xrCreateAction('{name}') type={actionType} paths={pathCount} rc={rc} action=0x{action:X}");
             return action;
         }
         finally { Marshal.FreeHGlobal(info); Marshal.FreeHGlobal(pathArr); }
@@ -1399,23 +1401,30 @@ public static class OpenXRManager
 
             // 3. Create actions
             // actionType: 4=POSE_INPUT, 1=BOOLEAN_INPUT, 3=VECTOR2F_INPUT
-            _poseAction      = CreateAction("hand_pose",  "Hand Pose",  4, _leftHandPath, _rightHandPath);
-            _triggerAction   = CreateAction("trigger",    "Trigger",    1, _leftHandPath, _rightHandPath);
-            _thumbAction     = CreateAction("thumbstick", "Thumbstick", 3, _leftHandPath, _rightHandPath);
+            _poseAction        = CreateAction("hand_pose",    "Hand Pose",    4, _leftHandPath, _rightHandPath);
+            _triggerAction     = CreateAction("trigger",      "Trigger",      1, _leftHandPath, _rightHandPath);
+            _thumbAction       = CreateAction("thumbstick",   "Thumbstick",   3, _leftHandPath, _rightHandPath);
+            // Menu button: left-hand only — used to open/close the pause menu (ESC equivalent).
+            // Single subaction path (left hand). Bound to Y-button and menu-button below.
+            _menuButtonAction  = CreateAction("menu_button",  "Menu Button",  1, _leftHandPath);
             if (_poseAction == 0 || _triggerAction == 0)
             { Log.LogWarning("  SetupActionSetsInstance: action creation failed"); return; }
 
             // 4. Suggest Oculus Touch bindings (instance-level, no session needed)
-            ulong profile   = XrStringToPath("/interaction_profiles/oculus/touch_controller");
-            ulong aimRight  = XrStringToPath("/user/hand/right/input/aim/pose");
-            ulong aimLeft   = XrStringToPath("/user/hand/left/input/aim/pose");
-            ulong trigRight = XrStringToPath("/user/hand/right/input/trigger/value");
-            ulong trigLeft  = XrStringToPath("/user/hand/left/input/trigger/value");
-            ulong stickR    = XrStringToPath("/user/hand/right/input/thumbstick");
-            ulong stickL    = XrStringToPath("/user/hand/left/input/thumbstick");
+            ulong profile    = XrStringToPath("/interaction_profiles/oculus/touch_controller");
+            ulong aimRight   = XrStringToPath("/user/hand/right/input/aim/pose");
+            ulong aimLeft    = XrStringToPath("/user/hand/left/input/aim/pose");
+            ulong trigRight  = XrStringToPath("/user/hand/right/input/trigger/value");
+            ulong trigLeft   = XrStringToPath("/user/hand/left/input/trigger/value");
+            ulong stickR     = XrStringToPath("/user/hand/right/input/thumbstick");
+            ulong stickL     = XrStringToPath("/user/hand/left/input/thumbstick");
+            ulong menuBtnY   = XrStringToPath("/user/hand/left/input/y/click");
+            ulong menuBtnM   = XrStringToPath("/user/hand/left/input/menu/click");
 
             // XrActionSuggestedBinding = action(8) + binding(8) = 16 bytes
-            int bindCount = 6;
+            // Include both Y-button and menu-button bindings for _menuButtonAction; runtime
+            // picks whichever is available on the actual hardware.
+            int bindCount = 8;
             IntPtr bindings = Marshal.AllocHGlobal(bindCount * 16);
             try
             {
@@ -1424,12 +1433,14 @@ public static class OpenXRManager
                     Marshal.WriteInt64(bindings, idx * 16 + 0, (long)act);
                     Marshal.WriteInt64(bindings, idx * 16 + 8, (long)path);
                 }
-                WriteBinding(0, _poseAction,    aimRight);
-                WriteBinding(1, _poseAction,    aimLeft);
-                WriteBinding(2, _triggerAction, trigRight);
-                WriteBinding(3, _triggerAction, trigLeft);
-                WriteBinding(4, _thumbAction,   stickR);
-                WriteBinding(5, _thumbAction,   stickL);
+                WriteBinding(0, _poseAction,       aimRight);
+                WriteBinding(1, _poseAction,       aimLeft);
+                WriteBinding(2, _triggerAction,    trigRight);
+                WriteBinding(3, _triggerAction,    trigLeft);
+                WriteBinding(4, _thumbAction,      stickR);
+                WriteBinding(5, _thumbAction,      stickL);
+                WriteBinding(6, _menuButtonAction, menuBtnY);
+                WriteBinding(7, _menuButtonAction, menuBtnM);
 
                 // XrInteractionProfileSuggestedBinding: type(24)+pad(4)+next(8)+profile(8)+count(4)+pad(4)+bindings*(8) = 40
                 IntPtr sugInfo = Marshal.AllocHGlobal(40);
@@ -1448,7 +1459,7 @@ public static class OpenXRManager
             }
             finally { Marshal.FreeHGlobal(bindings); }
 
-            Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X} thumb=0x{_thumbAction:X}");
+            Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X} thumb=0x{_thumbAction:X} menu=0x{_menuButtonAction:X}");
         }
         catch (Exception ex) { Log.LogWarning($"  SetupActionSetsInstance: {ex}"); }
     }
@@ -1595,6 +1606,27 @@ public static class OpenXRManager
             return rc == 0;
         }
         catch (Exception ex) { Log.LogWarning($"  GetThumbstickState: {ex.Message}"); return false; }
+    }
+
+    /// <summary>
+    /// Returns whether the left-controller menu/Y button is pressed this frame.
+    /// Used to simulate an ESC key press for opening the pause menu.
+    /// Returns false (pressed=false) if action is not ready.
+    /// </summary>
+    public static bool GetMenuButtonState(out bool pressed)
+    {
+        pressed = false;
+        if (!ActionSetsReady || _dGetActionStateBool == null || _menuButtonAction == 0) return false;
+        try
+        {
+            Marshal.WriteInt64(_bActionGi, 16, (long)_menuButtonAction);
+            Marshal.WriteInt64(_bActionGi, 24, (long)_leftHandPath);
+            int rc = _dGetActionStateBool(_session, _bActionGi, _bActionStateBool);
+            if (rc == 0)
+                pressed = Marshal.ReadInt32(_bActionStateBool, 16) != 0; // currentState at +16
+            return rc == 0;
+        }
+        catch (Exception ex) { Log.LogWarning($"  GetMenuButtonState: {ex.Message}"); return false; }
     }
 
     private static float ReadFloat(IntPtr p, int offset)

@@ -1,334 +1,542 @@
-# Phase 9 — VR Movement Plan
+# PLAN — Phase 9: GUI, HUD & Game UI in VR
 
 **Date**: 2026-03-28
-**Goal**: Thumbstick locomotion, snap turn, and controller bindings so the player can move in VR without keyboard/mouse.
+**Scope**: Fix all remaining UI issues so every game canvas is usable in the headset.
+Phase 10 (movement) is blocked on this.
 
 ---
 
-## Current State
+## Current state
 
-### What works
-- OpenXR action set already binds **both controllers**: aim pose, trigger (boolean), thumbstick (vector2f)
-- Right controller: pose tracked, trigger fires clicks, cursor dot visible
-- Right thumbstick Y: scrolls VR settings panel when open
-- VROrigin follows game camera position each frame (`transform.position = _gameCam.position`)
-- VROrigin rotation is **independent** of game camera — head tracking applies via local child transforms
+The canvas pipeline is operational:
+- Every 90 frames, `ScanAndConvertCanvases` discovers root ScreenSpace canvases via
+  `Resources.FindObjectsOfTypeAll<Canvas>()` and converts them to WorldSpace.
+- Each canvas is placed once at 2 m from the head on first activation.
+- Material patches (ZTest Always, render-queue assignment, stencil neutralization)
+  make UI visible through 3D geometry.
+- Brightness boosts (text ×4 vertex + ×4 material, images ×16 material) partially
+  compensate for HDRP auto-exposure.
+- Controller ray-cast + trigger click + cursor dot all functional.
 
-### OpenXR bindings already in place (OpenXRManager.cs)
-```
-_poseAction    → /user/hand/{left,right}/input/aim/pose    (type 4 = POSE)
-_triggerAction → /user/hand/{left,right}/input/trigger/value (type 1 = BOOLEAN)
-_thumbAction   → /user/hand/{left,right}/input/thumbstick   (type 3 = VECTOR2F)
-```
-Both `_leftAimSpace` and `_rightAimSpace` are created and attached to the session.
+### What's broken or incomplete
 
-### Public API already available
-```csharp
-OpenXRManager.GetControllerPose(bool right, long displayTime, out Quaternion ori, out Vector3 pos)
-OpenXRManager.GetTriggerState(bool right, out bool pressed)
-OpenXRManager.GetThumbstickState(bool right, out float x, out float y)
-```
-
-### Game character movement system (unknown — needs runtime discovery)
-- Game has `RigidbodyFirstPersonController` (found in Assembly-CSharp interop)
-- Also has `CharacterController`, `firstPersonController`, `ApplyMovement`, `GetInput`
-- Rewired_Core.dll is referenced in csproj — game uses Rewired for input
-- Rewired `CustomController.SetAxisValue(string, float)` and `SetButtonValue(string, bool)` exist
-- Asset files contain `Horizontal` and `Vertical` strings (likely Rewired action names)
-- **Unknown**: exact Rewired action names, whether to inject via Rewired or move transform directly
+| Issue | Severity | Status |
+|-------|----------|--------|
+| HDRP auto-exposure darkens UI text to near-black | **Blocking** | Workaround only (×4/×16 boost) |
+| Trigger click fires every frame while held | High | Rising-edge exists but may be unreliable |
+| Y-button (ESC) fires multiple times per press | High | Cooldown guard in place, still slipping |
+| Right-eye temporal jitter | Medium | GL.InvalidateState deployed, unconfirmed |
+| "Blue box" flash on ESC | Low | Canvas whitelist deployed, unconfirmed |
+| No per-canvas positioning strategy | Medium | All canvases stacked at same distance |
+| Some game canvases not yet verified in VR | Medium | Only MenuCanvas/GameCanvas well-tested |
 
 ---
 
-## Implementation Steps
+## Game canvas inventory
 
-### Step 1: Snap Turn (right stick X → VROrigin yaw rotation)
+From `Assembly-CSharp.dll` (`InterfaceController` class) — these are the canvases
+the game creates at runtime:
 
-**No game API needed — pure VR rig rotation.**
+| Field name | Purpose | VR treatment needed |
+|------------|---------|---------------------|
+| `hudCanvas` | Crosshair, awareness indicator, notifications | HUD — needs comfort positioning |
+| `statusCanvas` | Health / energy / awareness bars | HUD — group with hudCanvas |
+| `menuCanvas` | Main menu (2231 elements, incl. FadeOverlay) | Menu — recentre on activate ✓ |
+| `dialogCanvas` | NPC conversation / interrogation | Menu — recentre on activate ✓ |
+| `gameWorldCanvas` | World-anchored 3D labels (names, prices) | Leave as WorldSpace — no conversion |
+| `caseCanvas` | Investigation board (pinned evidence) | Panel — large, may need scale adjustment |
+| `contentCanvas` | Document / folder viewer | Panel — same treatment as caseCanvas |
+| `windowCanvas` | In-game windows (phone, email, computer) | Panel — positioned at interaction point |
+| `tooltipsCanvas` | Item/button tooltips (sortOrder=3) | Tooltip — attach near cursor or controller |
+| `controlPanelCanvas` | Door/safe/intercom UI | Panel — world-anchored at interaction |
+| `controlsCanvas` | Settings / key remapping | Menu — treat like menuCanvas |
+| `minimapCanvas` | Minimap overlay | HUD — position at wrist or corner |
+| `osCanvas` | In-game computer desktop | Panel — full-size, positioned at desk |
+| `keyboardCanvas` | Virtual keyboard for computer | Panel — group with osCanvas |
+| `upgradesCanvas` | Sync disk / augmentation screen | Menu — recentre like dialog |
+| `interactionProgressCanvas` | Lockpick / hack progress bar | HUD — attach near interaction point |
+| `fingerprintDisplayCanvas` | Fingerprint scanner results | Panel — positioned at scanner |
+| `mapLayerCanvas` | Full map layers | Panel — large, needs custom scale |
 
-Add to `VRCamera.cs`:
+### Canvas categories for VR
+
+**Category A — HUD** (always visible, comfort-positioned):
+`hudCanvas`, `statusCanvas`, `interactionProgressCanvas`
+
+**Category B — Menu** (recentre in front of head on activate):
+`menuCanvas`, `dialogCanvas`, `controlsCanvas`, `upgradesCanvas`
+
+**Category C — Panel** (large interactive surfaces):
+`caseCanvas`, `contentCanvas`, `windowCanvas`, `osCanvas`, `keyboardCanvas`,
+`fingerprintDisplayCanvas`, `mapLayerCanvas`
+
+**Category D — World-anchored** (stay at interaction point):
+`gameWorldCanvas`, `controlPanelCanvas`
+
+**Category E — Tooltip** (follow cursor/controller):
+`tooltipsCanvas`
+
+---
+
+## Task 1 — Trigger click debounce
+
+**File**: `VRCamera.cs` ~line 2428
+**Time**: 10 min
+
+The rising-edge detection (`triggerDown = triggerNow && !_prevTrigger`) should work
+but may be defeated by `GetTriggerState` returning inconsistent state across a single
+frame (e.g. if `xrSyncActions` resets the boolean between two reads).
+
+**Fix**: Add `_triggerNeedsRelease` latch as belt-and-suspenders:
 
 ```csharp
-// ── Snap turn state ──
-private const float SnapTurnAngle    = 30f;   // degrees per snap
-private const float SnapTurnDeadZone = 0.6f;  // thumbstick threshold
-private const float SnapTurnCooldown = 0.25f; // seconds between snaps
-private float _snapTurnCooldownTimer;
-private bool  _snapTurnReady = true;
-```
+// New field alongside _prevTrigger:
+private bool _triggerNeedsRelease;
 
-**Logic** (in `Update()`, after `SyncActions()`):
-1. Read right thumbstick X via `OpenXRManager.GetThumbstickState(true, out tx, out _)`
-2. If `|tx| > SnapTurnDeadZone` and cooldown expired:
-   - Rotate `transform` (VROrigin) around Y by `sign(tx) * SnapTurnAngle`
-   - Reset cooldown timer
-3. If `|tx| < SnapTurnDeadZone * 0.5`: re-arm (hysteresis to prevent double-fire)
-4. Subtract `Time.deltaTime` from cooldown timer each frame
-
-**Why rotate VROrigin**: The game camera position is followed each frame, but VROrigin's **rotation** is independent — head tracking is applied as local rotations on child cameras. Rotating VROrigin around Y effectively turns the player's view.
-
-**Canvas re-centering**: After snap turn, canvases should stay at their world positions (they already do — `_positionedCanvases` prevents re-placement). The Home key re-centres them if needed.
-
-**Conflict with settings panel scroll**: Currently right stick Y scrolls the settings panel. When the panel is open, **skip snap turn** (already gated by `VRSettingsPanel.RootGO?.activeSelf`).
-
-### Step 2: Left Controller Pose Tracking
-
-**Trivial — same pattern as right controller.**
-
-Add to `BuildCameraRig()`:
-```csharp
-var leftCtrlGO = new GameObject("LeftController");
-leftCtrlGO.layer = UILayer;
-leftCtrlGO.transform.SetParent(_cameraOffset, false);
-_leftControllerGO = leftCtrlGO;
-```
-
-Add field:
-```csharp
-private GameObject? _leftControllerGO;
-```
-
-In `UpdateControllerPose()`, after right controller update:
-```csharp
-if (_leftControllerGO != null)
+// Replace the trigger block in UpdateControllerPose (~line 2428):
+OpenXRManager.GetTriggerState(true, out bool triggerNow);
+if (_triggerNeedsRelease)
 {
-    if (OpenXRManager.GetControllerPose(false, displayTime, out Quaternion lOri, out Vector3 lPos))
-    {
-        var ulPos = new Vector3(lPos.x, lPos.y, -lPos.z);
-        var ulOri = new Quaternion(-lOri.x, -lOri.y, lOri.z, lOri.w);
-        _leftControllerGO.transform.position = transform.TransformPoint(ulPos);
-        _leftControllerGO.transform.rotation = transform.rotation * ulOri;
-    }
+    if (!triggerNow) _triggerNeedsRelease = false;
+}
+else if (triggerNow && !_prevTrigger)   // rising edge + latch
+{
+    _triggerNeedsRelease = true;
+    TryClickCanvas(_rightControllerGO.transform.position,
+                   _rightControllerGO.transform.forward);
+}
+_prevTrigger = triggerNow;
+```
+
+---
+
+## Task 2 — Y-button (menu) multi-fire
+
+**File**: `VRCamera.cs` ~line 2556
+**Time**: 15 min (includes diagnostic build)
+
+### Step 2a — Diagnose
+
+Add logging to confirm hypothesis that `realtimeSinceStartup` stalls during the ESC
+pause-unpause cycle:
+
+```csharp
+// At top of UpdateMenuButton():
+Log.LogInfo($"[VRCamera] MenuBtn t={Time.realtimeSinceStartup:F3} " +
+            $"cooldown={_menuBtnCooldownUntil:F3} " +
+            $"needsRelease={_menuBtnNeedsRelease} " +
+            $"frame={Time.frameCount}");
+```
+
+Build, run, press Y once, read log. Look for multiple `MenuBtn` lines with
+identical or very close `t=` values but different `frame=` values.
+
+### Step 2b — Fix
+
+Replace the time-based cooldown with a frame-counter latch (frame numbers always
+advance exactly once per `Update()`, regardless of Unity internal scheduling):
+
+```csharp
+// Replace _menuBtnCooldownUntil with:
+private int _menuBtnFireFrame = -999;
+private const int MenuBtnFrameCooldown = 90;  // ~1.5 s at 60 fps
+
+// In UpdateMenuButton():
+if (_menuBtnNeedsRelease)
+{
+    if (!menuNow) _menuBtnNeedsRelease = false;
+    return;
+}
+if (!menuNow) return;
+if (Time.frameCount - _menuBtnFireFrame < MenuBtnFrameCooldown) return;
+_menuBtnNeedsRelease = true;
+_menuBtnFireFrame = Time.frameCount;
+FireMenuButton();
+```
+
+Remove `_menuBtnCooldownUntil` after confirming the frame-based guard works.
+
+---
+
+## Task 3 — HDRP UI brightness (primary blocker)
+
+### Root cause
+
+HDRP's auto-exposure computes EV ≈ 8–12 for city interiors (exposure multiplier
+≈ 1/256 to 1/4096). The eye cameras inherit this exposure. Unlit UI with white vertex
+colours × 1/256 → near-black.
+
+Current workaround (×4 text, ×16 image boost) is 1–2 orders of magnitude too weak
+for dark environments.
+
+### Approach 3A — `FrameSettingsField.Postprocess` master toggle
+
+**Rationale**: If this field persists per-camera (unlike `ExposureControl` which
+doesn't), it disables the entire post-processing stack including exposure. Tonemapping
+is already off, so the main thing we lose is bloom — acceptable trade-off.
+
+**Change**: Add to `s_VrDisabledFields` array in `VRCamera.cs` ~line 730:
+
+```csharp
+private static readonly FrameSettingsField[] s_VrDisabledFields =
+{
+    FrameSettingsField.Postprocess,         // ← NEW: master post-process kill
+    FrameSettingsField.SSAO,
+    FrameSettingsField.SSR,
+    FrameSettingsField.Volumetrics,
+    FrameSettingsField.MotionVectors,
+    FrameSettingsField.MotionBlur,
+    FrameSettingsField.DepthOfField,
+    FrameSettingsField.ChromaticAberration,
+    FrameSettingsField.ContactShadows,
+    FrameSettingsField.Tonemapping,
+};
+```
+
+**Verify**: Add readback log after camera setup:
+
+```csharp
+bool ppOff = !fsRb.IsEnabled(FrameSettingsField.Postprocess);
+Log.LogInfo($"[VRCamera] HDRP FS readback: PostprocessOff={ppOff}");
+```
+
+If `PostprocessOff=True` → test in headset. If text is legible → done.
+If `PostprocessOff=False` (same failure as ExposureControl) → try 3B.
+
+### Approach 3B — `SetExposureTextureToEmpty()` on HDCamera
+
+Discovered in `Unity.RenderPipelines.HighDefinition.Runtime.dll`:
+
+```
+HDCamera.GetOrCreate(Camera)
+HDCamera.GetExposureTexture()       → current 1×1 RFloat exposure RT
+HDCamera.SetExposureTextureToEmpty() → reset to neutral (m_EmptyExposureTexture)
+```
+
+This is a direct API on `HDCamera` that resets the exposure texture to neutral.
+Call it each frame before `Camera.Render()`:
+
+```csharp
+// In LateUpdate, before each eye render:
+try
+{
+    var hdLeft = HDCamera.GetOrCreate(_leftCam);
+    hdLeft.SetExposureTextureToEmpty();  // exposure = 1.0 (log₂ = 0)
+}
+catch (Exception ex) { Log.LogWarning($"[VRCamera] Exposure reset failed: {ex.Message}"); }
+
+GL.invertCulling = true;
+GL.InvalidateState();
+_leftCam.Render();
+// ... same for right eye
+```
+
+If `SetExposureTextureToEmpty` is not public in IL2CPP, fall back to reflection or
+direct field write:
+
+```csharp
+// Alternative: write m_EmptyExposureTexture to m_ExposureTextures via reflection
+var hdType = Il2CppType.Of<HDCamera>();
+// ... field access pattern
+```
+
+### Approach 3C — Increase boost multipliers (stop-gap)
+
+If both 3A and 3B fail, increase the brightness constants to survive EV 10:
+
+```csharp
+private const float UITextBrightnessBoost  = 32.0f;   // was 4.0
+private const float UIImageBrightnessBoost = 256.0f;   // was 16.0 (32²)
+```
+
+Bump `UIMaterialVersion` to 4 to force re-patching of all cached materials.
+
+This will over-expose in lighter environments (loading screens) but at least makes
+text readable in-game. Can be refined later with dynamic compensation (3D below).
+
+### Approach 3D — Dynamic exposure compensation (future refinement)
+
+Read the scene camera's live exposure value and scale boosts to compensate:
+
+```csharp
+// In ScanAndConvertCanvases (every 90 frames):
+try
+{
+    var hdScene = HDCamera.GetOrCreate(_gameCamComponent);
+    var expTex = hdScene.GetExposureTexture();
+    // Read the 1×1 RFloat value via AsyncGPUReadback or RenderTexture.ReadPixels
+    float ev = /* log₂ value from texture */;
+    float compensationFactor = Mathf.Pow(2f, ev);  // boost = 2^EV to cancel exposure
+    // Apply to UI materials...
 }
 ```
 
-### Step 3: Runtime Discovery — Rewired Action Names & Character Controller
-
-**One-shot debug logging** to discover the game's movement API.
-
-Add a `_movementDiscoveryDone` flag. On the first frame where `_stereoReady` and `_gameCam != null`:
-
-```csharp
-private bool _movementDiscoveryDone;
-
-private void DiscoverMovementSystem()
-{
-    if (_movementDiscoveryDone || _gameCam == null) return;
-    _movementDiscoveryDone = true;
-
-    try
-    {
-        // 1. Log all Rewired actions
-        var actions = Rewired.ReInput.mapping.Actions;
-        foreach (var a in actions)
-            Log.LogInfo($"[Movement] Rewired action: id={a.id} name='{a.name}' type={a.type}");
-
-        // 2. Find the player object (Rewired player 0 = local player)
-        var player = Rewired.ReInput.players.GetPlayer(0);
-        Log.LogInfo($"[Movement] Rewired player0: name='{player?.name}' id={player?.id}");
-
-        // 3. Walk up from _gameCam to find CharacterController or Rigidbody
-        var t = _gameCam;
-        for (int i = 0; i < 10 && t != null; i++)
-        {
-            var cc = t.GetComponent<CharacterController>();
-            var rb = t.GetComponent<Rigidbody>();
-            var rfpc = t.GetComponent<RigidbodyFirstPersonController>();
-            Log.LogInfo($"[Movement] Ancestor[{i}] '{t.gameObject.name}': " +
-                        $"CC={cc != null} RB={rb != null} RFPC={rfpc != null}");
-            if (cc != null || rb != null || rfpc != null) break;
-            t = t.parent;
-        }
-
-        // 4. Also try FindObjectOfType for the FPS controller
-        var fpc = UnityEngine.Object.FindObjectOfType<RigidbodyFirstPersonController>();
-        if (fpc != null)
-            Log.LogInfo($"[Movement] Found RFPC: GO='{fpc.gameObject.name}' " +
-                        $"pos={fpc.transform.position}");
-    }
-    catch (Exception ex)
-    {
-        Log.LogWarning($"[Movement] Discovery failed: {ex}");
-    }
-}
-```
-
-**Expected output**: Rewired action names (likely `Horizontal`, `Vertical`, `Jump`, `Sprint`, `Crouch`, `Interact`), player info, and which GO has the CharacterController/Rigidbody.
-
-### Step 4: Thumbstick Locomotion (left stick → character movement)
-
-**Two candidate approaches — chosen based on Step 3 results.**
-
-#### Approach A: Rewired Virtual Input (preferred if action names found)
-
-If Step 3 confirms action names (e.g. `"Horizontal"`, `"Vertical"`):
-
-```csharp
-// In Update(), after SyncActions():
-OpenXRManager.GetThumbstickState(false, out float lx, out float ly); // left stick
-
-if (Mathf.Abs(lx) > 0.15f || Mathf.Abs(ly) > 0.15f)
-{
-    // Transform thumbstick input from head-relative to world-relative
-    // Head yaw = combined VROrigin yaw + HMD local yaw
-    float headYaw = _leftCam.transform.eulerAngles.y;
-    Vector3 forward = Quaternion.Euler(0, headYaw, 0) * Vector3.forward;
-    Vector3 right   = Quaternion.Euler(0, headYaw, 0) * Vector3.right;
-    Vector3 moveDir = (forward * ly + right * lx).normalized;
-
-    // Inject into Rewired — game's own movement system handles physics, speed, collision
-    var player = Rewired.ReInput.players.GetPlayer(0);
-    // player.SetAxisValue(...) requires CustomController — may need alternative
-}
-```
-
-**Problem**: Rewired's `SetAxisValue` is on `CustomController`, not `Player`. To inject virtual input we'd need to:
-1. Create a `CustomController` via `ReInput.controllers.CreateCustomController(0)`
-2. Add it to the player
-3. Set axis values each frame
-
-This may conflict with the game's existing controller setup. Needs testing.
-
-#### Approach B: Direct CharacterController.Move() (simpler, guaranteed to work)
-
-If Step 3 finds a `CharacterController` on the player GO:
-
-```csharp
-private CharacterController? _charController;
-private float _moveSpeed = 3.5f; // m/s — calibrate to match game's walk speed
-
-// In Update(), after SyncActions():
-if (_charController != null)
-{
-    OpenXRManager.GetThumbstickState(false, out float lx, out float ly);
-    if (Mathf.Abs(lx) > 0.15f || Mathf.Abs(ly) > 0.15f)
-    {
-        float headYaw = _leftCam.transform.eulerAngles.y;
-        Vector3 forward = Quaternion.Euler(0, headYaw, 0) * Vector3.forward;
-        Vector3 right   = Quaternion.Euler(0, headYaw, 0) * Vector3.right;
-        Vector3 move = (forward * ly + right * lx) * _moveSpeed * Time.deltaTime;
-        _charController.Move(move);
-    }
-}
-```
-
-**Pros**: Works regardless of Rewired. Collision detection built in.
-**Cons**: Bypasses game's speed modifiers (sprint, crouch speed, drunk effects). May fight with game's own movement system if both call `CharacterController.Move()` in the same frame.
-
-#### Approach C: Direct Rigidbody velocity (if RigidbodyFirstPersonController found)
-
-```csharp
-private Rigidbody? _playerRb;
-
-// In Update():
-if (_playerRb != null)
-{
-    OpenXRManager.GetThumbstickState(false, out float lx, out float ly);
-    float headYaw = _leftCam.transform.eulerAngles.y;
-    Vector3 forward = Quaternion.Euler(0, headYaw, 0) * Vector3.forward;
-    Vector3 right   = Quaternion.Euler(0, headYaw, 0) * Vector3.right;
-    Vector3 hVel = (forward * ly + right * lx) * _moveSpeed;
-    _playerRb.velocity = new Vector3(hVel.x, _playerRb.velocity.y, hVel.z); // preserve gravity
-}
-```
-
-**Pros**: Preserves gravity/jumping. More compatible with physics-based movement.
-**Cons**: Overrides horizontal velocity — may fight with game movement.
-
-### Step 5: Additional Button Bindings (optional, deferred)
-
-These need new OpenXR actions added to `SetupActionSetsInstance()`:
-
-| Action | Type | Binding | Purpose |
-|--------|------|---------|---------|
-| `grip_left` | BOOLEAN | `/user/hand/left/input/squeeze/value` | Interact / pickup |
-| `grip_right` | BOOLEAN | `/user/hand/right/input/squeeze/value` | Interact / pickup |
-| `button_a` | BOOLEAN | `/user/hand/right/input/a/click` | Jump |
-| `button_b` | BOOLEAN | `/user/hand/right/input/b/click` | Sprint toggle |
-| `button_x` | BOOLEAN | `/user/hand/left/input/x/click` | Crouch toggle |
-| `button_y` | BOOLEAN | `/user/hand/left/input/y/click` | Menu / inventory |
-
-**Defer** until Steps 1-4 are confirmed working. These are additive — they don't change existing bindings, just add new actions to the same action set.
-
-**Note**: Adding actions to the action set requires modifying `SetupActionSetsInstance()` (instance-level, before session). The action set can only have actions added before `xrAttachSessionActionSets` is called. So all new actions must be created in the same call.
-
-**IMPORTANT**: OpenXR spec says action sets are immutable after `xrAttachSessionActionSets`. All button bindings must be added in the same pass as the existing pose/trigger/thumbstick actions. This means Step 5 requires modifying `SetupActionSetsInstance()` to create the new actions and add them to the suggested bindings array.
+This is the most correct approach but requires async GPU readback which adds
+complexity. Defer to a future pass after 3A/3B/3C establishes baseline readability.
 
 ---
 
-## Build Order
+## Task 4 — Confirm deployed fixes (no code change)
 
-### Build 1: Snap turn + left controller + discovery logging
-**Files changed**: `VRCamera.cs` only
-- Add snap turn logic (right stick X → VROrigin yaw)
-- Add left controller GO and pose update
-- Add `DiscoverMovementSystem()` one-shot logger
-- **No game API changes** — safe, isolated
+Run game after Tasks 1–3 are applied. Verify in headset:
 
-**Expected log output**:
-```
-[Movement] Rewired action: id=0 name='Horizontal' type=Axis
-[Movement] Rewired action: id=1 name='Vertical' type=Axis
-[Movement] Rewired action: id=2 name='Jump' type=Button
-...
-[Movement] Ancestor[0] 'FPSController': CC=True RB=False RFPC=False
-```
-
-### Build 2: Thumbstick locomotion
-**Files changed**: `VRCamera.cs`
-- Implement locomotion based on Build 1 log results
-- Choose Approach A, B, or C based on discovered APIs
-- Wire left thumbstick to character movement
-- Add dead zone, speed scaling
-
-### Build 3: Button bindings (optional)
-**Files changed**: `OpenXRManager.cs` + `VRCamera.cs`
-- Add grip/A/B/X/Y actions to `SetupActionSetsInstance()`
-- Add suggested bindings
-- Add `GetGripState()`, `GetButtonState()` public API
-- Wire to game actions (jump, interact, sprint, crouch)
-- Add pre-allocated buffers for new action states in `InitPerFrameResources()`
+- **Right-eye jitter**: GL.InvalidateState fix — look for shimmer in right eye
+  - If still jittering: swap render order (right first → left second) to determine
+    if jitter follows second-rendered eye vs. always right eye
+- **Blue-box on ESC**: press Y to open/close pause menu; confirm no blue flash from
+  ActionPanelCanvas being repositioned
 
 ---
 
-## Risk Assessment
+## Task 5 — Per-canvas positioning strategy
 
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| Rewired action names don't match `Horizontal`/`Vertical` | Can't use Approach A | Build 1 discovery logging reveals correct names |
-| `SetAxisValue` on CustomController conflicts with game input | Movement jitters or doubles | Fall back to Approach B or C |
-| `CharacterController.Move()` fights with game's own movement | Double-speed or jittering | Only apply when game's own input is zero (idle) |
-| Snap turn causes nausea | Comfort issue | Configurable angle (settings panel), smooth turn option later |
-| VROrigin rotation breaks canvas placement | Canvases drift | Already handled — positioned canvases are world-fixed |
-| Adding OpenXR actions breaks existing bindings | Controllers stop working | Actions are additive — won't affect existing pose/trigger/thumb |
-| IL2CPP interop for `ReInput.mapping.Actions` throws | Can't enumerate | Wrap in try/catch; fall back to hardcoded names from asset dump |
+**File**: `VRCamera.cs`, `PositionCanvases()` ~line 2189
+**Time**: 30 min
 
----
+Currently all canvases are placed at `UIDistance = 2.0 m` with the same scale. This
+means HUD elements, menus, and panels all overlap at the same spot.
 
-## Constants & Configuration
+### 5a — Canvas name → category mapping
+
+Add a lookup table that maps canvas names to categories and per-category defaults:
 
 ```csharp
-// Snap turn
-const float SnapTurnAngle    = 30f;    // degrees
-const float SnapTurnDeadZone = 0.6f;   // stick threshold (0-1)
-const float SnapTurnCooldown = 0.25f;  // seconds
+private enum CanvasCategory { HUD, Menu, Panel, WorldAnchored, Tooltip }
 
-// Locomotion
-const float MoveDeadZone     = 0.15f;  // stick threshold
-const float MoveSpeed        = 3.5f;   // m/s (calibrate to game walk speed)
-const float SprintMultiplier = 1.8f;   // when sprint button held
+private static readonly Dictionary<string, CanvasCategory> s_canvasCategories = new(
+    StringComparer.OrdinalIgnoreCase)
+{
+    // Category A — HUD
+    ["hudCanvas"]                   = CanvasCategory.HUD,
+    ["GameCanvas"]                  = CanvasCategory.HUD,
+    ["statusCanvas"]                = CanvasCategory.HUD,
+    ["interactionProgressCanvas"]   = CanvasCategory.HUD,
 
-// Smooth turn (future option)
-const float SmoothTurnSpeed  = 120f;   // degrees/second
+    // Category B — Menu
+    ["MenuCanvas"]                  = CanvasCategory.Menu,
+    ["DialogCanvas"]                = CanvasCategory.Menu,
+    ["controlsCanvas"]              = CanvasCategory.Menu,
+    ["upgradesCanvas"]              = CanvasCategory.Menu,
+
+    // Category C — Panel
+    ["caseCanvas"]                  = CanvasCategory.Panel,
+    ["contentCanvas"]               = CanvasCategory.Panel,
+    ["windowCanvas"]                = CanvasCategory.Panel,
+    ["osCanvas"]                    = CanvasCategory.Panel,
+    ["keyboardCanvas"]              = CanvasCategory.Panel,
+    ["fingerprintDisplayCanvas"]    = CanvasCategory.Panel,
+    ["mapLayerCanvas"]              = CanvasCategory.Panel,
+    ["PrototypeBuilderCanvas"]      = CanvasCategory.Panel,
+
+    // Category D — World-anchored
+    ["gameWorldCanvas"]             = CanvasCategory.WorldAnchored,
+    ["controlPanelCanvas"]          = CanvasCategory.WorldAnchored,
+
+    // Category E — Tooltip
+    ["TooltipCanvas"]               = CanvasCategory.Tooltip,
+    ["tooltipsCanvas"]              = CanvasCategory.Tooltip,
+};
+
+private struct CanvasCategoryDefaults
+{
+    public float Distance;      // metres from head
+    public float VerticalOffset;// metres above/below eye level
+    public float Scale;         // world-units per canvas pixel
+    public bool  RecentreOnActivate; // reposition when canvas re-appears
+}
+
+private static readonly Dictionary<CanvasCategory, CanvasCategoryDefaults> s_categoryDefaults = new()
+{
+    [CanvasCategory.HUD]           = new() { Distance = 1.8f, VerticalOffset = -0.15f,
+                                             Scale = 0.0012f, RecentreOnActivate = false },
+    [CanvasCategory.Menu]          = new() { Distance = 2.0f, VerticalOffset = 0.0f,
+                                             Scale = 0.0015f, RecentreOnActivate = true },
+    [CanvasCategory.Panel]         = new() { Distance = 1.5f, VerticalOffset = 0.0f,
+                                             Scale = 0.0018f, RecentreOnActivate = true },
+    [CanvasCategory.WorldAnchored] = new() { Distance = 1.0f, VerticalOffset = 0.0f,
+                                             Scale = 0.001f,  RecentreOnActivate = false },
+    [CanvasCategory.Tooltip]       = new() { Distance = 1.2f, VerticalOffset = -0.1f,
+                                             Scale = 0.001f,  RecentreOnActivate = false },
+};
 ```
 
-All of these should eventually be exposed in the VR Settings panel (Phase 10 comfort options).
+### 5b — Apply category defaults in PositionCanvases
+
+When placing a canvas for the first time, look up its category and apply the
+category-specific distance, vertical offset, and scale instead of the global
+`UIDistance` / `UICanvasScale` constants.
+
+### 5c — Update `s_recentreOnActivate` to use categories
+
+Replace the string-based `s_recentreOnActivate` HashSet with a category check:
+
+```csharp
+// In PositionCanvases, replace:
+//   if (s_recentreOnActivate.Contains(name)) ...
+// with:
+if (GetCategory(name).RecentreOnActivate) ...
+```
+
+### 5d — Tooltip follows cursor
+
+For `CanvasCategory.Tooltip`, position the canvas at `_cursorAimDepth - 0.02 m` so
+it appears just in front of the aimed-at canvas, near the cursor dot. Update its
+position every frame (never add to `_positionedCanvases`).
 
 ---
 
-## Files to Modify
+## Task 6 — Canvas-specific fixes
+
+### 6a — `gameWorldCanvas` (world-space labels)
+
+The game already creates this canvas as WorldSpace with 3D labels for NPCs, shops,
+and items. Currently the scan converts it a second time, resetting its transform.
+
+**Fix**: Skip canvases that are already `RenderMode.WorldSpace` at scan time AND
+whose names match known world-anchored canvases.
+
+### 6b — Large panel canvases (case board, map)
+
+`caseCanvas` and `mapLayerCanvas` can be very large (the case board has dozens of
+pinned items). These need:
+- Larger scale (0.0018 → 0.002) so content is legible at arm's length
+- Optional: slight tilt (5° back) so the top is farther away, reducing neck strain
+
+### 6c — Computer / OS interface
+
+`osCanvas` + `keyboardCanvas` should be grouped: keyboard below, screen above.
+Position both at the same world point (the in-game computer/terminal) with
+keyboard offset by -0.3 m vertically.
+
+---
+
+## Task 7 — Missing canvas handling audit
+
+After Tasks 1–6, do a canvas discovery pass:
+
+1. Add a one-time log dump in `ScanAndConvertCanvases` that prints **every** canvas
+   found by `Resources.FindObjectsOfTypeAll<Canvas>()` with name, renderMode,
+   and element count.
+2. Run through a full gameplay loop: main menu → new game → walk around → interact
+   with computer → open case board → talk to NPC → open map → open inventory.
+3. Read log and compare against the inventory table above. Any undiscovered canvases
+   get added to the category table.
+
+---
+
+## Execution order
+
+```
+1. Task 1 — Trigger debounce              (10 min)
+2. Task 2a — Y-button diagnostic logging   (5 min)
+   → Build + test run #1 (user says "done")
+   → Read log, confirm diagnosis
+3. Task 2b — Y-button frame-counter fix    (10 min)
+4. Task 3A — FrameSettingsField.Postprocess (5 min)
+   → Build + test run #2 (user says "done")
+   → Read log: check PostprocessOff readback + visual brightness
+5. If 3A failed → Task 3B (SetExposureTextureToEmpty)  (30 min)
+   → Build + test run #3
+6. If 3B failed → Task 3C (boost increase)  (10 min)
+7. Task 4 — Confirm jitter + blue-box       (during any test run)
+8. Task 5 — Per-canvas positioning           (30 min)
+   → Build + test run #4
+9. Task 6 — Canvas-specific fixes            (20 min)
+10. Task 7 — Canvas audit                    (15 min, during test run)
+```
+
+Total: ~2.5 hours across 3–4 build-test cycles.
+
+---
+
+## Verification checklist
+
+- [ ] Main menu: all text clearly legible (not dark)
+- [ ] In-game HUD: crosshair, status bars, notifications visible
+- [ ] Trigger click: single fire per press, no multi-fire in log
+- [ ] Y-button: single ESC per press, no multi-fire in log
+- [ ] Right eye: no temporal jitter (smooth as left eye)
+- [ ] ESC press: no blue rectangle flash
+- [ ] Dialog canvas: recentres in front of head when NPC conversation starts
+- [ ] Case board: readable at arm's length, correctly scaled
+- [ ] Tooltips: appear near cursor/controller, not at fixed point
+- [ ] Computer screen: OS canvas + keyboard canvas properly grouped
+- [ ] Map: full map canvas scaled appropriately, navigable
+- [ ] No canvases stacked on top of each other at same distance
+- [ ] Pause menu → resume: HUD still in correct position
+- [ ] Scene transition (load game): canvases survive, no crash
+
+---
+
+## Files modified
 
 | File | Changes |
 |------|---------|
-| `SoDVR/VR/VRCamera.cs` | Snap turn, left controller pose, discovery logging, thumbstick locomotion |
-| `SoDVR/OpenXRManager.cs` | (Build 3 only) Additional button actions, grip/A/B/X/Y bindings |
-| `SoDVR/SoDVR.csproj` | No changes — `Rewired_Core` already referenced |
+| `SoDVR/VR/VRCamera.cs` | Tasks 1–7: trigger latch, menu frame-counter, s_VrDisabledFields, exposure reset, canvas categories, positioning overhaul |
+
+---
+
+## Key APIs discovered from Mono assemblies
+
+### HDRP exposure (from `Unity.RenderPipelines.HighDefinition.Runtime.dll`)
+
+```
+HDCamera.GetOrCreate(Camera)          → HDCamera wrapper
+HDCamera.GetExposureTexture()         → current 1×1 RFloat exposure RT
+HDCamera.GetExposureTextureHandle()   → RTHandle version
+HDCamera.GetPreviousExposureTexture() → previous frame
+HDCamera.SetExposureTextureToEmpty()  → reset to m_EmptyExposureTexture (neutral)
+HDCamera.m_ExposureTextures           → exposure texture array (private)
+HDCamera.m_EmptyExposureTexture       → pre-allocated neutral texture (private)
+HDCamera.m_ExposureControlFS          → exposure control frame setting (private)
+```
+
+### FrameSettingsField post-processing fields
+
+```
+FrameSettingsField.Postprocess           — master toggle (disables entire PP stack)
+FrameSettingsField.ExposureControl       — exposure only (KNOWN: does not persist per-camera)
+FrameSettingsField.Tonemapping           — tonemapping only (CONFIRMED: persists)
+FrameSettingsField.Bloom
+FrameSettingsField.DepthOfField
+FrameSettingsField.MotionBlur
+FrameSettingsField.ChromaticAberration
+FrameSettingsField.ColorGrading
+FrameSettingsField.FilmGrain
+FrameSettingsField.Dithering
+FrameSettingsField.LensDistortion
+FrameSettingsField.Vignette
+FrameSettingsField.LensFlareDataDriven
+```
+
+### Game UI architecture (from `Assembly-CSharp.dll`)
+
+```
+InterfaceController           — master UI manager, owns all canvas references
+  .hudCanvas                  — HUD crosshair/awareness
+  .statusCanvas               — health/energy bars
+  .menuCanvas                 — main menu
+  .dialogCanvas               — NPC conversations
+  .caseCanvas                 — investigation board
+  .contentCanvas              — document viewer
+  .windowCanvas               — in-game windows
+  .tooltipsCanvas             — tooltips
+  .minimapCanvas              — minimap
+  .osCanvas                   — computer desktop
+  .keyboardCanvas             — virtual keyboard
+  .controlPanelCanvas         — door/safe/intercom
+  .controlsCanvas             — settings/keybinds
+  .upgradesCanvas             — sync disks
+  .gameWorldCanvas            — world-space 3D labels
+  .interactionProgressCanvas  — lockpick/hack progress
+  .fingerprintDisplayCanvas   — fingerprint scanner
+  .mapLayerCanvas             — full map layers
+
+StatusController              — HUD bars
+NotificationController        — alerts/notifications
+MapController                 — map open/close
+CasePanelController           — case board logic
+DialogController              — conversation display
+TooltipController             — tooltip positioning
+VirtualCursorController       — virtual cursor
+```

@@ -1,6 +1,7 @@
 using BepInEx.Logging;
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.Rendering;
@@ -91,7 +92,15 @@ public class VRCamera : MonoBehaviour
 
     // Tracks which canvas IDs have already been placed in world space.
     // Once in this set the canvas transform is never moved again by us.
-    private readonly HashSet<int> _positionedCanvases = new();
+    private readonly HashSet<int>         _positionedCanvases = new();
+    // Tracks the last-known active state of each managed canvas (by instance ID).
+    // When a canvas transitions false→true AND its name is in s_recentreOnActivate,
+    // we clear it from _positionedCanvases so it gets repositioned at the current head.
+    // HUD canvases (ActionPanelCanvas, CaseCanvas, …) are NOT in the whitelist and are
+    // never auto-repositioned, regardless of how long they were inactive.
+    private readonly Dictionary<int,bool> _canvasWasActive = new();
+    private static readonly HashSet<string> s_recentreOnActivate =
+        new(StringComparer.OrdinalIgnoreCase) { "MenuCanvas", "DialogCanvas" };
 
     // Canvas instance IDs that belong to VRMod itself (settings panel, cursor, etc.).
     // Every mutation pass (RescanCanvasAlpha, etc.) must skip canvases in this set —
@@ -116,8 +125,9 @@ public class VRCamera : MonoBehaviour
     // ScanAndConvertCanvases for 120 frames.  This gives SaveStateController
     // and other scene-init code a clean window before we start touching canvases
     // and camera components — the source of the "Can't remove Rigidbody" crash.
-    private int _lastSceneHandle;
-    private int _sceneLoadGrace;   // frames remaining in the grace period
+    private int  _lastSceneHandle;
+    private int  _sceneLoadGrace;      // frames remaining in the grace period
+    private bool _prevGameCamValid;    // was _gameCam non-null last frame? (same-scene reload detection)
 
     // ── Game camera deferred disable ─────────────────────────────────────────
     // We delay calling cam.enabled=false by several frames so that scene-load
@@ -135,8 +145,9 @@ public class VRCamera : MonoBehaviour
     private bool  _snapArmed = true;
 
     // ── Movement discovery + locomotion ──────────────────────────────────────
-    private bool      _movementDiscoveryDone;
-    private Rigidbody? _playerRb;               // FPSController rigidbody, cached at discovery
+    private bool              _movementDiscoveryDone;
+    private CharacterController? _playerCC;    // FPSController CharacterController (primary locomotion driver)
+    private Rigidbody?        _playerRb;       // FPSController Rigidbody (kept for null-check / reset only)
     private const float MoveDeadZone = 0.15f;
     private const float MoveSpeed    = 4.0f;   // m/s at full deflection
     // Cursor: ScreenSpaceOverlay canvas "VRCursorCanvasInternal" created at rig-build time.
@@ -154,8 +165,14 @@ public class VRCamera : MonoBehaviour
     private int            _menuSettingsBtnId;   // instanceID of the patched Settings button in MenuCanvas
     private bool           _cursorVisible = false; // tracks SetActive state to avoid per-frame IL2CPP calls
     private bool        _prevTrigger;
+    private float       _menuBtnCooldownUntil;   // Time.realtimeSinceStartup when lockout expires (wall-clock, not dt-scaled)
+    private bool        _menuBtnNeedsRelease;    // true after fire; cleared only once button is physically released
     private int         _poseFrameCount;
     private bool        _poseEverValid;
+
+    // Win32 keyboard simulation — used to forward left-controller menu button as ESC.
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
     // Maps (origMaterialInstanceID << 5 | tier<<1 | isBackground) → patched clone.
     // Lower 5 bits: tier (0-9, 4 bits) + isBackground (1 bit).
@@ -182,6 +199,11 @@ public class VRCamera : MonoBehaviour
     // guard each graphic would re-boost the shared material, compounding ×4 per
     // Image and producing extreme / broken colours.
     private static readonly HashSet<int> s_imageBoostedMats = new();
+    // Tracks material instance IDs that have been stencil-patched by RelaxMenuTextMaterials.
+    // Each new material instance (spawned when Unity rebuilds a canvas after a dirty-mark) is
+    // patched exactly once.  Without this guard, patching marks the material dirty → canvas
+    // rebuilds → new instance → patch again → exponential growth in "materials" count per scan.
+    private static readonly HashSet<int> s_stencilNeutralizedMats = new();
     private static readonly HashSet<int> s_menuMaskRelaxedCanvases = new();
     private static readonly HashSet<int> s_menuMaskabilityRelaxed = new();
     private static readonly Dictionary<int, Material> s_menuTmpReadableMats = new();
@@ -225,7 +247,38 @@ public class VRCamera : MonoBehaviour
             _lastSceneHandle = sh;
         }
         catch { }
+
+        // Same-scene reload detection: the scene handle doesn't change when the player
+        // loads a second save in the same session (game reuses the single Unity scene).
+        // However, the game destroys and recreates "Main Camera" each load, so _gameCam
+        // transitions from non-null → null.  Treat that edge as an implicit scene change:
+        // apply the same 120-frame grace period, and reset all cached per-load state.
+        {
+            bool gcValid = (_gameCam != null);
+            if (_prevGameCamValid && !gcValid)
+            {
+                _sceneLoadGrace = 120;
+                _canvasTick     = 0;
+                _movementDiscoveryDone = false;
+                _playerRb       = null;
+                _playerCC       = null;
+                Log.LogInfo("[VRCamera] Game camera lost — same-scene reload detected; canvas scan paused 120 frames, movement state reset.");
+            }
+            _prevGameCamValid = gcValid;
+        }
+
+        // Detect grace-period expiry so we can schedule movement rediscovery.
+        // We do NOT set _movementDiscoveryDone=false at click time (that would trigger
+        // immediate re-discovery in the same frame, before SaveStateController runs).
+        // Instead we wait until the grace period finishes — by then the load is complete
+        // and the player hierarchy is fully initialised.
+        bool graceWasActive = _sceneLoadGrace > 0;
         if (_sceneLoadGrace > 0) _sceneLoadGrace--;
+        if (graceWasActive && _sceneLoadGrace == 0 && _movementDiscoveryDone)
+        {
+            _movementDiscoveryDone = false;
+            Log.LogInfo("[VRCamera] Grace expired — movement rediscovery scheduled.");
+        }
 
         // Scan for new screen-space canvases and convert them to WorldSpace.
         // Skipped during the post-scene-load grace period.
@@ -476,17 +529,24 @@ public class VRCamera : MonoBehaviour
         if (_gameCam == null && (_frameCount % 60) == 0) TryFindGameCamera();
         if (_gameCam != null) transform.position = _gameCam.position;
 
-        // Deferred camera disable: fire after the countdown reaches zero.
-        // This gives scene-load code (SaveStateController etc.) several frames to
-        // complete before we disable the camera they may depend on.
+        // Deferred camera suppress: fire after the countdown reaches zero.
+        // We keep the camera ENABLED (so Camera.main remains non-null for game systems
+        // like SaveStateController:LoadSaveState), but zero out its culling mask so it
+        // renders nothing.  Fully disabling the camera makes Camera.main return null,
+        // which causes LoadSaveState to crash on the second load with
+        // "Can't remove Rigidbody because CharacterJoint depends on it".
         if (_gameCamPending != null && _gameCamDisableDelay > 0)
         {
             _gameCamDisableDelay--;
             if (_gameCamDisableDelay == 0)
             {
-                try { _gameCamPending.enabled = false; }
+                try
+                {
+                    _gameCamPending.cullingMask = 0;  // renders nothing — but Camera.main stays valid
+                    _gameCamPending.depth = -1000f;   // sink below everything so it can't accidentally composite
+                    Log.LogInfo($"[VRCamera] Game camera suppressed (cullingMask=0): '{_gameCamPending.gameObject.name}'");
+                }
                 catch { }
-                Log.LogInfo($"[VRCamera] Game camera disabled (deferred): '{_gameCamPending.gameObject.name}'");
                 _gameCamPending = null;
             }
         }
@@ -531,6 +591,7 @@ public class VRCamera : MonoBehaviour
             UpdateControllerPose(_displayTime);
             UpdateSnapTurn();
             UpdateLocomotion();
+            UpdateMenuButton();
         }
 
         // One-shot movement system discovery (runs once after stereo is ready and game cam found)
@@ -659,7 +720,7 @@ public class VRCamera : MonoBehaviour
             _gameCam          = cam.transform;
             _gameCamPending   = cam;
             _gameCamDisableDelay = 10; // ~10 frames at 60 fps ≈ 167 ms grace period
-            Log.LogInfo($"[VRCamera] Found game camera: '{cam.gameObject.name}' pos={cam.transform.position} (disable in 10 frames)");
+            Log.LogInfo($"[VRCamera] Found game camera: '{cam.gameObject.name}' pos={cam.transform.position} (suppress in 10 frames)");
             transform.position = _gameCam.position;
             return;
         }
@@ -753,11 +814,14 @@ public class VRCamera : MonoBehaviour
                 return;
             }
 
-            // Skip full renders when the game camera is absent (scene transition / world
-            // generation).  The GPU is saturated by city-gen work; Camera.Render() on top
-            // of that causes DXGI_ERROR_DEVICE_REMOVED.  ATW holds the last valid frame in
-            // the headset so the transition is invisible to the user.
-            if (_gameCam == null)
+            // Skip full renders when:
+            // (a) the game camera is absent (scene transition / world gen), OR
+            // (b) we are inside a save-reload grace period that was triggered while a game
+            //     camera was live (_prevGameCamValid) — same GPU-overload risk as (a),
+            //     because city generation runs during the reload.
+            // ATW holds the last valid frame in the headset so the transition is invisible.
+            bool inReloadGrace = _sceneLoadGrace > 0 && _prevGameCamValid;
+            if (_gameCam == null || inReloadGrace)
             {
                 OpenXRManager.FrameEndEmpty(_displayTime);
                 return;
@@ -772,7 +836,10 @@ public class VRCamera : MonoBehaviour
                     Canvas.ForceUpdateCanvases();
 
                 GL.invertCulling = true;
+                GL.InvalidateState();  // discard Unity's GL state cache (stale from prev-frame D3D11 copies)
                 _leftCam.Render();
+                GL.Flush();            // flush D3D11 command buffer so left-eye GPU work is submitted
+                GL.InvalidateState();  // reset Unity's GL cache so right eye starts from a clean slate
                 _rightCam.Render();
                 GL.invertCulling = false;
             }
@@ -851,7 +918,7 @@ public class VRCamera : MonoBehaviour
         var dead = new List<int>();
         foreach (var kvp in _managedCanvases)
             if (kvp.Value == null) dead.Add(kvp.Key);
-        foreach (var k in dead) { _managedCanvases.Remove(k); _positionedCanvases.Remove(k); }
+        foreach (var k in dead) { _managedCanvases.Remove(k); _positionedCanvases.Remove(k); _canvasWasActive.Remove(k); }
 
         Canvas[] all;
         try
@@ -1636,9 +1703,13 @@ public class VRCamera : MonoBehaviour
                     var mat = g.material;
                     if (mat != null)
                     {
-                        NeutralizeStencilMasking(mat);
-                        StrengthenMenuTextMaterial(mat);
-                        patchedMaterials++;
+                        int mid = mat.GetInstanceID();
+                        if (s_stencilNeutralizedMats.Add(mid))   // Add returns true if newly inserted
+                        {
+                            NeutralizeStencilMasking(mat);
+                            StrengthenMenuTextMaterial(mat);
+                            patchedMaterials++;
+                        }
                     }
                 }
                 catch { }
@@ -1648,9 +1719,13 @@ public class VRCamera : MonoBehaviour
                     var crMat = g.canvasRenderer.GetMaterial(0);
                     if (crMat != null)
                     {
-                        NeutralizeStencilMasking(crMat);
-                        StrengthenMenuTextMaterial(crMat);
-                        patchedMaterials++;
+                        int mid = crMat.GetInstanceID();
+                        if (s_stencilNeutralizedMats.Add(mid))   // Add returns true if newly inserted
+                        {
+                            NeutralizeStencilMasking(crMat);
+                            StrengthenMenuTextMaterial(crMat);
+                            patchedMaterials++;
+                        }
                     }
                 }
                 catch { }
@@ -2147,9 +2222,39 @@ public class VRCamera : MonoBehaviour
 
         if (_leftCam == null || !_posesValid) return;
 
+        // Active-state tracking: auto-reposition a canvas that transitions inactive→active
+        // ONLY when its name is in s_recentreOnActivate (e.g. "MenuCanvas", "DialogCanvas").
+        // HUD canvases (ActionPanelCanvas, CaseCanvas, …) are never repositioned — regardless
+        // of how long they were inactive — because they are not in the whitelist.
+        foreach (var kvp in _managedCanvases)
+        {
+            if (kvp.Value == null) continue;
+            int tid = kvp.Key;
+            bool nowActive = kvp.Value.gameObject.activeSelf;
+            bool wasActive;
+            bool hadTracking = _canvasWasActive.TryGetValue(tid, out wasActive);
+
+            // Transition false→true on a whitelisted canvas: clear positioned flag so it
+            // gets placed at the current head position in the loop below.
+            if (hadTracking && !wasActive && nowActive)
+            {
+                if (s_recentreOnActivate.Contains(kvp.Value.gameObject.name))
+                    _positionedCanvases.Remove(tid);
+            }
+
+            _canvasWasActive[tid] = nowActive;
+        }
+
+        // Early-exit: skip the placement loop when all active canvases are already positioned.
+        // Inactive canvases are never considered "unplaced" — they wait until they become active.
+        int cursorId = _cursorCanvas != null ? _cursorCanvas.GetInstanceID() : -1;
         bool anyUnplaced = false;
         foreach (var kvp in _managedCanvases)
-            if (!_positionedCanvases.Contains(kvp.Key)) { anyUnplaced = true; break; }
+        {
+            if (kvp.Key == cursorId) { anyUnplaced = true; break; }   // cursor always needs update
+            if (_positionedCanvases.Contains(kvp.Key)) continue;
+            if (kvp.Value != null && kvp.Value.gameObject.activeSelf) { anyUnplaced = true; break; }
+        }
         if (!anyUnplaced) return;
 
         Vector3 headPos = _leftCam.transform.position;
@@ -2169,6 +2274,9 @@ public class VRCamera : MonoBehaviour
             if (!isCursorCanvas)
             {
                 if (_positionedCanvases.Contains(kvp.Key)) continue;
+                // Skip inactive canvases — they will be placed when they next become active
+                // (detected by the active-state tracking loop above).
+                if (canvas == null || !canvas.gameObject.activeSelf) continue;
                 _positionedCanvases.Add(kvp.Key);
             }
 
@@ -2392,15 +2500,14 @@ public class VRCamera : MonoBehaviour
     /// </summary>
     private void UpdateLocomotion()
     {
-        if (_playerRb == null) return;
+        if (_playerCC == null) return;
+        // Refuse to drive the CharacterController during any reload grace period.
+        if (_sceneLoadGrace > 0) return;
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
 
         if (!OpenXRManager.GetThumbstickState(false, out float lx, out float ly)) return;
         if (Mathf.Abs(lx) <= MoveDeadZone && Mathf.Abs(ly) <= MoveDeadZone)
-        {
-            // No stick input — let the game own horizontal velocity fully
             return;
-        }
 
         // Apply dead-zone scaling so motion starts smoothly at the threshold
         float dx = Mathf.Abs(lx) > MoveDeadZone ? lx : 0f;
@@ -2410,35 +2517,113 @@ public class VRCamera : MonoBehaviour
         float headYaw = _leftCam != null ? _leftCam.transform.eulerAngles.y : transform.eulerAngles.y;
         Vector3 fwd   = Quaternion.Euler(0f, headYaw, 0f) * Vector3.forward;
         Vector3 right = Quaternion.Euler(0f, headYaw, 0f) * Vector3.right;
-
         Vector3 hMove = (fwd * dy + right * dx) * MoveSpeed;
 
-        // Preserve vertical velocity so gravity and jumping are unaffected
-        _playerRb.velocity = new Vector3(hMove.x, _playerRb.velocity.y, hMove.z);
+        // Call CharacterController.Move() to drive player locomotion.
+        // Guard: verify CC is still alive before touching it (destroyed objects aren't null
+        // in IL2CPP — the managed wrapper lingers after the native object is gone).
+        try
+        {
+            if (_playerCC.gameObject == null || !_playerCC.gameObject.activeInHierarchy)
+            {
+                Log.LogInfo("[Movement] CC gameObject inactive/null — invalidating");
+                _playerCC = null;
+                return;
+            }
+            _playerCC.Move(hMove * Time.deltaTime);
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"[Movement] CC.Move failed: {ex.Message} — invalidating CC");
+            _playerCC = null;
+        }
+    }
+
+    /// <summary>
+    /// Left-controller menu/Y button → ESC simulation.
+    ///
+    /// State machine (avoids rapid-fire from OpenXR button oscillation):
+    ///   Idle          → on press: fire ESC, go to Held
+    ///   Held          → on release: start 0.5 s post-release cooldown
+    ///   ReleaseCooldown → after 0.5 s: back to Idle
+    ///
+    /// Canvas repositioning is handled automatically by PositionCanvases active-state
+    /// tracking: when the pause-menu canvas transitions inactive→active it is removed
+    /// from _positionedCanvases and placed at the current head pose next frame.
+    /// We only need to force a scan tick so that any brand-new canvas (not yet in
+    /// _managedCanvases) is discovered quickly rather than waiting up to 90 frames.
+    /// </summary>
+    private void UpdateMenuButton()
+    {
+        // Phase 1 — post-fire lockout (WALL-CLOCK time, NOT Time.deltaTime).
+        // Time.deltaTime can be >> 1s when the game drops to <1fps processing the pause menu's
+        // 2000+ canvas elements, which would evaporate a deltaTime-based 1s countdown in one frame.
+        // Time.realtimeSinceStartup always advances at real-world speed regardless of frame rate.
+        if (Time.realtimeSinceStartup < _menuBtnCooldownUntil) return;
+
+        OpenXRManager.GetMenuButtonState(out bool menuNow);
+
+        // Phase 2 — wait for physical release: after lockout, require the button to actually
+        // read NOT-pressed before re-arming (guards against sustained oscillation post-lockout).
+        if (_menuBtnNeedsRelease)
+        {
+            if (!menuNow) _menuBtnNeedsRelease = false;
+            return;
+        }
+
+        // Phase 3 — armed: fire on press.
+        if (!menuNow) return;
+
+        _menuBtnNeedsRelease = true;
+        _menuBtnCooldownUntil = Time.realtimeSinceStartup + 1.5f;  // 1.5 s real-time lockout
+        FireMenuButton();
+    }
+
+    private void FireMenuButton()
+    {
+        try
+        {
+            const byte VK_ESCAPE = 0x1B;
+            const uint KEYEVENTF_KEYUP = 0x0002;
+            keybd_event(VK_ESCAPE, 0, 0,               UIntPtr.Zero); // key down
+            keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, UIntPtr.Zero); // key up
+            Log.LogInfo("[VRCamera] Menu button → ESC");
+        }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateMenuButton: {ex.Message}"); }
+
+        // Force immediate canvas scan to discover any brand-new pause-menu canvas.
+        // Existing canvases are repositioned automatically when they become active
+        // (see _canvasWasActive tracking in PositionCanvases).
+        _canvasTick = UICanvasScanRate;
     }
 
     private void DiscoverMovementSystem()
     {
         _movementDiscoveryDone = true;
 
-        // 1. Enumerate all Rewired actions (index loop — IL2CPP IList<T> has no GetEnumerator)
+        // 1. Enumerate all Rewired actions — probe common names via GetAction(name)
         try
         {
-            var actions = Rewired.ReInput.mapping.Actions;
-            if (actions != null)
+            // Probe common action names; GetAction returns null if not found
+            string[] candidates = {
+                "Horizontal", "Vertical", "MoveHorizontal", "MoveVertical",
+                "Move Horizontal", "Move Vertical", "Strafe", "Forward",
+                "Move X", "Move Y", "h", "v", "x", "y",
+                "Walk", "Run", "Sprint", "Jump", "Interact", "Fire", "Aim",
+                "CameraX", "CameraY", "Look X", "Look Y", "LookHorizontal", "LookVertical"
+            };
+            var sb = new System.Text.StringBuilder("[Movement] Rewired actions found:");
+            foreach (var name in candidates)
             {
-                // Cast to Il2CppSystem list to get Count
-                var list = actions.TryCast<Il2CppSystem.Collections.Generic.List<Rewired.InputAction>>();
-                int cnt = list != null ? list.Count : -1;
-                Log.LogInfo($"[Movement] Rewired actions (cnt={cnt}):");
-                if (list != null)
-                    for (int i = 0; i < list.Count; i++)
-                    {
-                        var a = list[i];
-                        Log.LogInfo($"[Movement]   id={a?.id} name='{a?.name}' type={a?.type}");
-                    }
+                try
+                {
+                    var act = Rewired.ReInput.mapping.GetAction(name);
+                    if (act != null)
+                        sb.Append($"\n  id={act.id} name='{act.name}' type={act.type}");
+                }
+                catch { }
             }
-            else Log.LogWarning("[Movement] ReInput.mapping.Actions is null");
+            Log.LogInfo(sb.ToString());
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] Actions enum: {ex.Message}"); }
 
@@ -2450,7 +2635,9 @@ public class VRCamera : MonoBehaviour
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] Player0: {ex.Message}"); }
 
-        // 3. Walk up from game camera to find CharacterController / Rigidbody; cache RB for locomotion
+        // 3. Walk up from game camera to find CharacterController / Rigidbody; cache both.
+        //    Locomotion is driven via CharacterController.Move() — Rigidbody velocity is
+        //    ignored by the game's kinematic FPS controller.
         try
         {
             var t = _gameCam;
@@ -2459,19 +2646,20 @@ public class VRCamera : MonoBehaviour
                 var cc = t.GetComponent<CharacterController>();
                 var rb = t.GetComponent<Rigidbody>();
                 Log.LogInfo($"[Movement] Ancestor[{i}] '{t.gameObject.name}': CC={cc != null} RB={rb != null}");
-                if (rb != null)
+                if (cc != null)
                 {
-                    _playerRb = rb;
-                    Log.LogInfo($"[Movement] Cached playerRb on '{t.gameObject.name}'");
+                    _playerCC = cc;
+                    _playerRb = rb; // may be null; kept only for reset-on-reload checks
+                    Log.LogInfo($"[Movement] Cached playerCC on '{t.gameObject.name}'" +
+                                $" isKinematic={rb?.isKinematic}");
                     break;
                 }
-                if (cc != null) break; // CC but no RB — won't use velocity approach
                 t = t.parent;
             }
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] Walk-up: {ex.Message}"); }
 
-        // 4. FindObjectOfType for the FPS controllers
+        // 4. FindObjectOfType for the FPS controller (diagnostic position check)
         try
         {
             var cc = FindObjectOfType<CharacterController>();
@@ -2481,6 +2669,40 @@ public class VRCamera : MonoBehaviour
                 Log.LogInfo("[Movement] FindObjectOfType<CC>: not found");
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] FindCC: {ex.Message}"); }
+
+        // 5. Probe common Rewired axis names (diagnostic only — logs which axes the game uses
+        //    so we can implement injection in a future session if needed)
+        try
+        {
+            var player = Rewired.ReInput.players.GetPlayer(0);
+            if (player != null)
+            {
+                string[] candidates = { "Horizontal", "Vertical", "MoveHorizontal", "MoveVertical",
+                                        "Move Horizontal", "Move Vertical", "Strafe", "Forward",
+                                        "Walk", "Run", "Move X", "Move Y" };
+                var sb2 = new System.Text.StringBuilder("[Movement] Rewired axis probe:");
+                foreach (var name in candidates)
+                {
+                    try
+                    {
+                        float v = player.GetAxis(name);
+                        sb2.Append($" '{name}'={v:F2}");
+                    }
+                    catch { }
+                }
+                Log.LogInfo(sb2.ToString());
+            }
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] Rewired probe: {ex.Message}"); }
+
+        // 6. Camera.main diagnostic — confirm it's non-null so SaveStateController won't crash
+        try
+        {
+            var cm = Camera.main;
+            Log.LogInfo($"[Movement] Camera.main='{cm?.gameObject?.name ?? "NULL"}'" +
+                        $" enabled={cm?.enabled} cullingMask={cm?.cullingMask}");
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] Camera.main check: {ex.Message}"); }
     }
     /// <summary>
     /// Casts a ray from the right controller into all managed WorldSpace canvases.
@@ -2534,6 +2756,33 @@ public class VRCamera : MonoBehaviour
                 {
                     var go = results[0].gameObject;
                     Log.LogInfo($"[VRCamera] Trigger click: '{go?.name}' on '{hitCanvas.gameObject.name}'");
+
+                    // Detect save-load button clicks.  When the user clicks "Continue" or any
+                    // "New Game"-style button, SaveStateController:LoadSaveState is about to
+                    // reconstruct the entire physics hierarchy.  Apply the grace period NOW —
+                    // before ExecuteEvents propagates the click — so canvas scanning and
+                    // locomotion are fully quiesced before the Rigidbody/CharacterJoint teardown.
+                    {
+                        string goNameLower = (go?.name ?? "").ToLowerInvariant();
+                        bool isSaveLoad = goNameLower.Contains("continue")
+                                       || goNameLower.Contains("new game")
+                                       || goNameLower.Contains("new city");
+                        if (isSaveLoad)
+                        {
+                            _sceneLoadGrace = 180;   // ~3 s at 60 fps
+                            _canvasTick     = 0;
+                            _playerRb       = null;
+                            _playerCC       = null;
+                            // NOTE: do NOT set _movementDiscoveryDone = false here.
+                            // Doing so would trigger DiscoverMovementSystem() at the bottom of
+                            // this same Update() frame (before SaveStateController runs in the
+                            // next frame), immediately re-caching _playerRb on the Rigidbody
+                            // that the game is about to destroy.  Instead, just null _playerRb
+                            // and guard UpdateLocomotion() with _sceneLoadGrace > 0.
+
+                            Log.LogInfo($"[VRCamera] Save/load trigger '{go?.name}' — grace=180, playerRb cleared.");
+                        }
+                    }
 
                     // Check if the click landed on (or inside) the patched Settings button.
                     // Walk up the hierarchy — the raycasted GO may be a child label, not the button itself.
@@ -2619,6 +2868,7 @@ public class VRCamera : MonoBehaviour
                 kvp.Value.renderMode = RenderMode.ScreenSpaceOverlay;
         _managedCanvases.Clear();
         _positionedCanvases.Clear();
+        _canvasWasActive.Clear();
         _managedFades.Clear();
 
         Log.LogInfo("[VRCamera] Destroyed.");

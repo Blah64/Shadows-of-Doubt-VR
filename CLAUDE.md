@@ -149,6 +149,30 @@ What was tried and confirmed NOT working:
 - 4 tabs: **Graphics** (VSync, Depth Blur, AA, DLSS, Frame Cap, UI Scale, …) | **Audio** (Master, VCAs, toggles) | **Controls** (run/invert/sensitivity) | **General** (FOV, Head Bob, Difficulty, …)
 - Settings that only write PlayerPrefs (sensitivity/smoothing) require restart to apply — accepted limitation
 
+## Current active bugs (GUI & graphics — Phase 9 focus)
+**Phase 9 movement is on hold.** Next session should fix these first:
+
+### 1. Right-eye jitter (UNCONFIRMED FIX)
+- Left eye is smooth; right eye shows temporal jitter
+- Latest fix deployed: `GL.InvalidateState()` before left render AND between left/right renders
+- Render loop is now: `GL.invertCulling=true → GL.InvalidateState() → _leftCam.Render() → GL.Flush() → GL.InvalidateState() → _rightCam.Render() → GL.invertCulling=false`
+- **Status**: Fix deployed, NOT yet confirmed. If still jittering after this, next step: swap render order to determine if jitter is always in second-rendered eye (confirming HDRP state contamination) vs always in right eye regardless of order
+
+### 2. Y/menu button multi-fire
+- Log shows multiple `Menu button → ESC` fires on single press (log lines 477, 481, 487, 496)
+- Current guard: `_menuBtnNeedsRelease` + `_menuBtnCooldownUntil = realtimeSinceStartup + 1.5f`
+- Should work in theory but log shows it still fires multiple times
+- **Hypothesis**: `GetMenuButtonState` may return a cached / edge-triggered value; or ESC causes game to pause/un-pause the Unity update loop causing realtimeSinceStartup to jump
+
+### 3. Trigger click multi-fire
+- Log shows many consecutive "Trigger click: 'Background' on 'MenuCanvas'" entries
+- Trigger has no debounce — fires every frame while held
+- **Fix needed**: same `_triggerNeedsRelease` / cooldown pattern as menu button
+
+### 4. UI brightness — HDRP auto-exposure (see §HDRP exposure above)
+- Button/menu text still near-black in headset
+- Three approaches to try (see HANDOVER.md §BLOCKING ISSUE: UI Brightness)
+
 ## Known canvas names (from LogOutput.log, 2026-03-26)
 | Canvas | Elements | Notes |
 |--------|----------|-------|
@@ -166,5 +190,10 @@ What was tried and confirmed NOT working:
 - git `346a6df` — **Phase 5 complete**: standard loader working, stereo image in headset
 - **Phase 6 complete**: camera positioning ✓, head tracking ✓, UI canvases visible in VR ✓
 - **Phase 7 complete**: controller pose ✓, trigger click ✓, cursor dot visible on all screens ✓
-- **Phase 8 complete**: VR settings panel ✓ — 4 tabs, all settings wired, FMOD audio, Settings button intercept
-- **Phase 9 (next)**: Movement — thumbstick locomotion, snap turn, jump, interact bindings
+- **Phase 8 complete** (git `12172ad`): VR settings panel ✓ — 4 tabs, all settings wired, FMOD audio, Settings button intercept
+- **Phase 9 on hold**: Movement deferred. Working on GUI/graphics polish first:
+  - Right-eye jitter fix (GL.InvalidateState between renders — UNCONFIRMED)
+  - Y-button multi-fire fix
+  - Trigger click debounce
+  - HDRP UI brightness (blocking issue)
+- **Phase 10 (after GUI fixes)**: Movement — thumbstick locomotion, snap turn, jump, interact bindings

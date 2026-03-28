@@ -1,7 +1,88 @@
 # SoDVR — Technical Handover
 
 **Date**: 2026-03-28
-**Phase**: 9 — Movement (thumbstick locomotion, snap turn, interact bindings)
+**Phase**: 9 (GUI & graphics polish) — Phase 10 will be movement
+
+---
+
+## IN-FLIGHT BUGS (next session must address these before movement work)
+
+### Bug 1 — Right-eye jitter (UNCONFIRMED FIX deployed 2026-03-28)
+
+**Symptom**: Left eye renders smoothly; right eye has visible per-frame jitter/shimmer.
+
+**Last confirmed state**: `GL.Flush()` between eyes was previously confirmed fixed, but jitter returned after canvas whitelist code was added. Canvas code is CPU-only so a logical link is unlikely — more probable that the prior test was on the lighter main-menu state.
+
+**Fix deployed** (not yet tested): Added `GL.InvalidateState()` before left render AND between the two renders:
+```csharp
+GL.invertCulling = true;
+GL.InvalidateState();   // purge stale state from previous frame's P/Invoke CopyResource calls
+_leftCam.Render();
+GL.Flush();             // submit left-eye D3D11 work to GPU
+GL.InvalidateState();   // clean Unity's GL cache before right-eye starts
+_rightCam.Render();
+GL.invertCulling = false;
+```
+
+**If still jittering after this fix**: swap render order (right first, then left) to determine whether jitter is always in the second-rendered camera (HDRP state contamination) or always in the right camera regardless of order.
+
+---
+
+### Bug 2 — Y/menu button multi-fire
+
+**Symptom**: A single Y press fires `Menu button → ESC` multiple times (log lines 477, 481, 487, 496 on 2026-03-28 run).
+
+**Current guard** (in `UpdateMenuButton`):
+```csharp
+private void UpdateMenuButton()
+{
+    if (Time.realtimeSinceStartup < _menuBtnCooldownUntil) return;
+    OpenXRManager.GetMenuButtonState(out bool menuNow);
+    if (_menuBtnNeedsRelease)
+    {
+        if (!menuNow) _menuBtnNeedsRelease = false;
+        return;
+    }
+    if (!menuNow) return;
+    _menuBtnNeedsRelease = true;
+    _menuBtnCooldownUntil = Time.realtimeSinceStartup + 1.5f;
+    FireMenuButton();
+}
+```
+
+**Hypothesis**: `GetMenuButtonState` may return stale/cached values during the brief pause-state that ESC triggers (Unity may stall `Update()` scheduling, causing `realtimeSinceStartup` to jump unexpectedly), or the ESC keypress itself opens a dialog that fires a second ESC.
+
+**Recommended fix**: Log `realtimeSinceStartup` at each call to `UpdateMenuButton` to confirm whether the cooldown is actually being evaluated when the extra fires happen.
+
+---
+
+### Bug 3 — Trigger click multi-fire
+
+**Symptom**: Holding the trigger fires a click every frame. Log shows dozens of "Trigger click: 'Background' on 'MenuCanvas'" entries in a single hold.
+
+**Root cause**: No release-latch or cooldown on the trigger path — `TryClickCanvas` is called from `UpdateControllerPose` every `Update()` frame the trigger is pressed.
+
+**Fix needed**: Add `_triggerNeedsRelease` + `_triggerLastFireTime` fields and apply the same pattern as `UpdateMenuButton`:
+```csharp
+if (_triggerNeedsRelease)
+{
+    if (!triggerPressed) _triggerNeedsRelease = false;
+    return;
+}
+if (!triggerPressed) return;
+_triggerNeedsRelease = true;
+TryClickCanvas(...);
+```
+
+---
+
+### Bug 4 — "Blue box" on ESC (LIKELY FIXED, unconfirmed)
+
+**Symptom**: A translucent blue rectangle appeared momentarily when pressing Y to open/close the pause menu. Cause: `ActionPanelCanvas` briefly goes inactive→active during the ESC transition, triggering a canvas reposition that placed it at the player's face.
+
+**Fix deployed**: Canvas reposition whitelist (`s_recentreOnActivate`) now only contains `"MenuCanvas"` and `"DialogCanvas"`. `ActionPanelCanvas` and other HUD canvases are never auto-repositioned on activate. Confirmed via log that first placement of ActionPanelCanvas occurs once only (not on every ESC).
+
+**Status**: Likely fixed but not yet confirmed by user with the latest build.
 
 ---
 
@@ -167,7 +248,18 @@ for (int i = 0; i < 5 && tr != null; i++)
 
 ---
 
-## Phase 9 — Movement (NEXT)
+## Phase 9 — GUI & Graphics Polish (CURRENT)
+
+### Priority order
+1. **Confirm right-eye jitter fix** (GL.InvalidateState — deployed, test first)
+2. **Trigger click debounce** (add `_triggerNeedsRelease` latch)
+3. **Y-button multi-fire** (diagnose with realtimeSinceStartup logging)
+4. **UI brightness** (HDRP auto-exposure — see §BLOCKING ISSUE: UI Brightness)
+5. **Confirm blue-box fix** (canvas whitelist — deployed, needs user confirmation)
+
+---
+
+## Phase 10 — Movement (DEFERRED)
 
 ### Goal
 Thumbstick locomotion and snap-turn so the player can move around in VR without keyboard.
@@ -210,7 +302,8 @@ Thumbstick locomotion and snap-turn so the player can move around in VR without 
 - [x] Phase 6: Camera positioning, head tracking, UI canvases visible in VR
 - [x] Phase 7: Controller pose + trigger click + cursor dot visible on all screens
 - [x] **Phase 8**: VR Settings Panel — 4 tabs, all settings wired, FMOD audio, Settings button intercept (`12172ad`)
-- [ ] **Phase 9 (next)**: Movement — thumbstick locomotion, snap turn, jump, interact bindings
-- [ ] Phase 10: Comfort options (vignette, snap-turn degrees, IPD, dominant hand)
-- [ ] Phase 11: Left controller full tracking + dual-hand interactions
-- [ ] Phase 12: Polish, performance tuning, UI brightness fix
+- [ ] **Phase 9 (current)**: GUI & graphics polish — right-eye jitter, trigger debounce, Y-button multi-fire, UI brightness
+- [ ] Phase 10: Movement — thumbstick locomotion, snap turn, jump, interact bindings
+- [ ] Phase 11: Comfort options (vignette, snap-turn degrees, IPD, dominant hand)
+- [ ] Phase 12: Left controller full tracking + dual-hand interactions
+- [ ] Phase 13: Final polish, performance tuning
