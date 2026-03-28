@@ -112,9 +112,14 @@ public class VRCamera : MonoBehaviour
     // It is NOT in _ownedCanvasIds so all mutation passes (including the ZTest patch) run on it.
     // PositionCanvases repositions it every frame (never added to _positionedCanvases).
     // The dot moves via anchoredPosition (2D) inside this fixed-distance canvas.
-    private Canvas?        _cursorCanvas;   // VRCursorCanvasInternal once scan converts it
-    private RectTransform? _cursorRect;     // the dot's RectTransform inside _cursorCanvas
-    private Canvas?        _menuCanvasRef;  // MenuCanvas — hidden while VR settings panel is open
+    private Canvas?        _cursorCanvas;         // VRCursorCanvasInternal once scan converts it
+    private RectTransform? _cursorRect;           // the dot's RectTransform inside _cursorCanvas
+    private Vector2        _cursorCanvasHalfSize; // half-size in canvas pixels; cached lazily
+    private float          _cursorAimDepth = UIDistance - 0.01f; // head-fwd depth of cursor canvas; tracks nearest aimed-at canvas
+    private Canvas?        _menuCanvasRef;       // MenuCanvas — hidden while VR settings panel is open
+    private bool           _menuCanvasHidden;    // tracks last hide state to avoid per-frame toggles
+    private int            _menuSettingsBtnId;   // instanceID of the patched Settings button in MenuCanvas
+    private bool           _cursorVisible = false; // tracks SetActive state to avoid per-frame IL2CPP calls
     private bool        _prevTrigger;
     private int         _poseFrameCount;
     private bool        _poseEverValid;
@@ -1512,6 +1517,7 @@ public class VRCamera : MonoBehaviour
     private void RelaxMenuTextMaterials(Canvas canvas)
     {
         if (!ShouldRelaxMenuClipping(canvas)) return;
+        if (!canvas.enabled) return;  // skip hidden canvas — avoids mass material instantiation on enable/disable
 
         int patchedMaterials = 0;
         try
@@ -1781,10 +1787,13 @@ public class VRCamera : MonoBehaviour
                 }
                 if (btn == null) continue;
 
-                btn.onClick.RemoveAllListeners();
-                btn.onClick.AddListener(new Action(VRSettingsPanel.Toggle));
+                // Replace onClick to suppress the game's persistent listener.
+                // The actual VR panel open is handled in TryClickCanvas via _menuSettingsBtnId
+                // to avoid IL2CPP AddListener reliability issues on freshly-created events.
+                btn.onClick = new Button.ButtonClickedEvent();
+                _menuSettingsBtnId = btn.gameObject.GetInstanceID();
                 patched++;
-                Log.LogInfo($"[VRCamera] Patched Settings button '{t.gameObject.name}'");
+                Log.LogInfo($"[VRCamera] Patched Settings button '{t.gameObject.name}' id={_menuSettingsBtnId}");
             }
             Log.LogInfo($"[VRCamera] PatchMenuSettingsButton: {patched} button(s) redirected to VR panel");
         }
@@ -1993,14 +2002,21 @@ public class VRCamera : MonoBehaviour
 
         // Hide MenuCanvas while VR settings panel is open so it doesn't bleed through
         // behind the panel and confuse cursor tracking.
+        // IMPORTANT: only toggle on state change — toggling canvas.enabled every frame causes
+        // Unity to rebuild all MenuCanvas materials each cycle, flooding MenuStencilRelax
+        // with ~986 new instances and crashing the game.
         if (_menuCanvasRef != null)
         {
             try
             {
                 bool vrOpen = VRSettingsPanel.RootGO?.activeSelf == true;
-                _menuCanvasRef.enabled = !vrOpen;
-                var mgr = _menuCanvasRef.GetComponent<GraphicRaycaster>();
-                if (mgr != null) mgr.enabled = !vrOpen;
+                if (vrOpen != _menuCanvasHidden)
+                {
+                    _menuCanvasHidden = vrOpen;
+                    _menuCanvasRef.enabled = !vrOpen;
+                    var mgr = _menuCanvasRef.GetComponent<GraphicRaycaster>();
+                    if (mgr != null) mgr.enabled = !vrOpen;
+                }
             }
             catch { }
         }
@@ -2017,6 +2033,7 @@ public class VRCamera : MonoBehaviour
         Quaternion yawOnly = Quaternion.Euler(0f, headYaw, 0f);
         Vector3 forward = yawOnly * Vector3.forward;
 
+        int suppressedPlacements = 0;
         foreach (var kvp in _managedCanvases)
         {
             var canvas = kvp.Value;
@@ -2033,15 +2050,31 @@ public class VRCamera : MonoBehaviour
 
             if (canvas == null) continue;
 
-            // sortingOrder nudge pushes canvases slightly behind UIDistance (higher order = closer).
-            // Cursor canvas sits at exactly UIDistance (zNudge=0) so it's coplanar with the UI.
+            // sortingOrder nudge: higher order = closer to camera.
+            // Cursor canvas uses _cursorAimDepth (updated each frame in UpdateControllerPose)
+            // so it sits just 0.01m in front of whichever canvas is being aimed at — eliminating
+            // the VR parallax gap that made the dot appear to float in front of the menu.
             float zNudge = isCursorCanvas ? 0f : -canvas.sortingOrder * 0.005f;
-            Vector3 pos = headPos + forward * (UIDistance + zNudge) + Vector3.up * UIVerticalOffset;
+            Vector3 pos = isCursorCanvas
+                ? headPos + forward * _cursorAimDepth + Vector3.up * UIVerticalOffset
+                : headPos + forward * (UIDistance + zNudge) + Vector3.up * UIVerticalOffset;
             canvas.transform.position = pos;
             canvas.transform.rotation = yawOnly;
             if (!isCursorCanvas)
-                Log.LogInfo($"[VRCamera] Placed '{canvas.gameObject.name}' at {pos} yaw={headYaw:F1}deg");
+            {
+                // Only log "notable" canvases; suppress generic/internal ones (Loading Icon, Content, etc.)
+                string cn = canvas.gameObject.name;
+                bool notable = cn.Contains("Canvas", StringComparison.OrdinalIgnoreCase)
+                            || cn.StartsWith("VR",   StringComparison.OrdinalIgnoreCase)
+                            || cn.Equals("3DUI",     StringComparison.OrdinalIgnoreCase);
+                if (notable)
+                    Log.LogInfo($"[VRCamera] Placed '{cn}' at {pos} yaw={headYaw:F1}deg");
+                else
+                    suppressedPlacements++;
+            }
         }
+        if (suppressedPlacements > 0)
+            Log.LogInfo($"[VRCamera] Placed {suppressedPlacements} auxiliary canvas(es) (log suppressed)");
     }
 
     /// <summary>
@@ -2057,7 +2090,8 @@ public class VRCamera : MonoBehaviour
         _poseFrameCount++;
         if (!poseOk)
         {
-            if (_cursorRect != null) try { _cursorRect.gameObject.SetActive(false); } catch { }
+            if (_cursorRect != null && _cursorVisible)
+                try { _cursorVisible = false; _cursorRect.gameObject.SetActive(false); } catch { }
             if (!_poseEverValid && _poseFrameCount % 120 == 0)
                 Log.LogInfo($"[VRCamera] Controller pose not valid (frame {_poseFrameCount}) - waiting");
             return;
@@ -2080,6 +2114,14 @@ public class VRCamera : MonoBehaviour
         // in front of the head), then set anchoredPosition to move the dot within the canvas.
         if (_cursorRect != null && _cursorCanvas != null)
         {
+            // Lazily cache the cursor canvas half-size (available only after WorldSpace conversion).
+            if (_cursorCanvasHalfSize == Vector2.zero)
+            {
+                var crt = _cursorCanvas.GetComponent<RectTransform>();
+                if (crt != null && crt.sizeDelta.x > 0)
+                    _cursorCanvasHalfSize = crt.sizeDelta * 0.5f;
+            }
+
             Vector3 ctrlPos = _rightControllerGO.transform.position;
             Vector3 ctrlFwd = _rightControllerGO.transform.forward;
             var ray = new Ray(ctrlPos, ctrlFwd);
@@ -2088,16 +2130,67 @@ public class VRCamera : MonoBehaviour
             if (cursorPlane.Raycast(ray, out float cd) && cd > 0f)
             {
                 Vector3 localHit = _cursorCanvas.transform.InverseTransformPoint(ctrlPos + ctrlFwd * cd);
-                _cursorRect.anchoredPosition = new Vector2(localHit.x, localHit.y);
-                _cursorRect.gameObject.SetActive(true);
 
-                if (_poseFrameCount <= 5 || (_poseFrameCount % 120) == 0)
-                    Log.LogInfo($"[VRCamera] Cursor: dist={cd:F2} px=({localHit.x:F0},{localHit.y:F0})");
+                // Hide cursor if ray hits the canvas plane but lands outside the canvas rect.
+                bool inBounds = _cursorCanvasHalfSize == Vector2.zero  // not yet cached — allow
+                             || (Mathf.Abs(localHit.x) <= _cursorCanvasHalfSize.x
+                              && Mathf.Abs(localHit.y) <= _cursorCanvasHalfSize.y);
+
+                if (inBounds)
+                {
+                    _cursorRect.anchoredPosition = new Vector2(localHit.x, localHit.y);
+                    if (!_cursorVisible) { _cursorVisible = true; _cursorRect.gameObject.SetActive(true); }
+
+                    if (_poseFrameCount <= 5 || (_poseFrameCount % 120) == 0)
+                        Log.LogInfo($"[VRCamera] Cursor: dist={cd:F2} px=({localHit.x:F0},{localHit.y:F0})");
+                }
+                else
+                {
+                    if (_cursorVisible) { _cursorVisible = false; _cursorRect.gameObject.SetActive(false); }
+                }
             }
             else
             {
-                _cursorRect.gameObject.SetActive(false);
+                if (_cursorVisible) { _cursorVisible = false; _cursorRect.gameObject.SetActive(false); }
             }
+        }
+
+        // Depth scan: find the nearest managed canvas (excluding cursor canvas) that the
+        // controller ray actually hits within its rect. Store that canvas's head-forward depth
+        // so PositionCanvases can place the cursor just 0.01m in front of it next frame.
+        if (_rightControllerGO != null && _leftCam != null)
+        {
+            Vector3 dCtrlPos = _rightControllerGO.transform.position;
+            Vector3 dCtrlFwd = _rightControllerGO.transform.forward;
+            Vector3 dHeadPos = _leftCam.transform.position;
+            Vector3 dHeadFwd = _leftCam.transform.forward;
+            float   bestDepth = UIDistance - 0.01f; // fallback: just inside the default placement
+            bool    foundHit  = false;
+
+            foreach (var kvp in _managedCanvases)
+            {
+                var c = kvp.Value;
+                if (c == null) continue;
+                if (!c.gameObject.activeSelf) continue;  // skip hidden canvases (e.g. VR settings panel when closed)
+                if (_cursorCanvas != null && c.GetInstanceID() == _cursorCanvas.GetInstanceID()) continue;
+
+                var pl = new Plane(-c.transform.forward, c.transform.position);
+                if (!pl.Raycast(new Ray(dCtrlPos, dCtrlFwd), out float hitDist) || hitDist <= 0f) continue;
+
+                // Bounds check — only count canvases the ray actually falls inside.
+                Vector3 lp = c.transform.InverseTransformPoint(dCtrlPos + dCtrlFwd * hitDist);
+                var rt = c.GetComponent<RectTransform>();
+                if (rt != null)
+                {
+                    Vector2 hs = rt.sizeDelta * 0.5f;
+                    if (Mathf.Abs(lp.x) > hs.x || Mathf.Abs(lp.y) > hs.y) continue;
+                }
+
+                float depth = Vector3.Dot(c.transform.position - dHeadPos, dHeadFwd);
+                if (!foundHit || depth < bestDepth) { bestDepth = depth; foundHit = true; }
+            }
+
+            _cursorAimDepth = bestDepth - 0.01f;
         }
 
         OpenXRManager.GetTriggerState(true, out bool triggerNow);
@@ -2106,6 +2199,19 @@ public class VRCamera : MonoBehaviour
 
         if (triggerDown)
             TryClickCanvas(_rightControllerGO.transform.position, _rightControllerGO.transform.forward);
+
+        // Thumbstick Y scrolls the VR settings panel when it is open.
+        // Dead-zone: ignore values < 0.2 to prevent drift.
+        if (VRSettingsPanel.RootGO?.activeSelf == true)
+        {
+            if (OpenXRManager.GetThumbstickState(true, out float tx, out float ty))
+            {
+                const float deadZone   = 0.20f;
+                const float scrollRate = 6.0f;  // pixels per frame at full deflection
+                if (Mathf.Abs(ty) > deadZone)
+                    VRSettingsPanel.Scroll(-ty * scrollRate); // negative: stick up → scroll up (lower y)
+            }
+        }
     }
     /// <summary>
     /// Casts a ray from the right controller into all managed WorldSpace canvases.
@@ -2159,6 +2265,24 @@ public class VRCamera : MonoBehaviour
                 {
                     var go = results[0].gameObject;
                     Log.LogInfo($"[VRCamera] Trigger click: '{go?.name}' on '{hitCanvas.gameObject.name}'");
+
+                    // Check if the click landed on (or inside) the patched Settings button.
+                    // Walk up the hierarchy — the raycasted GO may be a child label, not the button itself.
+                    if (_menuSettingsBtnId != 0)
+                    {
+                        var tr = go?.transform;
+                        for (int i = 0; i < 5 && tr != null; i++)
+                        {
+                            if (tr.gameObject.GetInstanceID() == _menuSettingsBtnId)
+                            {
+                                Log.LogInfo("[VRCamera] Settings button intercepted → VRSettingsPanel.Toggle");
+                                VRSettingsPanel.Toggle();
+                                return;
+                            }
+                            tr = tr.parent;
+                        }
+                    }
+
                     ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerEnterHandler);
                     ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerDownHandler);
                     ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerUpHandler);

@@ -32,10 +32,21 @@ public static class VRSettingsPanel
 
     private static Action<int>?    _removeFromPositioned;
     private static RectTransform?  _graphicsPaneRT;
+    private static RectTransform?  _audioPaneRT;
+    private static RectTransform?  _controlsPaneRT;
     private static RectTransform?  _generalPaneRT;
+    private static RectTransform?  _graphicsContentRT;
+    private static RectTransform?  _audioContentRT;
+    private static RectTransform?  _controlsContentRT;
+    private static RectTransform?  _generalContentRT;
+    private static int             _activeTab = 0;  // 0=Graphics, 1=Audio, 2=Controls, 3=General
     private static CanvasGroup?    _graphicsGroup;
+    private static CanvasGroup?    _audioGroup;
+    private static CanvasGroup?    _controlsGroup;
     private static CanvasGroup?    _generalGroup;
     private static Image?          _graphicsTabImg;
+    private static Image?          _audioTabImg;
+    private static Image?          _controlsTabImg;
     private static Image?          _generalTabImg;
 
     // Image colour refresh — called in Show() to re-apply toggle states and static colors.
@@ -118,25 +129,43 @@ public static class VRSettingsPanel
             tabRowRT.pivot = new Vector2(0.5f, 1f); tabRowRT.sizeDelta = new Vector2(0f, 56f);
             tabRowRT.anchoredPosition = new Vector2(0f, -70f);
 
-            MakeTabButton("GraphicsTab", "Graphics", tabRowGO.transform, new Vector2(-110f, 0f), true,
-                          out _graphicsTabImg, out var graphicsBtn);
-            MakeTabButton("GeneralTab",  "General",  tabRowGO.transform, new Vector2( 110f, 0f), false,
-                          out _generalTabImg,  out var generalBtn);
+            // 4 tabs × 130px wide, ~10px gap → positions -210 / -70 / +70 / +210
+            MakeTabButton("GraphicsTab",  "Graphics",  tabRowGO.transform, new Vector2(-210f, 0f), true,
+                          out _graphicsTabImg,  out var graphicsBtn);
+            MakeTabButton("AudioTab",     "Audio",     tabRowGO.transform, new Vector2( -70f, 0f), false,
+                          out _audioTabImg,     out var audioBtn);
+            MakeTabButton("ControlsTab",  "Controls",  tabRowGO.transform, new Vector2(  70f, 0f), false,
+                          out _controlsTabImg,  out var controlsBtn);
+            MakeTabButton("GeneralTab",   "General",   tabRowGO.transform, new Vector2( 210f, 0f), false,
+                          out _generalTabImg,   out var generalBtn);
             graphicsBtn.onClick.AddListener(new Action(ActivateGraphicsTab));
+            audioBtn.onClick.AddListener(new Action(ActivateAudioTab));
+            controlsBtn.onClick.AddListener(new Action(ActivateControlsTab));
             generalBtn.onClick.AddListener(new Action(ActivateGeneralTab));
 
             // ── Scrollable content panes (topOffset = -126 = below 70px title + 56px tabs) ──
             // No ScrollRect / RectMask2D — those corrupt HDRP stencil in WorldSpace canvas.
             // Scrolling done by shifting content.anchoredPosition.y via ▲/▼ buttons.
             var (graphicsPaneGO, graphicsContent) = MakeScrollablePane("GraphicsPane", root.transform, -126f);
+            var (audioPaneGO,    audioContent)    = MakeScrollablePane("AudioPane",    root.transform, -126f);
+            var (controlsPaneGO, controlsContent) = MakeScrollablePane("ControlsPane", root.transform, -126f);
             var (generalPaneGO,  generalContent)  = MakeScrollablePane("GeneralPane",  root.transform, -126f);
-            _graphicsPaneRT = graphicsPaneGO.GetComponent<RectTransform>();
-            _generalPaneRT  = generalPaneGO.GetComponent<RectTransform>();
+            _graphicsPaneRT    = graphicsPaneGO.GetComponent<RectTransform>();
+            _audioPaneRT       = audioPaneGO.GetComponent<RectTransform>();
+            _controlsPaneRT    = controlsPaneGO.GetComponent<RectTransform>();
+            _generalPaneRT     = generalPaneGO.GetComponent<RectTransform>();
+            _graphicsContentRT = graphicsContent;
+            _audioContentRT    = audioContent;
+            _controlsContentRT = controlsContent;
+            _generalContentRT  = generalContent;
             _graphicsGroup  = graphicsPaneGO.AddComponent<CanvasGroup>();
+            _audioGroup     = audioPaneGO.AddComponent<CanvasGroup>();
+            _controlsGroup  = controlsPaneGO.AddComponent<CanvasGroup>();
             _generalGroup   = generalPaneGO.AddComponent<CanvasGroup>();
-            // Start with General pane hidden — shift off-canvas via localPosition.
-            // VRCamera.ApplyReadableImageBoost handles Image brightness; no alpha tricks needed.
-            SetPaneVisible(_generalPaneRT, _generalGroup, false);
+            // Start with non-Graphics panes hidden — shift off-canvas via localPosition.
+            SetPaneVisible(_audioPaneRT,    _audioGroup,    false);
+            SetPaneVisible(_controlsPaneRT, _controlsGroup, false);
+            SetPaneVisible(_generalPaneRT,  _generalGroup,  false);
 
             // ── Graphics tab rows ─────────────────────────────────────────────
             float gy = TOP_PAD;
@@ -214,6 +243,158 @@ public static class VRSettingsPanel
 
             FinalizeContent(graphicsContent, gy);
 
+            // ── Audio tab ─────────────────────────────────────────────────────
+            float ay = TOP_PAD;
+
+            // Volume steps: 0% → 100% in 10% increments
+            var volLabels = new[] { "0%", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%" };
+            var volVals   = new[] { 0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f };
+
+            // Master volume — FMOD bus:/ controls all audio. AudioListener.volume has no effect on FMOD.
+            AddPrevNextRow(audioContent, ref ay, "Master Volume", volLabels,
+                () => FloatToIdx(ReadFloat("masterVolume", 1f), volVals),
+                v  => {
+                    float vol = volVals[v];
+                    try
+                    {
+                        var bus = FMODUnity.RuntimeManager.GetBus("bus:/");
+                        bus.setVolume(vol);
+                        Log.LogInfo($"[VRSettings] masterVolume bus:/ = {vol:F2} OK");
+                    }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] masterVolume bus: {ex.Message}"); }
+                    try { PlayerPrefs.SetFloat("masterVolume", vol); PlayerPrefs.Save(); }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] masterVolume prefs: {ex.Message}"); }
+                });
+
+            // Per-channel volumes — AudioController.SetVCALevel for live change + PlayerPrefs to persist.
+            // VCA paths confirmed from Master Bank.strings.bank.
+            // Note: "vca:/Music" does not exist — music is "vca:/Soundtrack".
+            foreach (var row in new (string lbl, string prefsKey, string vca, float def)[]
+            {
+                ("Music Volume",   "musicVolume",        "vca:/Soundtrack",    1f),
+                ("Ambience Vol.",  "ambienceVolume",     "vca:/Ambience",      1f),
+                ("Weather Vol.",   "weatherVolume",      "vca:/Weather",       1f),
+                ("Footsteps Vol.", "footstepsVolume",    "vca:/Footsteps",     1f),
+                ("Notifications",  "notificationsVolume","vca:/Notifications", 1f),
+                ("PA System Vol.", "paVolume",           "vca:/PA System",     1f),
+                ("Other SFX Vol.", "otherVolume",        "vca:/Other SFX",     1f),
+            })
+            {
+                var cKey = row.prefsKey;
+                var cVca = row.vca;
+                var cDef = row.def;
+                AddPrevNextRow(audioContent, ref ay, row.lbl, volLabels,
+                    () => FloatToIdx(ReadFloat(cKey, cDef), volVals),
+                    v => {
+                        float vol = volVals[v];
+                        try
+                        {
+                            var vca = FMODUnity.RuntimeManager.GetVCA(cVca);
+                            vca.setVolume(vol);
+                            Log.LogInfo($"[VRSettings] VCA {cVca} = {vol:F2} OK");
+                        }
+                        catch (Exception ex) { Log.LogWarning($"[VRSettings] VCA {cVca} EX: {ex.Message}"); }
+                        try { PlayerPrefs.SetFloat(cKey, vol); PlayerPrefs.Save(); }
+                        catch (Exception ex) { Log.LogWarning($"[VRSettings] prefs {cKey}: {ex.Message}"); }
+                    });
+            }
+
+            // Music on/off — SetFamilyA routes through PlayerPrefsController.OnToggleChanged
+            // which updates both the in-memory GameSetting.intValue AND PlayerPrefs.
+            AddToggleRow(audioContent, ref ay, "Music",
+                () => ReadBool("music"),
+                v => {
+                    try { SetFamilyA("music", v); }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] music toggle: {ex.Message}"); }
+                });
+
+            // Licensed music — Game.SetAllowLicensedMusic(bool) + PlayerPrefs
+            AddToggleRow(audioContent, ref ay, "Licensed Music",
+                () => ReadBool("licensedMusic"),
+                v => {
+                    try { Game.Instance?.SetAllowLicensedMusic(v); }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] licensedMusic live: {ex.Message}"); }
+                    try { PlayerPrefs.SetInt("licensedMusic", v ? 1 : 0); PlayerPrefs.Save(); }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] licensedMusic prefs: {ex.Message}"); }
+                });
+
+            // Bass reduction — Game.SetBassReduction(int) triggers FMOD snapshot internally
+            AddToggleRow(audioContent, ref ay, "Bass Reduction",
+                () => ReadBool("bassReduction"),
+                v => {
+                    try { Game.Instance?.SetBassReduction(v ? 1 : 0); }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] bassReduction live: {ex.Message}"); }
+                    try { PlayerPrefs.SetInt("bassReduction", v ? 1 : 0); PlayerPrefs.Save(); }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] bassReduction prefs: {ex.Message}"); }
+                });
+
+            // Hyperacusis — Game.SetHyperacusisFilter(int) triggers FMOD snapshot internally
+            AddToggleRow(audioContent, ref ay, "Hyperacusis",
+                () => ReadBool("hyperacusis"),
+                v => {
+                    try { Game.Instance?.SetHyperacusisFilter(v ? 1 : 0); }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] hyperacusis live: {ex.Message}"); }
+                    try { PlayerPrefs.SetInt("hyperacusis", v ? 1 : 0); PlayerPrefs.Save(); }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] hyperacusis prefs: {ex.Message}"); }
+                });
+
+            FinalizeContent(audioContent, ay);
+
+            // ── Controls tab ──────────────────────────────────────────────────
+            float cy = TOP_PAD;
+
+            // Bool controls — use SetFamilyA (OnToggleChanged via gameSettingControls list).
+            // Falls back to raw PlayerPrefs when PlayerPrefsController is unavailable.
+            AddToggleRow(controlsContent, ref cy, "Always Run",
+                () => ReadBool("alwaysRun"),     v => SetFamilyA("alwaysRun", v));
+            AddToggleRow(controlsContent, ref cy, "Toggle Run",
+                () => ReadBool("toggleRun"),     v => SetFamilyA("toggleRun", v));
+            AddToggleRow(controlsContent, ref cy, "Auto-Switch Ctrls",
+                () => ReadBool("controlAutoSwitch"), v => SetFamilyA("controlAutoSwitch", v));
+            AddToggleRow(controlsContent, ref cy, "Control Hints",
+                () => ReadBool("controlHints"),  v => SetFamilyA("controlHints", v));
+            AddToggleRow(controlsContent, ref cy, "Invert X",
+                () => ReadBool("invertX"),       v => SetFamilyA("invertX", v));
+            AddToggleRow(controlsContent, ref cy, "Invert Y",
+                () => ReadBool("invertY"),       v => SetFamilyA("invertY", v));
+            AddToggleRow(controlsContent, ref cy, "Force Feedback",
+                () => ReadBool("forceFeedback"), v => SetFamilyA("forceFeedback", v));
+
+            // Sensitivity — float, no dedicated setter; PlayerPrefs only (takes effect on reload).
+            var sensVals   = new[] { 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f };
+            var sensLabels = new[] { "0.5×", "0.75×", "1.0×", "1.25×", "1.5×", "1.75×", "2.0×", "2.5×", "3.0×" };
+            foreach (var row in new (string lbl, string key)[]
+            {
+                ("Mouse Sens. X",    "mouseSensitivityX"),
+                ("Mouse Sens. Y",    "mouseSensitivityY"),
+                ("Ctlr Sens. X",     "controllerSensitivityX"),
+                ("Ctlr Sens. Y",     "controllerSensitivityY"),
+            })
+            {
+                var cKey = row.key;
+                AddPrevNextRow(controlsContent, ref cy, row.lbl, sensLabels,
+                    () => FloatToIdx(ReadFloat(cKey, 1f), sensVals),
+                    v => SetPrefsFloat(cKey, sensVals[v]));
+            }
+
+            // Smoothing — stored as int 0–3; no dedicated setter, PlayerPrefs only.
+            var smoothLabels = new[] { "Off", "Low", "Medium", "High" };
+            AddPrevNextRow(controlsContent, ref cy, "Mouse Smoothing", smoothLabels,
+                () => ClampIdx(ReadInt("mouseSmoothing"), 3),
+                v => SetPrefsInt("mouseSmoothing", v));
+            AddPrevNextRow(controlsContent, ref cy, "Ctlr Smoothing", smoothLabels,
+                () => ClampIdx(ReadInt("controllerSmoothing"), 3),
+                v => SetPrefsInt("controllerSmoothing", v));
+
+            // Virtual cursor sensitivity (in-game mouse UI)
+            var vcVals = new[] { 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f, 2.5f };
+            AddPrevNextRow(controlsContent, ref cy, "Virtual Cursor",
+                new[] { "0.5×", "0.75×", "1.0×", "1.25×", "1.5×", "2.0×", "2.5×" },
+                () => FloatToIdx(ReadFloat("virtualCursorSensitivity", 1f), vcVals),
+                v => SetPrefsFloat("virtualCursorSensitivity", vcVals[v]));
+
+            FinalizeContent(controlsContent, cy);
+
             // ── General tab ───────────────────────────────────────────────────
             float gy2 = TOP_PAD;
 
@@ -274,10 +455,28 @@ public static class VRSettingsPanel
                 v => { try { Game.Instance?.SetDrawDistance(ddVals[v]); PlayerPrefs.SetFloat("drawDist", ddVals[v]); PlayerPrefs.Save(); }
                        catch (Exception ex) { Log.LogWarning($"[VRSettings] drawDist: {ex.Message}"); } });
 
+            // Game difficulty — stored as string "Easy"/"Normal"/"Hard"/"Extreme"
+            var diffLabels = new[] { "Easy", "Normal", "Hard", "Extreme" };
+            AddPrevNextRow(generalContent, ref gy2, "Difficulty", diffLabels,
+                () => StrToIdx(PlayerPrefs.GetString("gameDifficulty", "Normal"), diffLabels),
+                v => {
+                    try { Game.Instance?.SetGameDifficulty(v); }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] difficulty live: {ex.Message}"); }
+                    try { PlayerPrefs.SetString("gameDifficulty", diffLabels[v]); PlayerPrefs.Save(); }
+                    catch (Exception ex) { Log.LogWarning($"[VRSettings] difficulty prefs: {ex.Message}"); }
+                });
+
+            // Game length — stored as string; SetGameLength(int,bool,bool,bool) is a game-start
+            // function, not a settings setter — write PlayerPrefs only, applies on next new game.
+            var lenLabels = new[] { "Very Short", "Short", "Normal", "Long", "Very Long" };
+            AddPrevNextRow(generalContent, ref gy2, "Game Length", lenLabels,
+                () => StrToIdx(PlayerPrefs.GetString("gameLength", "Normal"), lenLabels),
+                v => SetPrefsStr("gameLength", lenLabels[v]));
+
             FinalizeContent(generalContent, gy2);
 
             // Start with Graphics tab active
-            SetTabVisual(true);
+            SetTabVisual(0);
 
             RootGO = root;
             root.SetActive(false);  // hidden by default — F10 to open
@@ -299,9 +498,12 @@ public static class VRSettingsPanel
         RootGO.SetActive(true);
         // Re-apply toggle states and static colors in case they changed while hidden.
         RefreshColors();
-        // Re-enforce tab pane visibility. Graphics tab shown, General tab off-canvas.
-        SetPaneVisible(_graphicsPaneRT, _graphicsGroup, true);
-        SetPaneVisible(_generalPaneRT,  _generalGroup,  false);
+        // Re-enforce tab pane visibility — always open on Graphics tab.
+        _activeTab = 0;
+        SetPaneVisible(_graphicsPaneRT,  _graphicsGroup,  true);
+        SetPaneVisible(_audioPaneRT,     _audioGroup,     false);
+        SetPaneVisible(_controlsPaneRT,  _controlsGroup,  false);
+        SetPaneVisible(_generalPaneRT,   _generalGroup,   false);
         _removeFromPositioned?.Invoke(CanvasInstanceId);
         Log.LogInfo("[VRSettingsPanel] Shown.");
     }
@@ -330,7 +532,7 @@ public static class VRSettingsPanel
         {
             if (img != null) img.color = col;
         }
-        SetTabVisual(true); // always open on Graphics tab
+        SetTabVisual(0); // always open on Graphics tab
     }
 
     public static void Destroy()
@@ -338,10 +540,19 @@ public static class VRSettingsPanel
         if (RootGO == null) return;
         try { UnityEngine.Object.Destroy(RootGO); } catch { }
         RootGO = null;
-        _graphicsPaneRT = null;
-        _generalPaneRT  = null;
-        _graphicsGroup  = null;
-        _generalGroup   = null;
+        _graphicsPaneRT  = null;
+        _audioPaneRT     = null;
+        _controlsPaneRT  = null;
+        _generalPaneRT   = null;
+        _graphicsGroup   = null;
+        _audioGroup      = null;
+        _controlsGroup   = null;
+        _generalGroup    = null;
+        _graphicsContentRT  = null;
+        _audioContentRT     = null;
+        _controlsContentRT  = null;
+        _generalContentRT   = null;
+        _activeTab = 0;
         _toggleRefs.Clear();
         _staticImgRefs.Clear();
     }
@@ -350,17 +561,41 @@ public static class VRSettingsPanel
 
     private static void ActivateGraphicsTab()
     {
-        SetTabVisual(true);
-        SetPaneVisible(_graphicsPaneRT, _graphicsGroup, true);
-        SetPaneVisible(_generalPaneRT,  _generalGroup,  false);
+        _activeTab = 0; SetTabVisual(0);
+        SetPaneVisible(_graphicsPaneRT,  _graphicsGroup,  true);
+        SetPaneVisible(_audioPaneRT,     _audioGroup,     false);
+        SetPaneVisible(_controlsPaneRT,  _controlsGroup,  false);
+        SetPaneVisible(_generalPaneRT,   _generalGroup,   false);
         Log.LogInfo("[VRSettingsPanel] Graphics tab active.");
+    }
+
+    private static void ActivateAudioTab()
+    {
+        _activeTab = 1; SetTabVisual(1);
+        SetPaneVisible(_graphicsPaneRT,  _graphicsGroup,  false);
+        SetPaneVisible(_audioPaneRT,     _audioGroup,     true);
+        SetPaneVisible(_controlsPaneRT,  _controlsGroup,  false);
+        SetPaneVisible(_generalPaneRT,   _generalGroup,   false);
+        Log.LogInfo("[VRSettingsPanel] Audio tab active.");
+    }
+
+    private static void ActivateControlsTab()
+    {
+        _activeTab = 2; SetTabVisual(2);
+        SetPaneVisible(_graphicsPaneRT,  _graphicsGroup,  false);
+        SetPaneVisible(_audioPaneRT,     _audioGroup,     false);
+        SetPaneVisible(_controlsPaneRT,  _controlsGroup,  true);
+        SetPaneVisible(_generalPaneRT,   _generalGroup,   false);
+        Log.LogInfo("[VRSettingsPanel] Controls tab active.");
     }
 
     private static void ActivateGeneralTab()
     {
-        SetTabVisual(false);
-        SetPaneVisible(_graphicsPaneRT, _graphicsGroup, false);
-        SetPaneVisible(_generalPaneRT,  _generalGroup,  true);
+        _activeTab = 3; SetTabVisual(3);
+        SetPaneVisible(_graphicsPaneRT,  _graphicsGroup,  false);
+        SetPaneVisible(_audioPaneRT,     _audioGroup,     false);
+        SetPaneVisible(_controlsPaneRT,  _controlsGroup,  false);
+        SetPaneVisible(_generalPaneRT,   _generalGroup,   true);
         Log.LogInfo("[VRSettingsPanel] General tab active.");
     }
 
@@ -378,10 +613,32 @@ public static class VRSettingsPanel
         if (cg != null) { cg.interactable = visible; cg.blocksRaycasts = visible; }
     }
 
-    private static void SetTabVisual(bool graphicsActive)
+    private static void SetTabVisual(int activeTab)
     {
-        if (_graphicsTabImg != null) _graphicsTabImg.color = graphicsActive ? ColTabActive : ColTabInactive;
-        if (_generalTabImg  != null) _generalTabImg.color  = graphicsActive ? ColTabInactive : ColTabActive;
+        if (_graphicsTabImg  != null) _graphicsTabImg.color  = activeTab == 0 ? ColTabActive : ColTabInactive;
+        if (_audioTabImg     != null) _audioTabImg.color     = activeTab == 1 ? ColTabActive : ColTabInactive;
+        if (_controlsTabImg  != null) _controlsTabImg.color  = activeTab == 2 ? ColTabActive : ColTabInactive;
+        if (_generalTabImg   != null) _generalTabImg.color   = activeTab == 3 ? ColTabActive : ColTabInactive;
+    }
+
+    /// <summary>
+    /// Scrolls the currently visible pane by <paramref name="pixels"/> units.
+    /// Positive pixels scrolls DOWN (reveals lower rows); negative scrolls UP.
+    /// Called from VRCamera when the thumbstick Y axis changes.
+    /// </summary>
+    public static void Scroll(float pixels)
+    {
+        var content = _activeTab == 0 ? _graphicsContentRT
+                    : _activeTab == 1 ? _audioContentRT
+                    : _activeTab == 2 ? _controlsContentRT
+                    :                   _generalContentRT;
+        if (content == null) return;
+        // Viewport height = pane height (content rect minus its top-offset).
+        // We approximate viewport as 400px (matches pane sizeDelta.y set in MakeScrollablePane).
+        const float viewportH = 400f;
+        float maxY = Mathf.Max(0f, content.sizeDelta.y - viewportH);
+        float newY = Mathf.Clamp(content.anchoredPosition.y + pixels, 0f, maxY);
+        content.anchoredPosition = new Vector2(0f, newY);
     }
 
     // ── Scrollable pane builder ───────────────────────────────────────────────
@@ -409,8 +666,8 @@ public static class VRSettingsPanel
         contentRT.anchoredPosition = Vector2.zero;
         contentRT.sizeDelta        = new Vector2(0f, 100f);
 
-        // Scroll arrows at right corners of the pane — shift content.anchoredPosition.y.
-        // topOffset captured so each arrow can compute maxScroll from content vs. viewport.
+        // Scroll arrows at LEFT corners of the pane — avoids overlap with ◄/► nav buttons
+        // which are anchored to the right edge of every row.
         AddScrollArrow(name + "Up",   paneGO.transform, up: true,  contentRT, topOffset);
         AddScrollArrow(name + "Down", paneGO.transform, up: false, contentRT, topOffset);
 
@@ -423,11 +680,12 @@ public static class VRSettingsPanel
         var go  = MakeGO(name, parent);
         var img = go.AddComponent<Image>();
         var rt  = go.GetComponent<RectTransform>();
-        rt.anchorMin = new Vector2(1f, up ? 1f : 0f);
-        rt.anchorMax = new Vector2(1f, up ? 1f : 0f);
-        rt.pivot     = new Vector2(1f, up ? 1f : 0f);
+        // Anchored to LEFT edge so the arrow never overlaps the right-side ◄/► buttons.
+        rt.anchorMin = new Vector2(0f, up ? 1f : 0f);
+        rt.anchorMax = new Vector2(0f, up ? 1f : 0f);
+        rt.pivot     = new Vector2(0f, up ? 1f : 0f);
         rt.sizeDelta = new Vector2(55f, 55f);
-        rt.anchoredPosition = new Vector2(-5f, up ? -5f : 5f);
+        rt.anchoredPosition = new Vector2(5f, up ? -5f : 5f);
         img.color = ColNavBtn;
         _staticImgRefs.Add((img, ColNavBtn));
 
@@ -611,8 +869,9 @@ public static class VRSettingsPanel
     {
         var lblGO   = MakeGO("Lbl", row);
         var lblRT   = lblGO.AddComponent<RectTransform>();
+        // Start label at 65px from left — clears the 55px scroll arrow + 5px gap.
         lblRT.anchorMin = new Vector2(0f, 0f); lblRT.anchorMax = new Vector2(0.55f, 1f);
-        lblRT.offsetMin = new Vector2(10f, 0f); lblRT.offsetMax = Vector2.zero;
+        lblRT.offsetMin = new Vector2(65f, 0f); lblRT.offsetMax = Vector2.zero;
         var lbl = lblGO.AddComponent<TextMeshProUGUI>();
         lbl.text = text; lbl.fontSize = 30; lbl.color = Color.white;
         lbl.alignment = TextAlignmentOptions.MidlineLeft; lbl.raycastTarget = false;
@@ -643,7 +902,7 @@ public static class VRSettingsPanel
         var img = go.AddComponent<Image>();
         var rt  = go.GetComponent<RectTransform>();
         rt.anchorMin = new Vector2(0.5f, 0.5f); rt.anchorMax = new Vector2(0.5f, 0.5f);
-        rt.sizeDelta = new Vector2(200f, 50f); rt.anchoredPosition = pos;
+        rt.sizeDelta = new Vector2(130f, 50f); rt.anchoredPosition = pos;
         img.color = startActive ? ColTabActive : ColTabInactive;
         button = go.AddComponent<Button>();
         bgImg  = img;
@@ -740,6 +999,35 @@ public static class VRSettingsPanel
     }
 
     // ── Utility ───────────────────────────────────────────────────────────────
+
+    /// <summary>Write a float to PlayerPrefs only (no live setter available).</summary>
+    private static void SetPrefsFloat(string id, float val)
+    {
+        try { PlayerPrefs.SetFloat(id, val); PlayerPrefs.Save(); }
+        catch (Exception ex) { Log.LogWarning($"[VRSettings] prefs float '{id}': {ex.Message}"); }
+    }
+
+    /// <summary>Write an int to PlayerPrefs only (no live setter available).</summary>
+    private static void SetPrefsInt(string id, int val)
+    {
+        try { PlayerPrefs.SetInt(id, val); PlayerPrefs.Save(); }
+        catch (Exception ex) { Log.LogWarning($"[VRSettings] prefs int '{id}': {ex.Message}"); }
+    }
+
+    /// <summary>Write a string to PlayerPrefs only.</summary>
+    private static void SetPrefsStr(string id, string val)
+    {
+        try { PlayerPrefs.SetString(id, val); PlayerPrefs.Save(); }
+        catch (Exception ex) { Log.LogWarning($"[VRSettings] prefs str '{id}': {ex.Message}"); }
+    }
+
+    /// <summary>Find the index of <paramref name="val"/> in <paramref name="arr"/>, case-insensitive; 0 if not found.</summary>
+    private static int StrToIdx(string val, string[] arr)
+    {
+        for (int i = 0; i < arr.Length; i++)
+            if (string.Equals(arr[i], val, StringComparison.OrdinalIgnoreCase)) return i;
+        return 0;
+    }
 
     private static int ClampIdx(int v, int max) => v < 0 ? 0 : v > max ? max : v;
 

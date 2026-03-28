@@ -1,7 +1,7 @@
 # SoDVR — Technical Handover
 
 **Date**: 2026-03-27
-**Phase**: 6 complete (UI visible), brightness fix in progress
+**Phase**: 8 — VR Settings Panel (Phase 0 confirmed, Phase 1 next)
 
 ---
 
@@ -15,13 +15,30 @@
 - VROrigin follows game camera world position ✓
 - HDRP eye cameras: AA=None, custom FrameSettings (SSAO/SSR/Volumetrics/MotionBlur/Tonemapping off) ✓
 
-### Phase 6 — UI canvases in VR (current code, PARTIAL)
+### Phase 6 — UI canvases in VR (COMPLETE)
 - All screen-space canvases auto-converted to WorldSpace every 30 frames ✓
 - Each canvas placed once in front of head on first valid tracked pose ✓
 - **Home key** re-centres all canvases ✓
 - FadeOverlay/Fade suppressed ✓
 - TMP font shader swapped from Distance Field → UI/Default with correct TSA ✓
-- Canvases visible in headset, but **text too dark to read** (see §UI Brightness below)
+- Canvases visible in headset (text too dark — see §UI Brightness; workaround: ZTest Always)
+
+### Phase 7 — Controller input (COMPLETE)
+- Right controller pose tracked via OpenXR action sets (aim pose, trigger) ✓
+- Controller visible as `RightController` GameObject under VROrigin ✓
+- Trigger fires `ExecuteEvents` pointer-click on closest WorldSpace canvas plane hit ✓
+- **Cursor dot** (`VRCursorCanvasInternal`) visible on all screens ✓
+  - ScreenSpaceOverlay canvas → converted via normal pipeline → HDRP-registered + ZTest Always
+  - `DontDestroyOnLoad` — survives loading→menu scene transition
+  - NOT in `_ownedCanvasIds` → `RescanCanvasAlpha` applies ZTest Always material patch (bypasses exposure darkening)
+  - Dot moves via `anchoredPosition` (2D projection onto canvas plane at `UIDistance`)
+  - `_cursorCanvas` cached in `BuildCameraRig`; `_cursorRect` via `AddComponent<Image>()` + `GetComponent<RectTransform>()`
+
+### Phase 8 — VR Settings Panel (IN PROGRESS)
+- Phase 0 test canvas (`VRSettingsPanelInternal`, F10 to toggle) confirmed visible in headset ✓
+- Panel created as ScreenSpaceOverlay → converted by scan pipeline, registered in `_ownedCanvasIds`
+- `DontDestroyOnLoad` on panel GO ✓
+- **Next**: Phase 1 — extract panel into `SoDVR/VR/VRSettingsPanel.cs` per PLAN-Claude.md
 
 ---
 
@@ -139,51 +156,39 @@ On End key press with options panel open, check the dump for options text elemen
 | `FindObjectsOfType<Canvas>()` | Less reliable in IL2CPP. Use `Resources.FindObjectsOfTypeAll<Canvas>()`. |
 | `TMP_Text.color` vs `Graphic.color` | TMP overrides `Graphic.color` with `new color` — the base setter is ignored. Must cast to `TMP_Text` and set `.color` directly. |
 | `FrameSettingsField.ExposureControl` | Cannot be overridden per-camera in HDRP 12 IL2CPP. Bit never persists. |
+| `AddComponent<RectTransform>()` on new GO | Returns **null** in IL2CPP — the GO already has a Transform. Instead: `AddComponent<Image>()` first, then `GetComponent<RectTransform>()`. |
+| `DontDestroyOnLoad` on VRMod GOs | **Required** for any VRMod-created canvas or panel. The loading→menu scene transition destroys all non-persistent objects, invalidating cached Canvas/RectTransform references silently. |
+| Duplicate `plugins/SoDVR.dll` | BepInEx loads two copies if both `plugins/SoDVR.dll` and `plugins/SoDVR/SoDVR.dll` exist. Use `powershell.exe -Command "Remove-Item -Recurse -Force 'path\SoDVR'"` to clean up; `rm -rf` in bash may silently fail on Windows. |
 
 ---
 
-## Phase 7 — Controller Input (after brightness fix)
+## Phase 8 — VR Settings Panel (CURRENT WORK)
 
-### Goal
-Laser-pointer style interaction: controller pose tracked via OpenXR, ray projected into the scene,
-intersection with WorldSpace canvases detected by Unity's `GraphicRaycaster`, trigger = click.
+See `PLAN-Claude.md` for the complete phase plan (Phases 0–4).
 
-### Step 1 — OpenXR action set setup (after xrCreateSession, before xrBeginSession)
-```
-xrCreateActionSet(instance, {name="gameplay", localizedName="Gameplay", priority=0}) → actionSet
-xrCreateAction(actionSet, {name="hand_pose",  type=POSE_INPUT,    subactionPaths=["/user/hand/left","/user/hand/right"]}) → poseAction
-xrCreateAction(actionSet, {name="trigger",    type=BOOLEAN_INPUT, subactionPaths=[...]}) → triggerAction
-xrCreateAction(actionSet, {name="thumbstick", type=VECTOR2F_INPUT, subactionPaths=[...]}) → thumbstickAction
+### Status
+- **Phase 0** (visibility proof): `VRSettingsPanelInternal` test canvas confirmed visible ✓
+- **Phase 1** (skeleton panel): **TODO** — extract into `SoDVR/VR/VRSettingsPanel.cs`
 
-xrSuggestInteractionProfileBindings(instance, {
-  profile: "/interaction_profiles/oculus/touch_controller",   ← Samsung Galaxy XR via VDXR
-  bindings: [
-    { poseAction,       "/user/hand/right/input/aim/pose" },
-    { poseAction,       "/user/hand/left/input/aim/pose"  },
-    { triggerAction,    "/user/hand/right/input/trigger/value" },
-    { thumbstickAction, "/user/hand/right/input/thumbstick"   },
-  ]
-})
+### Phase 1 deliverables (per PLAN-Claude.md)
+- New file `SoDVR/VR/VRSettingsPanel.cs` — owns canvas, layout, settings logic
+- Dark semi-transparent background, title "VR Settings", Close button
+- Two tab buttons: **Graphics** | **General**
+- 3–4 hardcoded rows per tab as layout proof (no scroll view yet)
+- F10 toggles visibility
+- `VRCamera` additions: ≤30 lines — call `VRSettingsPanel.Init()`, add canvas ID to `_ownedCanvasIds`, wire F10
 
-xrCreateActionSpace(session, {action=poseAction, subactionPath="/user/hand/right"}) → rightAimSpace
-xrAttachSessionActionSets(session, {actionSets=[actionSet]})
-```
+### Canvas creation rules (learned from Phase 0 + cursor dot work)
+- Create as `ScreenSpaceOverlay` → let `ScanAndConvertCanvases` convert → HDRP-registered automatically
+- `DontDestroyOnLoad` on the root GO — **mandatory**
+- Register canvas instance ID in `_ownedCanvasIds` immediately after `AddComponent<Canvas>()` — before scan runs
+- `_ownedCanvasIds` gates `RescanCanvasAlpha` only; `PositionCanvases` still places owned canvases normally (placed once via `_positionedCanvases`, re-placed on F10 by removing from `_positionedCanvases`)
+- Add `CanvasScaler` with `referenceResolution = (900, 700)` so `ConvertCanvasToWorldSpace` uses the right size
+- Assert `GraphicRaycaster` exists after conversion (added by `ConvertCanvasToWorldSpace`, but confirm)
 
-### Step 2 — Per frame
-```
-xrSyncActions(session, {activeSets=[{actionSet, XR_NULL_PATH}]})
-xrLocateSpace(rightAimSpace, referenceSpace, displayTime) → rightPose
-xrGetActionStateBoolean(session, {action=triggerAction, subactionPath="/user/hand/right"}) → triggerState
-```
-
-### Step 3 — Laser pointer
-- `RightController` GameObject under VROrigin; add `LineRenderer` for the beam
-- Apply rightPose each frame (same coord flip as `ApplyCameraPose`)
-- Raycast against WorldSpace canvases via `GraphicRaycaster` (already added to each canvas at scan time)
-- On trigger: `ExecuteEvents.Execute(hitGO, ped, ExecuteEvents.pointerClickHandler)`
-
-### Interaction profile note
-Samsung Galaxy XR via Virtual Desktop presents as Oculus Touch. Profile: `/interaction_profiles/oculus/touch_controller`.
+### Setting families (for Phase 2 wiring)
+See `PLAN-Claude.md §Setting families and write paths` for complete API.
+Key families: A (`OnToggleChanged` + `SessionData` guard), B (`Game.Instance.SetXxx` + `PlayerPrefs.Save`), C (enum setter), D (float setter), E (frame cap compound), F (DLSS special), G (resolution, deferred).
 
 ---
 
@@ -206,7 +211,8 @@ Samsung Galaxy XR via Virtual Desktop presents as Oculus Touch. Profile: `/inter
 - [x] Phase 1–4: OpenXR init, session, swapchain (VDXR patch approach, archived `1be2b0e`)
 - [x] **Phase 5**: Standard loader → real swapchain textures → stereo image in headset (`346a6df`)
 - [x] **Phase 6**: Camera positioning, head tracking, UI canvases visible in VR
-- [ ] **Phase 7 (current)**: Fix UI brightness (see §UI Brightness above), then controller input
-- [ ] Phase 8: Movement (thumbstick → character move/rotate), jump, interact bindings
-- [ ] Phase 9: Comfort options (vignette, snap-turn, IPD)
-- [ ] Phase 10: Polish, performance tuning
+- [x] **Phase 7**: Controller pose + trigger click + cursor dot visible on all screens
+- [ ] **Phase 8 (current)**: VR Settings Panel (Phase 0 done, Phase 1–4 per PLAN-Claude.md)
+- [ ] Phase 9: Movement (thumbstick → character move/rotate), jump, interact bindings
+- [ ] Phase 10: Comfort options (vignette, snap-turn, IPD)
+- [ ] Phase 11: Polish, performance tuning

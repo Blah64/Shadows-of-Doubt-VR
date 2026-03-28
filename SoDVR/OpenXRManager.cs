@@ -52,7 +52,8 @@ public static class OpenXRManager
     private static IntPtr _pfnSuggestInteractionProfileBindings;
     private static IntPtr _pfnCreateActionSpace, _pfnAttachSessionActionSets;
     private static IntPtr _pfnSyncActions, _pfnLocateSpace, _pfnGetActionStateBoolean;
-    private static ulong  _actionSet, _poseAction, _triggerAction;
+    private static IntPtr _pfnGetActionStateVector2f;
+    private static ulong  _actionSet, _poseAction, _triggerAction, _thumbAction;
     private static ulong  _rightAimSpace, _leftAimSpace;
     private static ulong  _rightHandPath, _leftHandPath;
     public  static bool   ActionSetsReady { get; private set; }
@@ -69,6 +70,45 @@ public static class OpenXRManager
     public  static long    LastDisplayTime       { get; private set; }
     private static int     _stereoCallCount;
 
+    // ── Cached per-frame delegates (populated once in InitPerFrameResources) ─
+    // GetDelegateForFunctionPointer<T> creates a new wrapper via reflection every call.
+    // Caching eliminates 12+ wrapper allocations per frame in the hot render path.
+    private static XrWaitFrameDelegate?              _dWaitFrame;
+    private static XrBeginFrameDelegate?             _dBeginFrame;
+    private static XrEndFrameDelegate?               _dEndFrame;
+    private static XrLocateViewsDelegate?            _dLocateViews;
+    private static XrAcquireSwapchainImageDelegate?  _dAcquireSwapchain;
+    private static XrWaitSwapchainImageDelegate?     _dWaitSwapchain;
+    private static XrReleaseSwapchainImageDelegate?  _dReleaseSwapchain;
+    private static XrSyncActionsDelegate?            _dSyncActions;
+    private static XrLocateSpaceDelegate?            _dLocateSpace;
+    private static XrGetActionStateBooleanDelegate?  _dGetActionStateBool;
+    private static XrGetActionStateVector2fDelegate? _dGetActionStateVec2;
+
+    // ── Pre-allocated unmanaged struct buffers (never freed) ─────────────────
+    // Eliminates AllocHGlobal/FreeHGlobal overhead from the per-frame hot path.
+    // Each buffer is zero-filled at init; static header fields written once.
+    // Only dynamic fields (displayTime, action handle, subactionPath) written each call.
+    private static IntPtr _bFrameWaitInfo;    // XrFrameWaitInfo (16 b)
+    private static IntPtr _bFrameState;       // XrFrameState (40 b) — output
+    private static IntPtr _bFrameBeginInfo;   // XrFrameBeginInfo (16 b)
+    private static IntPtr _bFrameEndInfo;     // XrFrameEndInfo (40 b)
+    private static IntPtr _bProjViews;        // XrCompositionLayerProjectionView × 2 (192 b)
+    private static IntPtr _bProjLayer;        // XrCompositionLayerProjection (48 b)
+    private static IntPtr _bLayerPtr;         // IntPtr pointing to _bProjLayer (ptr-size)
+    private static IntPtr _bViewLocateInfo;   // XrViewLocateInfo (40 b)
+    private static IntPtr _bViewState;        // XrViewState (24 b) — output
+    private static IntPtr _bViewBuffer;       // XrView × 2 (128 b) — output
+    private static IntPtr _bAcquireInfo;      // XrSwapchainImageAcquireInfo (16 b)
+    private static IntPtr _bWaitInfo2;        // XrSwapchainImageWaitInfo (24 b)
+    private static IntPtr _bReleaseInfo;      // XrSwapchainImageReleaseInfo (16 b)
+    private static IntPtr _bSyncAas;          // XrActiveActionSet (16 b)
+    private static IntPtr _bSyncInfo;         // XrActionsSyncInfo (32 b)
+    private static IntPtr _bLocSpaceInfo;     // XrActionStateGetInfo (32 b) — reused for locateSpace gi
+    private static IntPtr _bSpaceLocation;    // XrSpaceLocation (48 b) — output
+    private static IntPtr _bActionGi;         // XrActionStateGetInfo (32 b) — trigger/thumb
+    private static IntPtr _bActionStateBool;  // XrActionStateBoolean (40 b) — output
+    private static IntPtr _bActionStateVec2;  // XrActionStateVector2f (48 b) — output
 
     // ── Delegate types ────────────────────────────────────────────────────────
 
@@ -154,6 +194,8 @@ public static class OpenXRManager
     private delegate int XrLocateSpaceDelegate(ulong space, ulong baseSpace, long time, IntPtr location);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int XrGetActionStateBooleanDelegate(ulong session, IntPtr getInfo, IntPtr state);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrGetActionStateVector2fDelegate(ulong session, IntPtr getInfo, IntPtr state);
     // D3D11 vtable helpers
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void D3D11GetImmediateContextDelegate(IntPtr device, out IntPtr context);
@@ -415,12 +457,16 @@ public static class OpenXRManager
             GetFn("xrSyncActions",                       out _pfnSyncActions);
             GetFn("xrLocateSpace",                       out _pfnLocateSpace);
             GetFn("xrGetActionStateBoolean",             out _pfnGetActionStateBoolean);
+            GetFn("xrGetActionStateVector2f",            out _pfnGetActionStateVector2f);
+
+            // Cache per-frame delegates and pre-allocate struct buffers (eliminates per-frame
+            // GetDelegateForFunctionPointer and AllocHGlobal overhead in hot render path).
+            InitPerFrameResources();
 
             // Log which DLL owns each function pointer — reveals if UnityOpenXR is in the chain.
             LogFnOwner("xrGetSystem",      _pfnGetSystem);
             LogFnOwner("xrCreateSession",  _pfnCreateSession);
             LogFnOwner("xrGetD3D11GfxReq", _pfnGetD3D11GfxReqs);
-            DumpVtableFunctions();
 
             rc = XrGetSystem();
             if (rc != 0 || _systemId == 0) { Log.LogError($"  xrGetSystem rc={rc}"); return; }
@@ -934,6 +980,9 @@ public static class OpenXRManager
             if (LeftSwapchainImages.Length == 0 || RightSwapchainImages.Length == 0)
             { Log.LogError("  Empty swapchain image arrays"); return false; }
 
+            // Write session-dependent values (ReferenceSpace, _actionSet) into pre-allocated buffers.
+            FinalizePerFrameBuffers();
+
             return true;
         }
         catch (Exception ex) { Log.LogError($"SetupStereo: {ex}"); return false; }
@@ -1050,43 +1099,25 @@ public static class OpenXRManager
     public static bool AcquireSwapchainImage(ulong sc, out uint index, out int rcOut)
     {
         index = 0; rcOut = -1;
-        if (_pfnAcquireSwapchainImage == IntPtr.Zero) return false;
-        // XrSwapchainImageAcquireInfo: type(4) pad(4) next(8) = 16 bytes
-        IntPtr p = Marshal.AllocHGlobal(16);
-        for (int i = 0; i < 16; i++) Marshal.WriteByte(p, i, 0);
-        Marshal.WriteInt32(p, 0, 55); // XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO
-        rcOut = Marshal.GetDelegateForFunctionPointer<XrAcquireSwapchainImageDelegate>
-            (_pfnAcquireSwapchainImage)(sc, p, out index);
-        Marshal.FreeHGlobal(p);
+        if (_dAcquireSwapchain == null) return false;
+        // _bAcquireInfo pre-allocated with type=55; fully static, no per-call writes needed.
+        rcOut = _dAcquireSwapchain(sc, _bAcquireInfo, out index);
         return rcOut == 0;
     }
     public static bool AcquireSwapchainImage(ulong sc, out uint index) => AcquireSwapchainImage(sc, out index, out _);
 
     public static bool WaitSwapchainImage(ulong sc)
     {
-        if (_pfnWaitSwapchainImage == IntPtr.Zero) return false;
-        // XrSwapchainImageWaitInfo: type(4) pad(4) next(8) timeout(8) = 24 bytes
-        IntPtr p = Marshal.AllocHGlobal(24);
-        for (int i = 0; i < 24; i++) Marshal.WriteByte(p, i, 0);
-        Marshal.WriteInt32(p, 0, 56);                             // XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO
-        Marshal.WriteInt64(p, 16, long.MaxValue);                 // XR_INFINITE_DURATION
-        int rc = Marshal.GetDelegateForFunctionPointer<XrWaitSwapchainImageDelegate>
-            (_pfnWaitSwapchainImage)(sc, p);
-        Marshal.FreeHGlobal(p);
-        return rc == 0;
+        if (_dWaitSwapchain == null) return false;
+        // _bWaitInfo2 pre-allocated with type=56 + timeout=MAX; fully static.
+        return _dWaitSwapchain(sc, _bWaitInfo2) == 0;
     }
 
     public static bool ReleaseSwapchainImage(ulong sc)
     {
-        if (_pfnReleaseSwapchainImage == IntPtr.Zero) return false;
-        // XrSwapchainImageReleaseInfo: type(4) pad(4) next(8) = 16 bytes
-        IntPtr p = Marshal.AllocHGlobal(16);
-        for (int i = 0; i < 16; i++) Marshal.WriteByte(p, i, 0);
-        Marshal.WriteInt32(p, 0, 57); // XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO
-        int rc = Marshal.GetDelegateForFunctionPointer<XrReleaseSwapchainImageDelegate>
-            (_pfnReleaseSwapchainImage)(sc, p);
-        Marshal.FreeHGlobal(p);
-        return rc == 0;
+        if (_dReleaseSwapchain == null) return false;
+        // _bReleaseInfo pre-allocated with type=57; fully static.
+        return _dReleaseSwapchain(sc, _bReleaseInfo) == 0;
     }
 
     public struct EyePose
@@ -1105,38 +1136,16 @@ public static class OpenXRManager
     public static bool LocateViews(long displayTime, out EyePose left, out EyePose right)
     {
         left = right = default;
-        if (_pfnLocateViews == IntPtr.Zero || ReferenceSpace == 0) return false;
+        if (_dLocateViews == null || ReferenceSpace == 0) return false;
         try
         {
-            // XrViewLocateInfo: type(4) pad(4) next(8) viewConfigType(4) pad(4) displayTime(8) space(8) = 40 bytes
-            IntPtr li = Marshal.AllocHGlobal(40);
-            for (int i = 0; i < 40; i++) Marshal.WriteByte(li, i, 0);
-            Marshal.WriteInt32(li,  0, 6);                     // XR_TYPE_VIEW_LOCATE_INFO
-            Marshal.WriteInt32(li, 16, 2);                     // PRIMARY_STEREO
-            Marshal.WriteInt64(li, 24, displayTime);
-            Marshal.WriteInt64(li, 32, (long)ReferenceSpace);
-
-            // XrViewState: type(4) pad(4) next(8) viewStateFlags(8) = 24 bytes
-            IntPtr vs = Marshal.AllocHGlobal(24);
-            for (int i = 0; i < 24; i++) Marshal.WriteByte(vs, i, 0);
-            Marshal.WriteInt32(vs, 0, 11); // XR_TYPE_VIEW_STATE
-
-            // XrView[2]: 64 bytes each
+            // Only the dynamic displayTime field needs updating; all other fields pre-filled.
+            Marshal.WriteInt64(_bViewLocateInfo, 24, displayTime);
+            int rc = _dLocateViews(_session, _bViewLocateInfo, _bViewState, 2, out uint countOut, _bViewBuffer);
+            if (rc != 0 || countOut < 2) return false;
             const int viewSz = 64;
-            IntPtr vb = Marshal.AllocHGlobal(2 * viewSz);
-            for (int i = 0; i < 2 * viewSz; i++) Marshal.WriteByte(vb, i, 0);
-            Marshal.WriteInt32(vb + 0,       0, 7); // XR_TYPE_VIEW
-            Marshal.WriteInt32(vb + viewSz,  0, 7);
-
-            int rc = Marshal.GetDelegateForFunctionPointer<XrLocateViewsDelegate>(_pfnLocateViews)
-                (_session, li, vs, 2, out uint countOut, vb);
-
-            Marshal.FreeHGlobal(li); Marshal.FreeHGlobal(vs);
-            if (rc != 0 || countOut < 2) { Marshal.FreeHGlobal(vb); return false; }
-
-            left  = ParseEyeView(vb,             viewSz);
-            right = ParseEyeView(vb + viewSz, viewSz);
-            Marshal.FreeHGlobal(vb);
+            left  = ParseEyeView(_bViewBuffer,           viewSz);
+            right = ParseEyeView(_bViewBuffer + viewSz,  viewSz);
             return true;
         }
         catch (Exception ex) { Log.LogWarning($"  LocateViews: {ex.Message}"); return false; }
@@ -1172,37 +1181,18 @@ public static class OpenXRManager
     public static void FrameEndStereo(long displayTime,
         EyePose leftEye, EyePose rightEye, uint leftIdx, uint rightIdx)
     {
-        if (_pfnEndFrame == IntPtr.Zero || _session == 0) return;
+        if (_dEndFrame == null || _session == 0) return;
         try
         {
             const int projViewSz = 96;
-            IntPtr pv = Marshal.AllocHGlobal(2 * projViewSz);
-            for (int i = 0; i < 2 * projViewSz; i++) Marshal.WriteByte(pv, i, 0);
-            WriteProjectionView(pv,               leftEye,  LeftSwapchain,  leftIdx);
-            WriteProjectionView(pv + projViewSz,  rightEye, RightSwapchain, rightIdx);
-
-            const int plSz = 48;
-            IntPtr pl = Marshal.AllocHGlobal(plSz);
-            for (int i = 0; i < plSz; i++) Marshal.WriteByte(pl, i, 0);
-            Marshal.WriteInt32(pl,  0, 35);                        // XR_TYPE_COMPOSITION_LAYER_PROJECTION
-            Marshal.WriteInt64(pl, 24, (long)ReferenceSpace);      // space
-            Marshal.WriteInt32(pl, 32, 2);                         // viewCount
-            Marshal.WriteIntPtr(pl, 40, pv);                       // *views
-
-            IntPtr lp = Marshal.AllocHGlobal(IntPtr.Size);
-            Marshal.WriteIntPtr(lp, pl);
-
-            const int eiSz = 40;
-            IntPtr ei = Marshal.AllocHGlobal(eiSz);
-            for (int i = 0; i < eiSz; i++) Marshal.WriteByte(ei, i, 0);
-            Marshal.WriteInt32(ei,  0, 12);           // XR_TYPE_FRAME_END_INFO
-            Marshal.WriteInt64(ei, 16, displayTime);
-            Marshal.WriteInt32(ei, 24, 1);            // OPAQUE
-            Marshal.WriteInt32(ei, 28, 1);            // layerCount = 1
-            Marshal.WriteIntPtr(ei, 32, lp);
+            // Write eye poses + swapchain indices into pre-allocated projection-view buffers.
+            WriteProjectionView(_bProjViews,              leftEye,  LeftSwapchain,  leftIdx);
+            WriteProjectionView(_bProjViews + projViewSz, rightEye, RightSwapchain, rightIdx);
+            // Only dynamic field in FrameEndInfo is displayTime.
+            Marshal.WriteInt64(_bFrameEndInfo, 16, displayTime);
 
             _stereoCallCount++;
-            bool logThis = _stereoCallCount <= 3 || (_stereoCallCount % 300) == 0;
+            bool logThis = _stereoCallCount <= 3;
             if (logThis)
             {
                 float qMag = (float)Math.Sqrt(leftEye.Orientation.x * leftEye.Orientation.x
@@ -1217,12 +1207,9 @@ public static class OpenXRManager
                 Log.LogInfo($"  [FS#{_stereoCallCount}] displayTime={displayTime}  session=0x{_session:X}");
             }
 
-            int rc = Marshal.GetDelegateForFunctionPointer<XrEndFrameDelegate>(_pfnEndFrame)(_session, ei);
+            int rc = _dEndFrame(_session, _bFrameEndInfo);
             if (rc != 0)
                 Log.LogWarning($"  xrEndFrame(stereo)#{_stereoCallCount} rc={rc}  space=0x{ReferenceSpace:X} L-sc=0x{LeftSwapchain:X} R-sc=0x{RightSwapchain:X} lidx={leftIdx} ridx={rightIdx}");
-
-            Marshal.FreeHGlobal(ei); Marshal.FreeHGlobal(lp);
-            Marshal.FreeHGlobal(pl); Marshal.FreeHGlobal(pv);
         }
         catch (Exception ex) { Log.LogWarning($"  FrameEndStereo: {ex.Message}"); }
     }
@@ -1257,18 +1244,17 @@ public static class OpenXRManager
     /// <summary>Submits xrEndFrame with zero composition layers (keeps session alive).</summary>
     public static void FrameEndEmpty(long displayTime)
     {
-        if (_pfnEndFrame == IntPtr.Zero || _session == 0) return;
+        if (_dEndFrame == null || _session == 0) return;
         try
         {
-            IntPtr ei = Marshal.AllocHGlobal(40);
-            for (int i = 0; i < 40; i++) Marshal.WriteByte(ei, i, 0);
-            Marshal.WriteInt32(ei,  0, 12);          // XR_TYPE_FRAME_END_INFO
-            Marshal.WriteInt64(ei, 16, displayTime);
-            Marshal.WriteInt32(ei, 24, 1);           // OPAQUE
-            Marshal.WriteInt32(ei, 28, 0);           // layerCount = 0
-            Marshal.WriteIntPtr(ei, 32, IntPtr.Zero);
-            Marshal.GetDelegateForFunctionPointer<XrEndFrameDelegate>(_pfnEndFrame)(_session, ei);
-            Marshal.FreeHGlobal(ei);
+            // Temporarily reconfigure _bFrameEndInfo for empty (0-layer) submission.
+            Marshal.WriteInt64(_bFrameEndInfo, 16, displayTime);
+            Marshal.WriteInt32(_bFrameEndInfo, 28, 0);              // layerCount = 0
+            Marshal.WriteIntPtr(_bFrameEndInfo, 32, IntPtr.Zero);
+            _dEndFrame(_session, _bFrameEndInfo);
+            // Restore to stereo (1-layer) config for the next real frame.
+            Marshal.WriteInt32(_bFrameEndInfo, 28, 1);
+            Marshal.WriteIntPtr(_bFrameEndInfo, 32, _bLayerPtr);
         }
         catch (Exception ex) { Log.LogWarning($"  FrameEndEmpty: {ex.Message}"); }
     }
@@ -1415,7 +1401,7 @@ public static class OpenXRManager
             // actionType: 4=POSE_INPUT, 1=BOOLEAN_INPUT, 3=VECTOR2F_INPUT
             _poseAction      = CreateAction("hand_pose",  "Hand Pose",  4, _leftHandPath, _rightHandPath);
             _triggerAction   = CreateAction("trigger",    "Trigger",    1, _leftHandPath, _rightHandPath);
-            var thumbAction  = CreateAction("thumbstick", "Thumbstick", 3, _leftHandPath, _rightHandPath);
+            _thumbAction     = CreateAction("thumbstick", "Thumbstick", 3, _leftHandPath, _rightHandPath);
             if (_poseAction == 0 || _triggerAction == 0)
             { Log.LogWarning("  SetupActionSetsInstance: action creation failed"); return; }
 
@@ -1442,8 +1428,8 @@ public static class OpenXRManager
                 WriteBinding(1, _poseAction,    aimLeft);
                 WriteBinding(2, _triggerAction, trigRight);
                 WriteBinding(3, _triggerAction, trigLeft);
-                WriteBinding(4, thumbAction,    stickR);
-                WriteBinding(5, thumbAction,    stickL);
+                WriteBinding(4, _thumbAction,   stickR);
+                WriteBinding(5, _thumbAction,   stickL);
 
                 // XrInteractionProfileSuggestedBinding: type(24)+pad(4)+next(8)+profile(8)+count(4)+pad(4)+bindings*(8) = 40
                 IntPtr sugInfo = Marshal.AllocHGlobal(40);
@@ -1462,7 +1448,7 @@ public static class OpenXRManager
             }
             finally { Marshal.FreeHGlobal(bindings); }
 
-            Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X}");
+            Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X} thumb=0x{_thumbAction:X}");
         }
         catch (Exception ex) { Log.LogWarning($"  SetupActionSetsInstance: {ex}"); }
     }
@@ -1515,27 +1501,13 @@ public static class OpenXRManager
     /// </summary>
     public static bool SyncActions()
     {
-        if (!ActionSetsReady || _pfnSyncActions == IntPtr.Zero || _session == 0) return false;
+        if (!ActionSetsReady || _dSyncActions == null || _session == 0) return false;
         try
         {
-            // XrActiveActionSet: actionSet(8)+subactionPath(8) = 16 bytes  (XR_NULL_PATH = 0)
-            IntPtr aas = Marshal.AllocHGlobal(16);
-            // XrActionsSyncInfo: type(61)+pad(4)+next(8)+count(4)+pad(4)+activeSets*(8) = 32
-            IntPtr si  = Marshal.AllocHGlobal(32);
-            try
-            {
-                Marshal.WriteInt64(aas, 0, (long)_actionSet);
-                Marshal.WriteInt64(aas, 8, 0);  // XR_NULL_PATH
-                for (int i = 0; i < 32; i++) Marshal.WriteByte(si, i, 0);
-                Marshal.WriteInt32(si,  0, 61); // XR_TYPE_ACTIONS_SYNC_INFO
-                Marshal.WriteInt32(si, 16, 1);  // countActiveSets
-                Marshal.WriteIntPtr(si, 24, aas);
-                int rc = Marshal.GetDelegateForFunctionPointer<XrSyncActionsDelegate>
-                    (_pfnSyncActions)(_session, si);
-                if (_syncLogCount < 3) { _syncLogCount++; Log.LogInfo($"  xrSyncActions rc={rc}"); }
-                return rc == 0;
-            }
-            finally { Marshal.FreeHGlobal(si); Marshal.FreeHGlobal(aas); }
+            // _bSyncInfo and _bSyncAas pre-filled with actionSet in FinalizePerFrameBuffers.
+            int rc = _dSyncActions(_session, _bSyncInfo);
+            if (_syncLogCount < 3) { _syncLogCount++; Log.LogInfo($"  xrSyncActions rc={rc}"); }
+            return rc == 0;
         }
         catch (Exception ex) { Log.LogWarning($"  SyncActions: {ex.Message}"); return false; }
     }
@@ -1550,40 +1522,32 @@ public static class OpenXRManager
     {
         orientation = UnityEngine.Quaternion.identity;
         position    = UnityEngine.Vector3.zero;
-        if (!ActionSetsReady || _pfnLocateSpace == IntPtr.Zero) return false;
+        if (!ActionSetsReady || _dLocateSpace == null) return false;
         ulong space = right ? _rightAimSpace : _leftAimSpace;
         if (space == 0 || ReferenceSpace == 0) return false;
         try
         {
-            // XrSpaceLocation: type(42)+pad(4)+next(8)+locationFlags(8)+pose(28) = 52, pad to 56
-            const int sz = 56;
-            IntPtr loc = Marshal.AllocHGlobal(sz);
-            try
+            // _bSpaceLocation pre-allocated; type=42 pre-filled.
+            // Runtime overwrites locationFlags and pose fields — no pre-zeroing needed.
+            int rc = _dLocateSpace(space, ReferenceSpace, displayTime, _bSpaceLocation);
+            ulong flags = (ulong)Marshal.ReadInt64(_bSpaceLocation, 16);
+            if (_poseLogCount < 3)
             {
-                for (int i = 0; i < sz; i++) Marshal.WriteByte(loc, i, 0);
-                Marshal.WriteInt32(loc, 0, 42); // XR_TYPE_SPACE_LOCATION
-                int rc = Marshal.GetDelegateForFunctionPointer<XrLocateSpaceDelegate>
-                    (_pfnLocateSpace)(space, ReferenceSpace, displayTime, loc);
-                ulong flags = (ulong)Marshal.ReadInt64(loc, 16);
-                if (_poseLogCount < 3)
-                {
-                    _poseLogCount++;
-                    Log.LogInfo($"  xrLocateSpace rc={rc} flags=0x{flags:X} t={displayTime}");
-                }
-                if (rc != 0) return false;
-                // XR_SPACE_LOCATION_ORIENTATION_VALID_BIT=1, XR_SPACE_LOCATION_POSITION_VALID_BIT=2
-                if ((flags & 3) != 3) return false;
-                // pose: orientation{x,y,z,w} at +24, position{x,y,z} at +40
-                orientation.x = ReadFloat(loc, 24);
-                orientation.y = ReadFloat(loc, 28);
-                orientation.z = ReadFloat(loc, 32);
-                orientation.w = ReadFloat(loc, 36);
-                position.x    = ReadFloat(loc, 40);
-                position.y    = ReadFloat(loc, 44);
-                position.z    = ReadFloat(loc, 48);
-                return true;
+                _poseLogCount++;
+                Log.LogInfo($"  xrLocateSpace rc={rc} flags=0x{flags:X} t={displayTime}");
             }
-            finally { Marshal.FreeHGlobal(loc); }
+            if (rc != 0) return false;
+            // XR_SPACE_LOCATION_ORIENTATION_VALID_BIT=1, XR_SPACE_LOCATION_POSITION_VALID_BIT=2
+            if ((flags & 3) != 3) return false;
+            // pose: orientation{x,y,z,w} at +24, position{x,y,z} at +40
+            orientation.x = ReadFloat(_bSpaceLocation, 24);
+            orientation.y = ReadFloat(_bSpaceLocation, 28);
+            orientation.z = ReadFloat(_bSpaceLocation, 32);
+            orientation.w = ReadFloat(_bSpaceLocation, 36);
+            position.x    = ReadFloat(_bSpaceLocation, 40);
+            position.y    = ReadFloat(_bSpaceLocation, 44);
+            position.z    = ReadFloat(_bSpaceLocation, 48);
+            return true;
         }
         catch (Exception ex) { Log.LogWarning($"  GetControllerPose: {ex.Message}"); return false; }
     }
@@ -1595,32 +1559,42 @@ public static class OpenXRManager
     public static bool GetTriggerState(bool right, out bool pressed)
     {
         pressed = false;
-        if (!ActionSetsReady || _pfnGetActionStateBoolean == IntPtr.Zero || _triggerAction == 0) return false;
+        if (!ActionSetsReady || _dGetActionStateBool == null || _triggerAction == 0) return false;
         try
         {
-            // XrActionStateGetInfo: type(58)+pad(4)+next(8)+action(8)+subactionPath(8) = 32
-            IntPtr gi = Marshal.AllocHGlobal(32);
-            // XrActionStateBoolean: type(23)+pad(4)+next(8)+currentState(4)+changed(4)+lastChangeTime(8)+isActive(4)+pad(4) = 40
-            IntPtr st = Marshal.AllocHGlobal(40);
-            try
-            {
-                for (int i = 0; i < 32; i++) Marshal.WriteByte(gi, i, 0);
-                Marshal.WriteInt32(gi,  0, 58); // XR_TYPE_ACTION_STATE_GET_INFO
-                Marshal.WriteInt64(gi, 16, (long)_triggerAction);
-                Marshal.WriteInt64(gi, 24, (long)(right ? _rightHandPath : _leftHandPath));
-
-                for (int i = 0; i < 40; i++) Marshal.WriteByte(st, i, 0);
-                Marshal.WriteInt32(st, 0, 23); // XR_TYPE_ACTION_STATE_BOOLEAN
-
-                int rc = Marshal.GetDelegateForFunctionPointer<XrGetActionStateBooleanDelegate>
-                    (_pfnGetActionStateBoolean)(_session, gi, st);
-                if (rc == 0)
-                    pressed = Marshal.ReadInt32(st, 16) != 0; // currentState at +16
-                return rc == 0;
-            }
-            finally { Marshal.FreeHGlobal(gi); Marshal.FreeHGlobal(st); }
+            // _bActionGi shared for trigger+thumbstick (sequential main-thread calls only).
+            // Only dynamic fields: action handle and subaction path.
+            Marshal.WriteInt64(_bActionGi, 16, (long)_triggerAction);
+            Marshal.WriteInt64(_bActionGi, 24, (long)(right ? _rightHandPath : _leftHandPath));
+            int rc = _dGetActionStateBool(_session, _bActionGi, _bActionStateBool);
+            if (rc == 0)
+                pressed = Marshal.ReadInt32(_bActionStateBool, 16) != 0; // currentState at +16
+            return rc == 0;
         }
         catch (Exception ex) { Log.LogWarning($"  GetTriggerState: {ex.Message}"); return false; }
+    }
+
+    /// <summary>
+    /// Returns the thumbstick X/Y axes for the given hand (-1..1 each).
+    /// Returns false (with x=y=0) if action sets aren't ready or thumbstick hasn't moved.
+    /// </summary>
+    public static bool GetThumbstickState(bool right, out float x, out float y)
+    {
+        x = 0f; y = 0f;
+        if (!ActionSetsReady || _dGetActionStateVec2 == null || _thumbAction == 0) return false;
+        try
+        {
+            Marshal.WriteInt64(_bActionGi, 16, (long)_thumbAction);
+            Marshal.WriteInt64(_bActionGi, 24, (long)(right ? _rightHandPath : _leftHandPath));
+            int rc = _dGetActionStateVec2(_session, _bActionGi, _bActionStateVec2);
+            if (rc == 0)
+            {
+                x = ReadFloat(_bActionStateVec2, 16); // currentState.x
+                y = ReadFloat(_bActionStateVec2, 20); // currentState.y
+            }
+            return rc == 0;
+        }
+        catch (Exception ex) { Log.LogWarning($"  GetThumbstickState: {ex.Message}"); return false; }
     }
 
     private static float ReadFloat(IntPtr p, int offset)
@@ -1628,6 +1602,117 @@ public static class OpenXRManager
 
     private static void WriteFloat(IntPtr p, int offset, float value)
         => Marshal.WriteInt32(p, offset, BitConverter.SingleToInt32Bits(value));
+
+    private static unsafe void Zero(IntPtr p, int n)
+        { byte* b = (byte*)p; for (int i = 0; i < n; i++) b[i] = 0; }
+
+    /// <summary>
+    /// Caches all per-frame delegates and pre-allocates all unmanaged struct buffers used
+    /// in the hot render/input path. Call once after the last GetFn() and after session init.
+    /// Eliminates ~12 GetDelegateForFunctionPointer calls and ~20 AllocHGlobal/FreeHGlobal
+    /// calls per frame.
+    /// </summary>
+    private static void InitPerFrameResources()
+    {
+        // ── Delegate cache ────────────────────────────────────────────────────
+        if (_pfnWaitFrame != IntPtr.Zero)
+            _dWaitFrame = Marshal.GetDelegateForFunctionPointer<XrWaitFrameDelegate>(_pfnWaitFrame);
+        if (_pfnBeginFrame != IntPtr.Zero)
+            _dBeginFrame = Marshal.GetDelegateForFunctionPointer<XrBeginFrameDelegate>(_pfnBeginFrame);
+        if (_pfnEndFrame != IntPtr.Zero)
+            _dEndFrame = Marshal.GetDelegateForFunctionPointer<XrEndFrameDelegate>(_pfnEndFrame);
+        if (_pfnLocateViews != IntPtr.Zero)
+            _dLocateViews = Marshal.GetDelegateForFunctionPointer<XrLocateViewsDelegate>(_pfnLocateViews);
+        if (_pfnAcquireSwapchainImage != IntPtr.Zero)
+            _dAcquireSwapchain = Marshal.GetDelegateForFunctionPointer<XrAcquireSwapchainImageDelegate>(_pfnAcquireSwapchainImage);
+        if (_pfnWaitSwapchainImage != IntPtr.Zero)
+            _dWaitSwapchain = Marshal.GetDelegateForFunctionPointer<XrWaitSwapchainImageDelegate>(_pfnWaitSwapchainImage);
+        if (_pfnReleaseSwapchainImage != IntPtr.Zero)
+            _dReleaseSwapchain = Marshal.GetDelegateForFunctionPointer<XrReleaseSwapchainImageDelegate>(_pfnReleaseSwapchainImage);
+        if (_pfnSyncActions != IntPtr.Zero)
+            _dSyncActions = Marshal.GetDelegateForFunctionPointer<XrSyncActionsDelegate>(_pfnSyncActions);
+        if (_pfnLocateSpace != IntPtr.Zero)
+            _dLocateSpace = Marshal.GetDelegateForFunctionPointer<XrLocateSpaceDelegate>(_pfnLocateSpace);
+        if (_pfnGetActionStateBoolean != IntPtr.Zero)
+            _dGetActionStateBool = Marshal.GetDelegateForFunctionPointer<XrGetActionStateBooleanDelegate>(_pfnGetActionStateBoolean);
+        if (_pfnGetActionStateVector2f != IntPtr.Zero)
+            _dGetActionStateVec2 = Marshal.GetDelegateForFunctionPointer<XrGetActionStateVector2fDelegate>(_pfnGetActionStateVector2f);
+
+        Log.LogInfo("[OpenXR] InitPerFrameResources: delegates cached.");
+
+        // ── Buffer pre-allocation ─────────────────────────────────────────────
+        // Frame loop buffers
+        _bFrameWaitInfo  = Marshal.AllocHGlobal(16);  Zero(_bFrameWaitInfo,  16);
+        _bFrameState     = Marshal.AllocHGlobal(40);  Zero(_bFrameState,     40);
+        _bFrameBeginInfo = Marshal.AllocHGlobal(16);  Zero(_bFrameBeginInfo, 16);
+        _bFrameEndInfo   = Marshal.AllocHGlobal(40);  Zero(_bFrameEndInfo,   40);
+        _bProjViews      = Marshal.AllocHGlobal(192); Zero(_bProjViews,      192);
+        _bProjLayer      = Marshal.AllocHGlobal(48);  Zero(_bProjLayer,      48);
+        _bLayerPtr       = Marshal.AllocHGlobal(IntPtr.Size);
+        _bViewLocateInfo = Marshal.AllocHGlobal(40);  Zero(_bViewLocateInfo, 40);
+        _bViewState      = Marshal.AllocHGlobal(24);  Zero(_bViewState,      24);
+        _bViewBuffer     = Marshal.AllocHGlobal(128); Zero(_bViewBuffer,     128);
+        // Swapchain
+        _bAcquireInfo    = Marshal.AllocHGlobal(16);  Zero(_bAcquireInfo,    16);
+        _bWaitInfo2      = Marshal.AllocHGlobal(24);  Zero(_bWaitInfo2,      24);
+        _bReleaseInfo    = Marshal.AllocHGlobal(16);  Zero(_bReleaseInfo,    16);
+        // Action input
+        _bSyncAas        = Marshal.AllocHGlobal(16);  Zero(_bSyncAas,        16);
+        _bSyncInfo       = Marshal.AllocHGlobal(32);  Zero(_bSyncInfo,       32);
+        _bActionGi       = Marshal.AllocHGlobal(32);  Zero(_bActionGi,       32);
+        _bActionStateBool = Marshal.AllocHGlobal(40); Zero(_bActionStateBool,40);
+        _bActionStateVec2 = Marshal.AllocHGlobal(48); Zero(_bActionStateVec2,48);
+        _bLocSpaceInfo   = Marshal.AllocHGlobal(40);  Zero(_bLocSpaceInfo,   40);
+        _bSpaceLocation  = Marshal.AllocHGlobal(48);  Zero(_bSpaceLocation,  48);
+
+        // Write static header fields into buffers (only the fields that never change)
+        Marshal.WriteInt32(_bFrameWaitInfo,  0, 33); // XR_TYPE_FRAME_WAIT_INFO
+        Marshal.WriteInt32(_bFrameState,     0, 44); // XR_TYPE_FRAME_STATE
+        Marshal.WriteInt32(_bFrameBeginInfo, 0, 46); // XR_TYPE_FRAME_BEGIN_INFO
+        Marshal.WriteInt32(_bFrameEndInfo,   0, 12); // XR_TYPE_FRAME_END_INFO
+        Marshal.WriteInt32(_bFrameEndInfo,  24,  1); // environmentBlendMode = OPAQUE
+        Marshal.WriteInt32(_bFrameEndInfo,  28,  1); // layerCount = 1
+        Marshal.WriteIntPtr(_bFrameEndInfo, 32, _bLayerPtr); // layers** → _bLayerPtr → _bProjLayer
+        Marshal.WriteInt32(_bProjViews + 0,  0, 48); // XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW
+        Marshal.WriteInt32(_bProjViews + 96, 0, 48);
+        Marshal.WriteInt32(_bProjLayer,      0, 35); // XR_TYPE_COMPOSITION_LAYER_PROJECTION
+        Marshal.WriteInt32(_bProjLayer,     32,  2); // viewCount = 2
+        Marshal.WriteIntPtr(_bProjLayer,    40, _bProjViews);  // *views (fixed once)
+        Marshal.WriteIntPtr(_bLayerPtr,      0, _bProjLayer);  // single-element layers array
+        Marshal.WriteInt32(_bViewLocateInfo, 0,  6); // XR_TYPE_VIEW_LOCATE_INFO
+        Marshal.WriteInt32(_bViewLocateInfo,16,  2); // PRIMARY_STEREO
+        Marshal.WriteInt32(_bViewState,      0, 11); // XR_TYPE_VIEW_STATE
+        Marshal.WriteInt32(_bViewBuffer + 0,  0, 7); // XR_TYPE_VIEW
+        Marshal.WriteInt32(_bViewBuffer + 64, 0, 7);
+        Marshal.WriteInt32(_bAcquireInfo,    0, 55); // XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO
+        Marshal.WriteInt32(_bWaitInfo2,      0, 56); // XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO
+        Marshal.WriteInt64(_bWaitInfo2,     16, long.MaxValue); // XR_INFINITE_DURATION
+        Marshal.WriteInt32(_bReleaseInfo,    0, 57); // XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO
+        Marshal.WriteInt32(_bSyncInfo,       0, 61); // XR_TYPE_ACTIONS_SYNC_INFO
+        Marshal.WriteInt32(_bSyncInfo,      16,  1); // countActiveSets = 1
+        Marshal.WriteIntPtr(_bSyncInfo,     24, _bSyncAas);
+        Marshal.WriteInt32(_bActionGi,       0, 58); // XR_TYPE_ACTION_STATE_GET_INFO
+        Marshal.WriteInt32(_bActionStateBool,0, 23); // XR_TYPE_ACTION_STATE_BOOLEAN
+        Marshal.WriteInt32(_bActionStateVec2,0, 25); // XR_TYPE_ACTION_STATE_VECTOR2F
+        Marshal.WriteInt32(_bLocSpaceInfo,   0, 42); // XR_TYPE_SPACE_LOCATION (reuse for output)
+        Marshal.WriteInt32(_bSpaceLocation,  0, 42); // XR_TYPE_SPACE_LOCATION
+
+        Log.LogInfo("[OpenXR] InitPerFrameResources: buffers pre-allocated.");
+    }
+
+    /// <summary>
+    /// Fills session-dependent values into the pre-allocated buffers.
+    /// Must be called after ReferenceSpace and _actionSet are both known
+    /// (i.e. at end of SetupStereo, after xrCreateReferenceSpace and SetupActionSetsInstance).
+    /// </summary>
+    private static void FinalizePerFrameBuffers()
+    {
+        if (_bViewLocateInfo == IntPtr.Zero) return; // InitPerFrameResources not yet called
+        Marshal.WriteInt64(_bViewLocateInfo, 32, (long)ReferenceSpace); // space at +32
+        Marshal.WriteInt64(_bProjLayer, 24, (long)ReferenceSpace);      // space at +24
+        Marshal.WriteInt64(_bSyncAas, 0, (long)_actionSet);             // actionSet at +0
+        Log.LogInfo($"[OpenXR] FinalizePerFrameBuffers: refSpace=0x{ReferenceSpace:X} actionSet=0x{_actionSet:X}");
+    }
 
     private static unsafe void DumpVtableFunctions()
     {
@@ -1772,25 +1857,12 @@ public static class OpenXRManager
     private static long FrameWait(out int rc)
     {
         rc = -1;
-        if (_pfnWaitFrame == IntPtr.Zero || _session == 0) return 0;
+        if (_dWaitFrame == null || _session == 0) return 0;
         try
         {
-            // XrFrameWaitInfo: type(4) pad(4) next(8) = 16 bytes
-            IntPtr waitInfo = Marshal.AllocHGlobal(16);
-            for (int i = 0; i < 16; i++) Marshal.WriteByte(waitInfo, i, 0);
-            Marshal.WriteInt32(waitInfo, 0, 33); // XR_TYPE_FRAME_WAIT_INFO = 33
-
-            // XrFrameState: type(4) pad(4) next(8) predictedDisplayTime(8) predictedDisplayPeriod(8) shouldRender(4) pad(4) = 40 bytes
-            IntPtr frameState = Marshal.AllocHGlobal(40);
-            for (int i = 0; i < 40; i++) Marshal.WriteByte(frameState, i, 0);
-            Marshal.WriteInt32(frameState, 0, 44); // XR_TYPE_FRAME_STATE = 44
-
-            rc = Marshal.GetDelegateForFunctionPointer<XrWaitFrameDelegate>(_pfnWaitFrame)(_session, waitInfo, frameState);
-            long displayTime = Marshal.ReadInt64(frameState, 16); // predictedDisplayTime at offset 16
-
-            Marshal.FreeHGlobal(waitInfo);
-            Marshal.FreeHGlobal(frameState);
-            return displayTime;
+            // Pre-allocated buffers; static headers written once in InitPerFrameResources.
+            rc = _dWaitFrame(_session, _bFrameWaitInfo, _bFrameState);
+            return Marshal.ReadInt64(_bFrameState, 16); // predictedDisplayTime at +16
         }
         catch (Exception ex) { Log.LogWarning($"  FrameWait: {ex.Message}"); return 0; }
     }
@@ -1798,15 +1870,10 @@ public static class OpenXRManager
     private static long FrameBegin(out int rc)
     {
         rc = -1;
-        if (_pfnBeginFrame == IntPtr.Zero || _session == 0) return -1;
+        if (_dBeginFrame == null || _session == 0) return -1;
         try
         {
-            // XrFrameBeginInfo: type(4) pad(4) next(8) = 16 bytes
-            IntPtr beginInfo = Marshal.AllocHGlobal(16);
-            for (int i = 0; i < 16; i++) Marshal.WriteByte(beginInfo, i, 0);
-            Marshal.WriteInt32(beginInfo, 0, 46); // XR_TYPE_FRAME_BEGIN_INFO = 46
-            rc = Marshal.GetDelegateForFunctionPointer<XrBeginFrameDelegate>(_pfnBeginFrame)(_session, beginInfo);
-            Marshal.FreeHGlobal(beginInfo);
+            rc = _dBeginFrame(_session, _bFrameBeginInfo);
             return rc;
         }
         catch (Exception ex) { Log.LogWarning($"  FrameBegin: {ex.Message}"); return -1; }
@@ -1815,19 +1882,22 @@ public static class OpenXRManager
     private static long FrameEnd(long displayTime, out int rc)
     {
         rc = -1;
-        if (_pfnEndFrame == IntPtr.Zero || _session == 0) return -1;
+        if (_dEndFrame == null || _session == 0) return -1;
         try
         {
-            // XrFrameEndInfo: type(4) pad(4) next(8) displayTime(8) blendMode(4) layerCount(4) layers(8) = 40 bytes
-            IntPtr endInfo = Marshal.AllocHGlobal(40);
-            for (int i = 0; i < 40; i++) Marshal.WriteByte(endInfo, i, 0);
-            Marshal.WriteInt32(endInfo,  0, 12);           // XR_TYPE_FRAME_END_INFO = 12
-            Marshal.WriteInt64(endInfo, 16, displayTime);
-            Marshal.WriteInt32(endInfo, 24, 1);            // XR_ENVIRONMENT_BLEND_MODE_OPAQUE = 1
-            Marshal.WriteInt32(endInfo, 28, 0);            // layerCount = 0
-            Marshal.WriteIntPtr(endInfo, 32, IntPtr.Zero);
-            rc = Marshal.GetDelegateForFunctionPointer<XrEndFrameDelegate>(_pfnEndFrame)(_session, endInfo);
-            Marshal.FreeHGlobal(endInfo);
+            // Reuse _bFrameEndInfo with layerCount=0 override (background frame thread, no layers).
+            // type=12, blendMode=1 already set; we override layerCount and layers* temporarily.
+            // Note: this function runs ONLY on the background frame thread (pre-stereo), so no
+            // contention with FrameEndStereo / FrameEndEmpty which run on the main thread.
+            IntPtr ei = Marshal.AllocHGlobal(40); // still alloc here — this is pre-stereo path only
+            for (int i = 0; i < 40; i++) Marshal.WriteByte(ei, i, 0);
+            Marshal.WriteInt32(ei,  0, 12);
+            Marshal.WriteInt64(ei, 16, displayTime);
+            Marshal.WriteInt32(ei, 24, 1);
+            Marshal.WriteInt32(ei, 28, 0);
+            Marshal.WriteIntPtr(ei, 32, IntPtr.Zero);
+            rc = _dEndFrame(_session, ei);
+            Marshal.FreeHGlobal(ei);
             return rc;
         }
         catch (Exception ex) { Log.LogWarning($"  FrameEnd: {ex.Message}"); return -1; }

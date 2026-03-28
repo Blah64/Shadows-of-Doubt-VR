@@ -60,6 +60,10 @@
       <HintPath>$(InteropDir)\UnityEngine.UIModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="UnityEngine.AudioModule">
+      <HintPath>$(InteropDir)\UnityEngine.AudioModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="UnityEngine.InputLegacyModule">
       <HintPath>$(InteropDir)\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>false</Private>
@@ -74,6 +78,10 @@
     </Reference>
     <Reference Include="Unity.TextMeshPro">
       <HintPath>$(InteropDir)\Unity.TextMeshPro.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="FMODUnity">
+      <HintPath>$(InteropDir)\FMODUnity.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>

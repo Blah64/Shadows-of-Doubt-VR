@@ -94,6 +94,8 @@ and sets their `disable_environment` variables.
 - `renderQueue` in HDRP Transparent: HDRP ignores fine-grained queue ordering; always sorts by spherical distance
 - `Resources.FindObjectsOfTypeAll<Canvas>()` more reliable than `FindObjectsOfType<Canvas>()` in IL2CPP
 - TMP hides `Graphic.color` with `new color` — must use `g.TryCast<TMP_Text>().color` to set vertex color
+- `AddComponent<RectTransform>()` on a freshly created `new GameObject()` **returns null** in IL2CPP (Transform already exists). Instead: `AddComponent<Image>()` first, then `GetComponent<RectTransform>()`.
+- VRMod-owned GameObjects (cursor canvas, settings panel) **must** have `DontDestroyOnLoad()` — the loading→menu scene transition destroys all non-persistent objects, silently invalidating cached Unity object references.
 
 ## CRITICAL: HDRP exposure — confirmed broken for per-camera override (2026-03-27)
 **This is the current blocking problem for UI brightness.**
@@ -110,14 +112,25 @@ What was tried and confirmed NOT working:
 2. CommandBuffer to overwrite HDRP's 1×1 exposure texture to neutral (log2=0) before the UI camera's post-process pass
 3. Read HDRP's live exposure value via `HDCamera` internals and apply compensating vertex-colour boost
 
-## Phase 6 UI canvas status (PARTIAL)
+## Phase 6 UI canvas status (COMPLETE)
 - All canvases converted to WorldSpace each 30-frame scan ✓
 - Canvases placed in front of head on first valid pose; stay fixed ✓
 - **Home key** re-centres all canvases ✓
-- TMP text: vertex colour = white via `TMP_Text.color`; SDF shader swapped to `UI/Default` with `_TextureSampleAdd=(1,1,1,0)` — all data confirmed correct by End-key diagnostic dump ✓
-- **Button text too dark** — correct data but exposure darkens output (root cause above)
-- **Options/settings text invisible** — likely a second font not yet shader-swapped when panel first opens; RescanCanvasAlpha catches it within 30 frames but may be incomplete
-- No controller pointer / raycaster yet
+- TMP text: vertex colour = white, shader = UI/Default, TSA=(1,1,1,0) ✓
+- **Button/menu text still dark** — HDRP auto-exposure issue (see HANDOVER.md §UI Brightness; not yet solved)
+
+## Phase 7 controller input status (COMPLETE)
+- Right controller pose tracked via OpenXR action sets ✓
+- Trigger fires `ExecuteEvents` pointer-click on closest canvas hit ✓
+- **Cursor dot** (`VRCursorCanvasInternal`) visible on all screens including post-scene-load menu ✓
+  - Canvas NOT in `_ownedCanvasIds` → `RescanCanvasAlpha` applies ZTest Always material patch (makes it visible despite exposure)
+  - `DontDestroyOnLoad` on cursor GO — survives loading→menu scene transition
+  - Dot moves via `anchoredPosition` (2D projection onto canvas plane at `UIDistance`)
+  - `_cursorCanvas` cached directly at `BuildCameraRig` time — never rely on name-lookup in `PositionCanvases`
+
+## Phase 8 (current): VR Settings Panel
+- Phase 0 test canvas (`VRSettingsPanelInternal`, F10 to toggle) confirmed visible ✓
+- **Next**: Phase 1 — extract into `VRSettingsPanel.cs` with two tabs, per PLAN-Claude.md
 
 ## Known canvas names (from LogOutput.log, 2026-03-26)
 | Canvas | Elements | Notes |
@@ -134,5 +147,6 @@ What was tried and confirmed NOT working:
 ## History
 - git `1be2b0e` — full VDXR-internal patching approach (archived checkpoint, do not rebase)
 - git `346a6df` — **Phase 5 complete**: standard loader working, stereo image in headset
-- **Phase 6 (current)**: camera positioning ✓, head tracking ✓, UI canvases visible in VR ✓, UI brightness broken (both Volume and FrameSettings exposure bypass fail)
-- **Phase 7 (next)**: Fix UI brightness (HANDOVER.md §UI Brightness), then controller input
+- **Phase 6 complete**: camera positioning ✓, head tracking ✓, UI canvases visible in VR ✓
+- **Phase 7 complete**: controller pose ✓, trigger click ✓, cursor dot visible on all screens ✓
+- **Phase 8 (current)**: VR settings panel — Phase 0 test canvas confirmed ✓, Phase 1 next
