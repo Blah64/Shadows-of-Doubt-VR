@@ -116,8 +116,11 @@ public class VRCamera : MonoBehaviour
     private float _snapCooldown;
     private bool  _snapArmed = true;
 
-    // ── Movement discovery ────────────────────────────────────────────────────
-    private bool _movementDiscoveryDone;
+    // ── Movement discovery + locomotion ──────────────────────────────────────
+    private bool      _movementDiscoveryDone;
+    private Rigidbody? _playerRb;               // FPSController rigidbody, cached at discovery
+    private const float MoveDeadZone = 0.15f;
+    private const float MoveSpeed    = 4.0f;   // m/s at full deflection
     // Cursor: ScreenSpaceOverlay canvas "VRCursorCanvasInternal" created at rig-build time.
     // ScanAndConvertCanvases converts it to WorldSpace via the normal pipeline — giving it proper
     // HDRP registration and the ZTest Always material patch from RescanCanvasAlpha.
@@ -477,6 +480,7 @@ public class VRCamera : MonoBehaviour
             OpenXRManager.SyncActions();
             UpdateControllerPose(_displayTime);
             UpdateSnapTurn();
+            UpdateLocomotion();
         }
 
         // One-shot movement system discovery (runs once after stereo is ready and game cam found)
@@ -1642,6 +1646,8 @@ public class VRCamera : MonoBehaviour
                 string nm = g.gameObject.name;
                 bool isBg = nm.IndexOf("background", StringComparison.OrdinalIgnoreCase) >= 0;
                 bool isFade = nm.IndexOf("fade", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isCutSceneGraphic = nm.IndexOf("cutscene", StringComparison.OrdinalIgnoreCase) >= 0
+                                      || nm.IndexOf("video", StringComparison.OrdinalIgnoreCase) >= 0;
                 bool isText = IsTextGraphic(g);
 
                 if (isFade)
@@ -1652,7 +1658,14 @@ public class VRCamera : MonoBehaviour
                         _managedFades[fid] = g;
                         Log.LogInfo($"[VRCamera] FadeSuppress(rescan) '{nm}' on '{canvasName}'");
                     }
+                    // Immediately suppress; skip all material/boost work for fade graphics.
+                    if (g.color.a > 0f)
+                        g.color = new Color(g.color.r, g.color.g, g.color.b, 0f);
+                    continue;
                 }
+
+                // Skip cutscene/video images — their dynamic textures must not be patched.
+                if (isCutSceneGraphic) continue;
 
                 IntPtr ptr = g.Pointer;
                 if (!s_patchedGraphicPtrs.Contains(ptr))
@@ -1864,6 +1877,28 @@ public class VRCamera : MonoBehaviour
                 string nm = g.gameObject.name;
                 string shaderName = orig.shader?.name ?? "";
                 bool isBg = nm.IndexOf("background", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isFadeGraphic = nm.IndexOf("fade", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isCutScene = nm.IndexOf("cutscene", StringComparison.OrdinalIgnoreCase) >= 0
+                               || nm.IndexOf("video", StringComparison.OrdinalIgnoreCase) >= 0;
+                // Fade overlays and cutscene/video images must not receive material patches or
+                // brightness boosts — we manage fade alpha ourselves, and video textures break
+                // if their material is cloned.
+                if (isFadeGraphic || isCutScene)
+                {
+                    if (isFadeGraphic)
+                    {
+                        int fid = g.GetInstanceID();
+                        if (!_managedFades.ContainsKey(fid))
+                        {
+                            _managedFades[fid] = g;
+                            Log.LogInfo($"[VRCamera] FadeSuppress(ZTest) '{nm}' on '{canvas.gameObject.name}' (cur a={g.color.a:F2})");
+                        }
+                        // Immediately suppress — don't wait for PositionCanvases.
+                        if (g.color.a > 0f)
+                            g.color = new Color(g.color.r, g.color.g, g.color.b, 0f);
+                    }
+                    continue;
+                }
                 bool isAdditive = shaderName.IndexOf("Additive", StringComparison.OrdinalIgnoreCase) >= 0
                                || shaderName.IndexOf("Particle", StringComparison.OrdinalIgnoreCase) >= 0
                                || shaderName.IndexOf("Add", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -1952,27 +1987,6 @@ public class VRCamera : MonoBehaviour
         {
             Log.LogWarning($"[VRCamera] ForceUIZTestAlways '{canvas.gameObject.name}': {ex.GetType().Name}: {ex.Message}");
         }
-
-        try
-        {
-            var allG = canvas.GetComponentsInChildren<Graphic>(true);
-            foreach (var g in allG)
-            {
-                if (g == null) continue;
-                string nm = g.gameObject.name;
-                bool isFade = nm.IndexOf("fade", StringComparison.OrdinalIgnoreCase) >= 0;
-                if (isFade)
-                {
-                    int gid = g.GetInstanceID();
-                    if (!_managedFades.ContainsKey(gid))
-                    {
-                        _managedFades[gid] = g;
-                        Log.LogInfo($"[VRCamera] FadeSuppress '{nm}' on '{canvas.gameObject.name}' (cur a={g.color.a:F2})");
-                    }
-                }
-            }
-        }
-        catch { }
 
         int canvasId = canvas.GetInstanceID();
         if (logQueueMap && _queueMapLogged.Add(canvasId))
@@ -2283,6 +2297,38 @@ public class VRCamera : MonoBehaviour
     /// CharacterController / Rigidbody / RigidbodyFirstPersonController.
     /// Results are read from LogOutput.log to choose the locomotion approach.
     /// </summary>
+    /// <summary>
+    /// Drives the player character via left thumbstick. Head-relative: forward/back follows
+    /// HMD yaw, strafe follows HMD right. Preserves Rigidbody Y velocity (gravity/jumping).
+    /// Skipped when VR settings panel is open.
+    /// </summary>
+    private void UpdateLocomotion()
+    {
+        if (_playerRb == null) return;
+        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+
+        if (!OpenXRManager.GetThumbstickState(false, out float lx, out float ly)) return;
+        if (Mathf.Abs(lx) <= MoveDeadZone && Mathf.Abs(ly) <= MoveDeadZone)
+        {
+            // No stick input — let the game own horizontal velocity fully
+            return;
+        }
+
+        // Apply dead-zone scaling so motion starts smoothly at the threshold
+        float dx = Mathf.Abs(lx) > MoveDeadZone ? lx : 0f;
+        float dy = Mathf.Abs(ly) > MoveDeadZone ? ly : 0f;
+
+        // Head-relative direction: use HMD yaw (left eye camera world yaw)
+        float headYaw = _leftCam != null ? _leftCam.transform.eulerAngles.y : transform.eulerAngles.y;
+        Vector3 fwd   = Quaternion.Euler(0f, headYaw, 0f) * Vector3.forward;
+        Vector3 right = Quaternion.Euler(0f, headYaw, 0f) * Vector3.right;
+
+        Vector3 hMove = (fwd * dy + right * dx) * MoveSpeed;
+
+        // Preserve vertical velocity so gravity and jumping are unaffected
+        _playerRb.velocity = new Vector3(hMove.x, _playerRb.velocity.y, hMove.z);
+    }
+
     private void DiscoverMovementSystem()
     {
         _movementDiscoveryDone = true;
@@ -2316,7 +2362,7 @@ public class VRCamera : MonoBehaviour
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] Player0: {ex.Message}"); }
 
-        // 3. Walk up from game camera to find CharacterController / Rigidbody
+        // 3. Walk up from game camera to find CharacterController / Rigidbody; cache RB for locomotion
         try
         {
             var t = _gameCam;
@@ -2325,7 +2371,13 @@ public class VRCamera : MonoBehaviour
                 var cc = t.GetComponent<CharacterController>();
                 var rb = t.GetComponent<Rigidbody>();
                 Log.LogInfo($"[Movement] Ancestor[{i}] '{t.gameObject.name}': CC={cc != null} RB={rb != null}");
-                if (cc != null || rb != null) break;
+                if (rb != null)
+                {
+                    _playerRb = rb;
+                    Log.LogInfo($"[Movement] Cached playerRb on '{t.gameObject.name}'");
+                    break;
+                }
+                if (cc != null) break; // CC but no RB — won't use velocity approach
                 t = t.parent;
             }
         }
