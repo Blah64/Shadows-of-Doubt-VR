@@ -92,13 +92,39 @@ applied at scan time. Actual case-board content lives elsewhere.
 
 ---
 
-## Next Priority: World Graphics
+## Next Priority: Phase 11 — Movement
 
-The user has flagged world graphics as the next issue to fix. Details to be determined
-at the start of the next session. Likely candidates:
-- In-world 3D objects affected by VR rendering (exposure, culling, layering)
-- Floating world-space UI (interaction prompts, overhead labels) broken or invisible
-- Main camera suppression (`cullingMask=0`) side-effects on game world rendering
+The movement infrastructure already exists in VRCamera.cs but has not been fully tested since Phase 10. Specific tasks:
+
+### 11a — Verify locomotion and snap turn (test first)
+- Load into game world, try left stick to walk → should move via `CharacterController.Move()`
+- Try right stick X → should snap-turn ±30°
+- Check logs: `[Movement] Cached playerCC on '...'` should appear after game cam found
+- If playerCC not found: `DiscoverMovementSystem()` walk-up from game cam may be failing — check log
+
+### 11b — Jump (not implemented)
+- Need: new OpenXR boolean action for right-hand A button
+- Binding: `/user/hand/right/input/a/click`
+- Add `_jumpAction` to OpenXRManager, `GetJumpButtonState()` public API
+- Implement `UpdateJump()` in VRCamera: detect press edge, simulate Space key (`keybd_event(0x20, ...)`)
+- OR inject directly: call game's jump method via Rewired axis injection if CharacterController approach isn't reliable
+
+### 11c — World interact (not implemented)
+- In-game 'E' to interact with objects/doors/NPCs
+- Suggested binding: right A button for jump, right grip button or left trigger for interact
+- Implement `UpdateInteract()` in VRCamera: detect press edge, simulate 'E' key (`keybd_event(0x45, ...)`)
+
+### 11d — Controller binding review
+| Action | Button | Status |
+|--------|--------|--------|
+| UI click | Right trigger | Working ✓ |
+| Locomotion | Left stick | Implemented, needs test |
+| Snap turn | Right stick X | Implemented, needs test |
+| Menu/ESC | Left Y/menu | Working ✓ |
+| Jump | Right A | **Not bound** |
+| World interact | TBD | **Not bound** |
+| Left trigger | Unbound | Could be: crouch? interact? |
+| Both grips | Bound but unused | Could be: run/sprint? |
 
 ---
 

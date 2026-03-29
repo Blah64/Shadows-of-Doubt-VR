@@ -140,7 +140,15 @@ Legacy mobile shader does not render in HDRP WorldSpace pipeline.
 Any material whose shader name contains "Additive", "Particle", or "Add" (`isAdditive`) has
 its shader replaced with `UI/Default` at material-creation time. Icons/borders/glows now visible.
 
-## Phase 9 status (COMPLETE — 2026-03-29)
+## CRITICAL: HDRP flipYMode for Camera.Render() to RenderTexture (Phase 10)
+
+When manually calling `Camera.Render()` to a RenderTexture in HDRP:
+- **DO NOT** combine `GL.invertCulling = true` with projection matrix Y-negation — both reverse clip-space winding → double-correction → front-faces culled → walls/floors invisible.
+- **DO** set `HDAdditionalCameraData.flipYMode = HDAdditionalCameraData.FlipYMode.ForceFlipY` — HDRP handles both image Y-flip AND face culling correction atomically.
+- VR eye cameras **must** copy the game camera's `HDAdditionalCameraData` settings at runtime, especially `volumeLayerMask` (controls which HDRP Volumes affect the camera). Without it, VR cameras won't pick up scene lighting/sky/fog → dark/unlit rendering.
+- `CopyGameCameraSettings(Camera src, Camera dst)` in VRCamera.cs does this when the game camera is found.
+
+## Phase 10 status (COMPLETE — 2026-03-30)
 - Stereo rendering, head tracking, swapchain: **working** ✓
 - UI canvases WorldSpace, placed in front of head: **working** ✓
 - Trigger click, cursor tracking: **working** ✓
@@ -151,6 +159,25 @@ its shader replaced with `UI/Default` at material-creation time. Icons/borders/g
 - Notebook/notes sizing (ScaleFix): **working** ✓
 - Crash prevention (rescan rate-limit, material cache cap): **working** ✓
 - CaseCanvas bright white background: **disabled** ✓
+- **World graphics (walls, floors, lighting): working** ✓ (Phase 10)
+
+## Phase 11 movement status (IN PROGRESS)
+
+Already implemented in VRCamera.cs — **needs functional testing**:
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Thumbstick locomotion | Implemented | Left stick → `CharacterController.Move()` at 4 m/s |
+| Snap turn | Implemented | Right stick X → ±30° VROrigin rotation |
+| Menu button (ESC) | Working ✓ | Left Y/menu → ESC key simulation |
+| Jump | **Not implemented** | Needs A button binding in OpenXRManager |
+| World interact | **Not implemented** | Needs button binding → 'E' key simulation |
+
+OpenXR actions currently bound in OpenXRManager.cs:
+- `_poseAction` — both hand aim poses
+- `_triggerAction` — both triggers (right = UI click)
+- `_thumbAction` — both thumbsticks (left = locomotion, right = snap turn)
+- `_gripAction` — both grips (unused beyond binding)
+- `_menuButtonAction` — left Y + left menu button → ESC
 
 ## Known canvas names (from LogOutput.log)
 | Canvas | Size | Status |
@@ -174,5 +201,5 @@ its shader replaced with `UI/Default` at material-creation time. Icons/borders/g
 - **Phase 7 complete**: controller pose ✓, trigger click ✓, cursor dot tracking ✓
 - **Phase 8 complete** (git `12172ad`): VR settings panel ✓ — 4 tabs, all settings wired, FMOD audio, Settings button intercept
 - **Phase 9 complete** (2026-03-29): All canvas/UI issues resolved — see HANDOVER.md for full details
-- **Phase 10 (current)**: World graphics — TBD
-- **Phase 11**: Movement — thumbstick locomotion, snap turn, jump, interact bindings
+- **Phase 10 complete** (2026-03-30): World graphics — flipYMode + HDRP Volume config fix (`546a4b5`)
+- **Phase 11 (current)**: Movement — locomotion testing + jump + world interact bindings
