@@ -1,11 +1,36 @@
 # SoDVR — Technical Handover
 
-**Date**: 2026-03-29 (updated end of session)
-**Phase**: 9 complete (UI canvas polish) — next priority: world graphics
+**Date**: 2026-03-30 (updated end of Phase 10)
+**Phase**: 10 complete (world graphics) — next priority: movement/locomotion
+
+---
+
+## Phase 10: World Graphics — COMPLETE ✓
+
+**Problem**: Walls, floors invisible. Lighting broken (dark areas fully lit).
+
+**Root Cause**:
+1. VR cameras had default HDRP Volume configuration → no scene lighting
+2. GL.invertCulling + projection Y-negate caused double face-winding reversal → front-faces culled
+
+**Solution**:
+1. **Copy game camera HDRP settings** to VR eye cameras:
+   - `volumeLayerMask` (most critical — ensures Volume influence)
+   - `probeLayerMask`, `clearColorMode`, `backgroundColorHDR`
+   - `cullingMask`, `nearClipPlane`, `farClipPlane`
+
+2. **Use `HDAdditionalCameraData.flipYMode = ForceFlipY`**:
+   - HDRP handles both Y-flip and culling correction internally
+   - Replaces hacky GL.invertCulling + projection Y-negate
+   - Single atomic operation → no winding double-correction
+
+**Result**: ✓ Walls visible ✓ Floors visible ✓ Lighting works ✓ Right-side-up
 
 ---
 
 ## What Was Fixed This Session
+
+### Phase 10: World graphics — FIXED ✓
 
 ### CanvasScaler inflation — FIXED ✓
 `ConvertCanvasToWorldSpace` now disables CanvasScaler before switching to WorldSpace.
@@ -145,6 +170,13 @@ Must be disabled before `xrCreateInstance` — see `DisableUnityOpenXRLayer()` i
 ### Swapchain format
 `RenderTextureFormat.ARGB32` → format 28 (`DXGI_FORMAT_R8G8B8A8_UNORM`). `_preferredFormats = {28,29,87,91}`.
 
+### CRITICAL: HDRP flipYMode for RenderTexture rendering (Phase 10)
+When manually calling `Camera.Render()` to a RenderTexture in HDRP:
+- **DO NOT use**: `GL.invertCulling = true` + projection Y-negation together. Both reverse clip-space winding → double-correction → front-faces culled → walls invisible.
+- **DO use**: `HDAdditionalCameraData.flipYMode = ForceFlipY`. HDRP handles both image Y-flip AND culling correction atomically.
+- VR eye cameras MUST copy game camera's HDRP settings, especially `volumeLayerMask` (controls which Volumes provide lighting/sky).
+- Without correct `volumeLayerMask`, VR cameras won't pick up scene lighting/exposure/fog → rendering appears dark/unlit.
+
 ---
 
 ## IL2CPP Interop Pitfalls
@@ -202,7 +234,7 @@ FMODUnity.RuntimeManager.GetVCA("vca:/Soundtrack").setVolume(vol);   // per-chan
 - [x] Phase 7: Controller pose + trigger click + cursor dot tracking
 - [x] Phase 8: VR Settings Panel — 4 tabs, FMOD audio, Settings button intercept (`12172ad`)
 - [x] **Phase 9**: Canvas sizes fixed, UI text/icons visible, crash prevention, notebook sizing
-- [ ] **Phase 10 (current)**: World graphics — TBD
-- [ ] Phase 11: Movement — thumbstick locomotion, snap turn, jump, interact bindings
+- [x] **Phase 10**: World graphics — walls/floors visible, lighting correct, HDRP Volume config (`546a4b5`)
+- [ ] **Phase 11 (next)**: Movement — thumbstick locomotion, snap turn, jump, interact bindings
 - [ ] Phase 12: Comfort options (vignette, snap-turn degrees, IPD)
 - [ ] Phase 13: Left controller full tracking + dual-hand interactions
