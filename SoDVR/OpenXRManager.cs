@@ -53,7 +53,7 @@ public static class OpenXRManager
     private static IntPtr _pfnCreateActionSpace, _pfnAttachSessionActionSets;
     private static IntPtr _pfnSyncActions, _pfnLocateSpace, _pfnGetActionStateBoolean;
     private static IntPtr _pfnGetActionStateVector2f;
-    private static ulong  _actionSet, _poseAction, _triggerAction, _thumbAction, _menuButtonAction;
+    private static ulong  _actionSet, _poseAction, _triggerAction, _thumbAction, _menuButtonAction, _gripAction;
     private static ulong  _rightAimSpace, _leftAimSpace;
     private static ulong  _rightHandPath, _leftHandPath;
     public  static bool   ActionSetsReady { get; private set; }
@@ -1404,6 +1404,7 @@ public static class OpenXRManager
             _poseAction        = CreateAction("hand_pose",    "Hand Pose",    4, _leftHandPath, _rightHandPath);
             _triggerAction     = CreateAction("trigger",      "Trigger",      1, _leftHandPath, _rightHandPath);
             _thumbAction       = CreateAction("thumbstick",   "Thumbstick",   3, _leftHandPath, _rightHandPath);
+            _gripAction        = CreateAction("grip",         "Grip",         1, _leftHandPath, _rightHandPath);
             // Menu button: left-hand only — used to open/close the pause menu (ESC equivalent).
             // Single subaction path (left hand). Bound to Y-button and menu-button below.
             _menuButtonAction  = CreateAction("menu_button",  "Menu Button",  1, _leftHandPath);
@@ -1420,11 +1421,13 @@ public static class OpenXRManager
             ulong stickL     = XrStringToPath("/user/hand/left/input/thumbstick");
             ulong menuBtnY   = XrStringToPath("/user/hand/left/input/y/click");
             ulong menuBtnM   = XrStringToPath("/user/hand/left/input/menu/click");
+            ulong gripRight  = XrStringToPath("/user/hand/right/input/squeeze/value");
+            ulong gripLeft   = XrStringToPath("/user/hand/left/input/squeeze/value");
 
             // XrActionSuggestedBinding = action(8) + binding(8) = 16 bytes
             // Include both Y-button and menu-button bindings for _menuButtonAction; runtime
             // picks whichever is available on the actual hardware.
-            int bindCount = 8;
+            int bindCount = 10;
             IntPtr bindings = Marshal.AllocHGlobal(bindCount * 16);
             try
             {
@@ -1441,6 +1444,8 @@ public static class OpenXRManager
                 WriteBinding(5, _thumbAction,      stickL);
                 WriteBinding(6, _menuButtonAction, menuBtnY);
                 WriteBinding(7, _menuButtonAction, menuBtnM);
+                WriteBinding(8, _gripAction,       gripRight);
+                WriteBinding(9, _gripAction,       gripLeft);
 
                 // XrInteractionProfileSuggestedBinding: type(24)+pad(4)+next(8)+profile(8)+count(4)+pad(4)+bindings*(8) = 40
                 IntPtr sugInfo = Marshal.AllocHGlobal(40);
@@ -1459,7 +1464,7 @@ public static class OpenXRManager
             }
             finally { Marshal.FreeHGlobal(bindings); }
 
-            Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X} thumb=0x{_thumbAction:X} menu=0x{_menuButtonAction:X}");
+            Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X} thumb=0x{_thumbAction:X} menu=0x{_menuButtonAction:X} grip=0x{_gripAction:X}");
         }
         catch (Exception ex) { Log.LogWarning($"  SetupActionSetsInstance: {ex}"); }
     }
@@ -1583,6 +1588,26 @@ public static class OpenXRManager
             return rc == 0;
         }
         catch (Exception ex) { Log.LogWarning($"  GetTriggerState: {ex.Message}"); return false; }
+    }
+
+    /// <summary>
+    /// Returns whether the grip/squeeze button is pressed this frame.
+    /// Returns false (with pressed=false) if action sets aren't ready.
+    /// </summary>
+    public static bool GetGripState(bool right, out bool pressed)
+    {
+        pressed = false;
+        if (!ActionSetsReady || _dGetActionStateBool == null || _gripAction == 0) return false;
+        try
+        {
+            Marshal.WriteInt64(_bActionGi, 16, (long)_gripAction);
+            Marshal.WriteInt64(_bActionGi, 24, (long)(right ? _rightHandPath : _leftHandPath));
+            int rc = _dGetActionStateBool(_session, _bActionGi, _bActionStateBool);
+            if (rc == 0)
+                pressed = Marshal.ReadInt32(_bActionStateBool, 16) != 0; // currentState at +16
+            return rc == 0;
+        }
+        catch (Exception ex) { Log.LogWarning($"  GetGripState: {ex.Message}"); return false; }
     }
 
     /// <summary>

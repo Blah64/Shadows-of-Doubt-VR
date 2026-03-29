@@ -96,21 +96,8 @@ and sets their `disable_environment` variables.
 - TMP hides `Graphic.color` with `new color` — must use `g.TryCast<TMP_Text>().color` to set vertex color
 - `AddComponent<RectTransform>()` on a freshly created `new GameObject()` **returns null** in IL2CPP (Transform already exists). Instead: `AddComponent<Image>()` first, then `GetComponent<RectTransform>()`.
 - VRMod-owned GameObjects (cursor canvas, settings panel) **must** have `DontDestroyOnLoad()` — the loading→menu scene transition destroys all non-persistent objects, silently invalidating cached Unity object references.
+- **CanvasScaler inflates sizeDelta** (discovered 2026-03-29): every game canvas has a CanvasScaler in "Scale With Screen Size" mode. Before our code runs, CanvasScaler has already set sizeDelta to the scaled display size (e.g. 2720×1680 instead of 1280×720). When we then switch renderMode to WorldSpace and set a fixed scale, the canvas is 2–4 metres wide. **Fix: disable the CanvasScaler component before calling `canvas.renderMode = RenderMode.WorldSpace`.**
 
-## CRITICAL: HDRP exposure — confirmed broken for per-camera override (2026-03-27)
-**This is the current blocking problem for UI brightness.**
-
-What was tried and confirmed NOT working:
-- `FrameSettingsField.ExposureControl` **never persists** when set per-camera — `ExposureOff` always reads back `False`. Not overridable in HDRP 12 IL2CPP.
-- `FrameSettingsField.Tonemapping` **does** persist — `TonemapOff=True` confirmed on all cameras.
-- `VRExposureOverride` Volume (global, layer 31, EV=0→Fixed, Tonemapping=None, priority=1000) on UI overlay cameras (`volumeLayerMask=1<<31`) is **NOT applied** — confirmed: `fixedExposure=-10` (1024× brightness) produced zero change. Volume path is dead.
-
-**Root cause**: The UI overlay cameras do not run their own HDRP exposure computation. They share/inherit the scene camera's auto-exposure (typically EV≈8–12 for city interiors → exposure multiplier ≈ 1/256–1/4096 → white vertex colours appear near-black).
-
-**What the next session must try** (see HANDOVER.md for full detail):
-1. Try `FrameSettingsField.Postprocess` (master toggle for all post-effects) in `s_VrDisabledFields` — if it persists unlike ExposureControl, it disables exposure as a side-effect
-2. CommandBuffer to overwrite HDRP's 1×1 exposure texture to neutral (log2=0) before the UI camera's post-process pass
-3. Read HDRP's live exposure value via `HDCamera` internals and apply compensating vertex-colour boost
 
 ## CRITICAL: IL2CPP Button / event additional pitfalls
 - `AddListener` on a **freshly-created** `new Button.ButtonClickedEvent()` is unreliable in IL2CPP — the listener silently fails to fire. Instead, intercept clicks in `TryClickCanvas` by comparing `tr.gameObject.GetInstanceID()` against a stored button GO id.
@@ -125,75 +112,67 @@ What was tried and confirmed NOT working:
 - `FMODUnity.dll` is in `BepInEx/interop/` and must be referenced in `SoDVR.csproj` ✓
 - Music toggle: `SetFamilyA("music", bool)` updates both in-memory `GameSetting.intValue` AND PlayerPrefs ✓
 
-## Phase 6 UI canvas status (COMPLETE)
-- All canvases converted to WorldSpace each 30-frame scan ✓
-- Canvases placed in front of head on first valid pose; stay fixed ✓
-- **Home key** re-centres all canvases ✓
-- TMP text: vertex colour = white, shader = UI/Default, TSA=(1,1,1,0) ✓
-- **Button/menu text still dark** — HDRP auto-exposure issue (see HANDOVER.md §UI Brightness; not yet solved)
+## CRITICAL: HDRP exposure workaround (Phase 9 solution — working)
 
-## Phase 7 controller input status (COMPLETE)
-- Right controller pose tracked via OpenXR action sets ✓
-- Trigger fires `ExecuteEvents` pointer-click on closest canvas hit ✓
-- **Cursor dot** (`VRCursorCanvasInternal`) visible on all screens including post-scene-load menu ✓
-  - Canvas NOT in `_ownedCanvasIds` → `RescanCanvasAlpha` applies ZTest Always material patch (makes it visible despite exposure)
-  - `DontDestroyOnLoad` on cursor GO — survives loading→menu scene transition
-  - Dot moves via `anchoredPosition` (2D projection onto canvas plane at `UIDistance`)
-  - `_cursorCanvas` cached directly at `BuildCameraRig` time — never rely on name-lookup in `PositionCanvases`
-- **Cursor depth** tracks nearest active aimed-at canvas (`_cursorAimDepth`); hidden canvases excluded via `activeSelf` check
+`FrameSettingsField.ExposureControl` cannot be overridden per-camera in HDRP 12 IL2CPP.
+**Workaround**: HDR material colour boost applied at material-creation time in `ForceUIZTestAlways`:
 
-## Phase 8 — VR Settings Panel (COMPLETE)
-- `SoDVR/VR/VRSettingsPanel.cs` — full panel with 4 tabs, all settings wired ✓
-- **F10** or **main menu Settings button** opens/closes the VR panel ✓
-- MenuCanvas hidden (canvas.enabled=false) while VR panel open; state-tracked to avoid per-frame material rebuilds ✓
-- 4 tabs: **Graphics** (VSync, Depth Blur, AA, DLSS, Frame Cap, UI Scale, …) | **Audio** (Master, VCAs, toggles) | **Controls** (run/invert/sensitivity) | **General** (FOV, Head Bob, Difficulty, …)
-- Settings that only write PlayerPrefs (sensitivity/smoothing) require restart to apply — accepted limitation
+| Item type | Treatment |
+|-----------|-----------|
+| `isText` (TMP_Text or Text component) | `StrengthenMenuTextMaterial` → `_FaceColor`/`_Color` = `(32,32,32,1)` |
+| `isAdditive` (shader name contains "Additive"/"Particle"/"Add") | Shader replaced with `UI/Default`, `renderQueue=3001`, `mat.color=(1,1,1,0.85)` |
+| `isBg` (GO name contains "background" or equals "BG") | `renderQueue=3000`, `color.a = UIBackgroundAlpha (0.07)` |
+| other (panels, borders, images) | `renderQueue=3008`, `color *= 4f` (min 0.01 per channel) |
 
-## Current active bugs (GUI & graphics — Phase 9 focus)
-**Phase 9 movement is on hold.** Next session should fix these first:
+`StrengthenMenuTextMaterial` is called for ALL text items regardless of canvas category.
 
-### 1. Right-eye jitter (UNCONFIRMED FIX)
-- Left eye is smooth; right eye shows temporal jitter
-- Latest fix deployed: `GL.InvalidateState()` before left render AND between left/right renders
-- Render loop is now: `GL.invertCulling=true → GL.InvalidateState() → _leftCam.Render() → GL.Flush() → GL.InvalidateState() → _rightCam.Render() → GL.invertCulling=false`
-- **Status**: Fix deployed, NOT yet confirmed. If still jittering after this, next step: swap render order to determine if jitter is always in second-rendered eye (confirming HDRP state contamination) vs always in right eye regardless of order
+## CRITICAL: CanvasScaler must be disabled before WorldSpace conversion (FIXED ✓)
+`ConvertCanvasToWorldSpace` disables CanvasScaler BEFORE switching to WorldSpace.
+`sizeDelta` stays at reference resolution (e.g. 1920×1080) and canvas scales correctly.
 
-### 2. Y/menu button multi-fire
-- Log shows multiple `Menu button → ESC` fires on single press (log lines 477, 481, 487, 496)
-- Current guard: `_menuBtnNeedsRelease` + `_menuBtnCooldownUntil = realtimeSinceStartup + 1.5f`
-- Should work in theory but log shows it still fires multiple times
-- **Hypothesis**: `GetMenuButtonState` may return a cached / edge-triggered value; or ESC causes game to pause/un-pause the Unity update loop causing realtimeSinceStartup to jump
+## CRITICAL: Game resets canvas localScale — enforce every scan cycle (FIXED ✓)
+The game resets `WindowCanvas.localScale` to 1.0 when opening notebook/notes panels.
+The reparent/ScaleFix pass re-applies correct `localScale` every 90-frame scan cycle for ALL
+root managed canvases. Log line: `ScaleFix 'WindowCanvas': 1.0 → 0.000625`.
 
-### 3. Trigger click multi-fire
-- Log shows many consecutive "Trigger click: 'Background' on 'MenuCanvas'" entries
-- Trigger has no debounce — fires every frame while held
-- **Fix needed**: same `_triggerNeedsRelease` / cooldown pattern as menu button
+## CRITICAL: Mobile/Particles/Additive shader in HDRP WorldSpace (FIXED ✓)
+Legacy mobile shader does not render in HDRP WorldSpace pipeline.
+Any material whose shader name contains "Additive", "Particle", or "Add" (`isAdditive`) has
+its shader replaced with `UI/Default` at material-creation time. Icons/borders/glows now visible.
 
-### 4. UI brightness — HDRP auto-exposure (see §HDRP exposure above)
-- Button/menu text still near-black in headset
-- Three approaches to try (see HANDOVER.md §BLOCKING ISSUE: UI Brightness)
+## Phase 9 status (COMPLETE — 2026-03-29)
+- Stereo rendering, head tracking, swapchain: **working** ✓
+- UI canvases WorldSpace, placed in front of head: **working** ✓
+- Trigger click, cursor tracking: **working** ✓
+- VR Settings Panel, FMOD audio: **working** ✓
+- Canvas sizes (CanvasScaler fix): **working** ✓
+- UI text visibility (HDR boost): **working** ✓
+- Icons/symbols (Additive shader fix): **working** ✓
+- Notebook/notes sizing (ScaleFix): **working** ✓
+- Crash prevention (rescan rate-limit, material cache cap): **working** ✓
+- CaseCanvas bright white background: **disabled** ✓
 
-## Known canvas names (from LogOutput.log, 2026-03-26)
-| Canvas | Elements | Notes |
-|--------|----------|-------|
-| `Canvas` | 4 | Startup loading splash (800×600) |
-| `MenuCanvas` | 2231 | Main menu; `[0]'Background'`, `[2230]'FadeOverlay'` |
-| `GameCanvas` | 327 | In-game HUD; `[1]'Fade'` suppressed |
-| `OverlayCanvas` | 42 | sortOrder=4, 1920×1080 |
-| `TooltipCanvas` | 82 | sortOrder=3, 1920×1080 |
-| `PrototypeBuilderCanvas` | 144 | City builder, sortOrder=2 |
-| `VirtualCursorCanvas & EventSystem` | 181 | Virtual keyboard + cursor, sortOrder=5 |
-| `ActionPanelCanvas`, `DialogCanvas`, `BioDisplayCanvas`, `MinimapCanvas` | various | In-game panels |
+## Known canvas names (from LogOutput.log)
+| Canvas | Size | Status |
+|--------|------|--------|
+| `MenuCanvas` | 1.20m | Working ✓ |
+| `WindowCanvas` (notes/notebook) | 1.20m | Working ✓ |
+| `ActionPanelCanvas` | 1.60m | Working ✓ |
+| `DialogCanvas` | 1.20m | Working ✓ |
+| `BioDisplayCanvas` | 1.80m | Working ✓ |
+| `GameCanvas`/HUD | 1.50m | Working ✓ |
+| `TooltipCanvas` | 0.80m | Working ✓ |
+| `PopupMessage` | 1.20m | Working ✓ (scale enforced each cycle) |
+| `VRSettingsPanelInternal` | 1.60m | Working ✓ |
+| `CaseCanvas` | — | Disabled (was bright white background) |
+| `MinimapCanvas` | 1.50m | Partially working |
 
 ## History
 - git `1be2b0e` — full VDXR-internal patching approach (archived checkpoint, do not rebase)
 - git `346a6df` — **Phase 5 complete**: standard loader working, stereo image in headset
 - **Phase 6 complete**: camera positioning ✓, head tracking ✓, UI canvases visible in VR ✓
-- **Phase 7 complete**: controller pose ✓, trigger click ✓, cursor dot visible on all screens ✓
+- **Phase 7 complete**: controller pose ✓, trigger click ✓, cursor dot tracking ✓
 - **Phase 8 complete** (git `12172ad`): VR settings panel ✓ — 4 tabs, all settings wired, FMOD audio, Settings button intercept
-- **Phase 9 on hold**: Movement deferred. Working on GUI/graphics polish first:
-  - Right-eye jitter fix (GL.InvalidateState between renders — UNCONFIRMED)
-  - Y-button multi-fire fix
-  - Trigger click debounce
-  - HDRP UI brightness (blocking issue)
-- **Phase 10 (after GUI fixes)**: Movement — thumbstick locomotion, snap turn, jump, interact bindings
+- **Phase 9 complete** (2026-03-29): All canvas/UI issues resolved — see HANDOVER.md for full details
+- **Phase 10 (current)**: World graphics — TBD
+- **Phase 11**: Movement — thumbstick locomotion, snap turn, jump, interact bindings
