@@ -243,6 +243,8 @@ public class VRCamera : MonoBehaviour
     // code (SaveStateController:LoadSaveState) has time to finish using the
     // camera before we interfere with it.
     private Camera? _gameCamPending;       // found but not yet disabled
+    private Camera? _gameCamRef;           // kept after suppress — used for VR rendering
+    private int     _gameCamSavedMask;     // original cullingMask, restored during Render()
     private int     _gameCamDisableDelay;  // frames remaining before disable
 
     // ── Snap turn ─────────────────────────────────────────────────────────────
@@ -655,8 +657,8 @@ public class VRCamera : MonoBehaviour
             {
                 try
                 {
-                    _gameCamPending.cullingMask = 0;  // renders nothing — but Camera.main stays valid
-                    _gameCamPending.depth = -1000f;   // sink below everything so it can't accidentally composite
+                    _gameCamPending.cullingMask = 0;
+                    _gameCamPending.depth = -1000f;
                     Log.LogInfo($"[VRCamera] Game camera suppressed (cullingMask=0): '{_gameCamPending.gameObject.name}'");
                 }
                 catch { }
@@ -747,7 +749,6 @@ public class VRCamera : MonoBehaviour
         _leftRT  = new RenderTexture(w, h, 24, RenderTextureFormat.ARGB32) { name = "SoDVR_Left" };
         _leftRT.Create();
         SetupEyeCam(_leftCam, _leftRT, isUiOverlay: false);
-        // Scene cameras render all layers (including UI layer 5).
 
         var rightGO = new GameObject("RightEye");
         rightGO.transform.SetParent(_cameraOffset, false);
@@ -755,7 +756,6 @@ public class VRCamera : MonoBehaviour
         _rightRT  = new RenderTexture(w, h, 24, RenderTextureFormat.ARGB32) { name = "SoDVR_Right" };
         _rightRT.Create();
         SetupEyeCam(_rightCam, _rightRT, isUiOverlay: false);
-        // Scene cameras render all layers (including UI layer 5).
 
         // UI overlay cameras removed — HDRP ignores clearFlags=Depth on explicit
         // Camera.Render() calls, causing the scene to be overwritten with blue/black.
@@ -905,8 +905,45 @@ public class VRCamera : MonoBehaviour
             if (!cam.gameObject.name.Equals("Main Camera", StringComparison.OrdinalIgnoreCase)) continue;
             _gameCam          = cam.transform;
             _gameCamPending   = cam;
-            _gameCamDisableDelay = 10; // ~10 frames at 60 fps ≈ 167 ms grace period
+            _gameCamRef       = cam;
+            _gameCamSavedMask = cam.cullingMask;
+            _gameCamDisableDelay = 10;
             Log.LogInfo($"[VRCamera] Found game camera: '{cam.gameObject.name}' pos={cam.transform.position} (suppress in 10 frames)");
+
+            // ── Diagnostic: dump game camera properties ──
+            try
+            {
+                Log.LogInfo($"[VRCamera] GameCam diag: allowHDR={cam.allowHDR} allowMSAA={cam.allowMSAA}" +
+                            $" clearFlags={cam.clearFlags} bgColor={cam.backgroundColor}" +
+                            $" cullingMask=0x{cam.cullingMask:X8} near={cam.nearClipPlane} far={cam.farClipPlane}" +
+                            $" depth={cam.depth} renderingPath={cam.renderingPath}");
+                var gameHD = cam.gameObject.GetComponent<HDAdditionalCameraData>();
+                if (gameHD != null)
+                {
+                    Log.LogInfo($"[VRCamera] GameCam HDRP: customRendering={gameHD.customRenderingSettings}" +
+                                $" AA={gameHD.antialiasing} dither={gameHD.dithering}" +
+                                $" volumeLayerMask=0x{gameHD.volumeLayerMask.value:X8}" +
+                                $" probeLayerMask=0x{gameHD.probeLayerMask.value:X8}" +
+                                $" clearColorMode={gameHD.clearColorMode}" +
+                                $" bgHDR={gameHD.backgroundColorHDR}" +
+                                $" stopNaNs={gameHD.stopNaNs}" +
+                                $" invertFaceCulling={gameHD.invertFaceCulling}");
+                }
+                else
+                {
+                    Log.LogInfo("[VRCamera] GameCam has NO HDAdditionalCameraData");
+                }
+            }
+            catch (Exception diagEx) { Log.LogWarning($"[VRCamera] Diagnostic failed: {diagEx.Message}"); }
+
+            // ── Copy game camera settings to VR eye cameras ──
+            CopyGameCameraSettings(cam, _leftCam);
+            CopyGameCameraSettings(cam, _rightCam);
+            Log.LogInfo($"[VRCamera] VRCam after copy: clearFlags={_leftCam.clearFlags}" +
+                        $" cullingMask=0x{_leftCam.cullingMask:X8}" +
+                        $" near={_leftCam.nearClipPlane} far={_leftCam.farClipPlane}" +
+                        $" allowHDR={_leftCam.allowHDR}");
+
             transform.position = _gameCam.position;
             return;
         }
@@ -951,70 +988,92 @@ public class VRCamera : MonoBehaviour
 
     private void SetupEyeCam(Camera cam, RenderTexture rt, bool isUiOverlay)
     {
+        // Minimal setup — only set what's strictly needed for manual rendering.
         cam.targetTexture = rt;
         cam.stereoTargetEye = StereoTargetEyeMask.None;
-        cam.nearClipPlane = 0.01f;
-        cam.farClipPlane = 1000f;
-        cam.allowHDR = false;
-        cam.allowMSAA = false;
-        cam.enabled = false;
+        cam.enabled = false;  // manual render only
 
         if (isUiOverlay)
         {
-            // Depth-only clear: preserves the scene rendered by the scene camera,
-            // adds UI on top via depth testing without overwriting the background.
             cam.clearFlags = CameraClearFlags.Depth;
             cam.backgroundColor = Color.clear;
         }
-
-        var fieldsToDisable = isUiOverlay ? s_UIOverlayDisabledFields : s_VrDisabledFields;
 
         try
         {
             var hd = cam.gameObject.GetComponent<HDAdditionalCameraData>()
                   ?? cam.gameObject.AddComponent<HDAdditionalCameraData>();
-
-            hd.antialiasing = HDAdditionalCameraData.AntialiasingMode.None;
-            hd.dithering = false;
-            hd.hasPersistentHistory = false;
-
-            var om = hd.renderingPathCustomFrameSettingsOverrideMask;
-            foreach (var f in fieldsToDisable)
-                om.mask[(uint)(int)f] = true;
-            hd.renderingPathCustomFrameSettingsOverrideMask = om;
-
-            bool maskOk = hd.renderingPathCustomFrameSettingsOverrideMask
-                            .mask[(uint)(int)FrameSettingsField.SSAO];
-
-            if (maskOk)
-            {
-                var fs = hd.renderingPathCustomFrameSettings;
-                foreach (var f in fieldsToDisable)
-                    fs.SetEnabled(f, false);
-                hd.renderingPathCustomFrameSettings = fs;
-                hd.customRenderingSettings = true;
-                Log.LogInfo($"[VRCamera] HDRP: AA=None, customFS=true, {fieldsToDisable.Length} passes off on {cam.gameObject.name} (uiOverlay={isUiOverlay})");
-
-                try
-                {
-                    var fsRb = hd.renderingPathCustomFrameSettings;
-                    bool ppOff   = !fsRb.IsEnabled(FrameSettingsField.Postprocess);
-                    bool tmapOff = !fsRb.IsEnabled(FrameSettingsField.Tonemapping);
-                    Log.LogInfo($"[VRCamera] HDRP FS readback on {cam.gameObject.name}: PostprocessOff={ppOff} TonemapOff={tmapOff}");
-                }
-                catch (Exception rbEx)
-                {
-                    Log.LogWarning($"[VRCamera] HDRP FS readback failed: {rbEx.Message}");
-                }
-            }
-            else
-            {
-                Log.LogWarning($"[VRCamera] HDRP: override mask did not persist (IL2CPP struct copy) - skipping customFS on {cam.gameObject.name}");
-            }
+            hd.customRenderingSettings = false;
+            hd.flipYMode = HDAdditionalCameraData.FlipYMode.ForceFlipY;
+            Log.LogInfo($"[VRCamera] HDRP setup: customRS={hd.customRenderingSettings}" +
+                        $" flipY={hd.flipYMode}" +
+                        $" volumeLayerMask=0x{hd.volumeLayerMask.value:X8}" +
+                        $" on {cam.gameObject.name}");
         }
         catch (Exception ex)
         {
             Log.LogWarning($"[VRCamera] HDAdditionalCameraData setup failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Copies essential camera and HDRP settings from the game camera to a VR eye camera.
+    /// Called once when the game camera is discovered.  This ensures the VR cameras pick up
+    /// the same HDRP Volume stack, culling mask, clip planes, and lighting configuration.
+    /// </summary>
+    private void CopyGameCameraSettings(Camera src, Camera dst)
+    {
+        try
+        {
+            // ── Core camera properties ──
+            dst.clearFlags      = src.clearFlags;
+            dst.backgroundColor = src.backgroundColor;
+            dst.cullingMask     = src.cullingMask;
+            dst.nearClipPlane   = src.nearClipPlane;
+            dst.farClipPlane    = src.farClipPlane;
+            dst.allowHDR        = src.allowHDR;
+            dst.allowMSAA       = src.allowMSAA;
+            dst.renderingPath   = src.renderingPath;
+
+            // ── HDRP-specific settings ──
+            var srcHD = src.gameObject.GetComponent<HDAdditionalCameraData>();
+            var dstHD = dst.gameObject.GetComponent<HDAdditionalCameraData>();
+            if (srcHD != null && dstHD != null)
+            {
+                // Volume layer mask — controls which HDRP Volumes affect this camera.
+                // Without this, the VR camera won't pick up scene lighting, sky, or exposure.
+                dstHD.volumeLayerMask = srcHD.volumeLayerMask;
+                // Probe layer mask — controls which reflection probes affect this camera.
+                dstHD.probeLayerMask  = srcHD.probeLayerMask;
+                // Clear color mode (Sky, Color, None).
+                dstHD.clearColorMode  = srcHD.clearColorMode;
+                // Background color in HDR.
+                dstHD.backgroundColorHDR = srcHD.backgroundColorHDR;
+                // Anti-aliasing.
+                dstHD.antialiasing    = srcHD.antialiasing;
+                dstHD.dithering       = srcHD.dithering;
+                dstHD.stopNaNs        = srcHD.stopNaNs;
+                // Do NOT copy customRenderingSettings — keep it false so we inherit defaults.
+                dstHD.customRenderingSettings = false;
+                // Force HDRP to handle Y-flip for RT rendering.  This correctly
+                // inverts both the image orientation and face culling internally,
+                // without needing GL.invertCulling or projection matrix hacks.
+                dstHD.flipYMode = HDAdditionalCameraData.FlipYMode.ForceFlipY;
+
+                Log.LogInfo($"[VRCamera] Copied HDRP to {dst.gameObject.name}: " +
+                            $"volumeLayerMask=0x{dstHD.volumeLayerMask.value:X8} " +
+                            $"probeLayerMask=0x{dstHD.probeLayerMask.value:X8} " +
+                            $"clearColorMode={dstHD.clearColorMode} " +
+                            $"bgHDR={dstHD.backgroundColorHDR}");
+            }
+            else
+            {
+                Log.LogWarning($"[VRCamera] CopyGameCameraSettings: srcHD={srcHD != null} dstHD={dstHD != null}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"[VRCamera] CopyGameCameraSettings failed for {dst.gameObject.name}: {ex.Message}");
         }
     }
 
@@ -1048,23 +1107,12 @@ public class VRCamera : MonoBehaviour
 
             if ((_frameCount % RenderEveryNFrames) == 0)
             {
-                // ForceUpdateCanvases every 4 rendered frames (~8 Unity frames at
-                // RenderEveryNFrames=2).  With 700+ map canvases this was causing
-                // a full mesh-rebuild storm every frame and freezing the game.
                 if ((_frameCount % (RenderEveryNFrames * 4)) == 0)
                     Canvas.ForceUpdateCanvases();
 
-                // Render right eye first: if HDRP state contamination causes jitter in
-                // the second-rendered eye, the left eye (more noticeable) stays clean.
-                GL.invertCulling = true;
-                GL.InvalidateState();
+                // No GL.invertCulling — HDRP flipYMode handles both Y-flip and culling.
                 _rightCam.Render();
-                GL.Flush();
-                GL.InvalidateState();
                 _leftCam.Render();
-                GL.Flush();
-                GL.InvalidateState();
-                GL.invertCulling = false;
             }
 
             bool leftOk = CopyEye(true, out uint leftIdx);
@@ -3167,7 +3215,7 @@ public class VRCamera : MonoBehaviour
         float t = Mathf.Tan(eye.FovUp)    * n;
         float b = Mathf.Tan(eye.FovDown)  * n;
         var m = Matrix4x4.Frustum(l, r, b, t, n, f);
-        m.m10 = -m.m10; m.m11 = -m.m11; m.m12 = -m.m12; m.m13 = -m.m13;
+        // No manual Y-flip — HDRP handles it via HDAdditionalCameraData.flipYMode.
         cam.projectionMatrix = m;
     }
 
