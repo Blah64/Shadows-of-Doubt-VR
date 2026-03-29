@@ -259,8 +259,12 @@ public class VRCamera : MonoBehaviour
     private bool              _movementDiscoveryDone;
     private CharacterController? _playerCC;    // FPSController CharacterController (primary locomotion driver)
     private Rigidbody?        _playerRb;       // FPSController Rigidbody (kept for null-check / reset only)
+    private Transform?        _fpsControllerTransform; // FPSController — controls player yaw
+    private Transform?        _cameraPivotTransform;   // first child above Main Camera for pitch (CamTransitionModifier or CameraLeanPivot)
+    private bool              _cameraLookDisabled;     // true after we've disabled the game's mouse-look components
     private const float MoveDeadZone = 0.15f;
-    private const float MoveSpeed    = 4.0f;   // m/s at full deflection
+    private const float MoveSpeed       = 4.0f;   // m/s at full deflection
+    private const float SprintMultiplier = 1.8f;  // sprint speed = MoveSpeed * this
     // Cursor: ScreenSpaceOverlay canvas "VRCursorCanvasInternal" created at rig-build time.
     // ScanAndConvertCanvases converts it to WorldSpace via the normal pipeline — giving it proper
     // HDRP registration and the ZTest Always material patch from RescanCanvasAlpha.
@@ -278,6 +282,16 @@ public class VRCamera : MonoBehaviour
     private bool           _menuCanvasHidden;    // tracks last hide state to avoid per-frame toggles
     private int            _menuSettingsBtnId;   // instanceID of the patched Settings button in MenuCanvas
     private bool           _cursorVisible = false; // tracks SetActive state to avoid per-frame IL2CPP calls
+    // ── New controller button state (edge detection) ──────────────────────────
+    private bool _jumpBtnPrev;
+    private bool _crouchBtnPrev;
+    private bool _interactBtnPrev;
+    private bool _notebookBtnPrev;
+    private bool _flashlightBtnPrev;
+    private bool _inventoryBtnPrev;
+    private bool _sprintThumbPrev;
+    private bool _sprintActive;       // true while Shift key is held down
+
     private bool        _prevTrigger;
     private bool        _triggerNeedsRelease;  // latch: must fully release before next click fires
     private int         _triggerFireFrame = -100; // frame of last trigger click (frame-gap guard)
@@ -289,6 +303,10 @@ public class VRCamera : MonoBehaviour
     // Win32 keyboard simulation — used to forward left-controller menu button as ESC.
     [DllImport("user32.dll")]
     private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    // Win32 mouse event simulation — used for flashlight toggle (middle mouse button).
+    [DllImport("user32.dll")]
+    private static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
 
     // Maps (origMaterialInstanceID << 5 | tier<<1 | isBackground) → patched clone.
     // Lower 5 bits: tier (0-9, 4 bits) + isBackground (1 bit).
@@ -373,6 +391,10 @@ public class VRCamera : MonoBehaviour
                 _movementDiscoveryDone = false;
                 _playerRb       = null;
                 _playerCC       = null;
+                _fpsControllerTransform = null;
+                _cameraPivotTransform   = null;
+                _cameraLookDisabled     = false;
+                StopSprint();
                 Log.LogInfo("[VRCamera] Game camera lost — same-scene reload detected; canvas scan paused 120 frames, movement state reset.");
             }
             _prevGameCamValid = gcValid;
@@ -690,6 +712,38 @@ public class VRCamera : MonoBehaviour
             ApplyCameraPose(_rightCam.transform, _rightEye);
             SetProjection(_leftCam,  _leftEye);
             SetProjection(_rightCam, _rightEye);
+
+            // Sync game camera hierarchy to VR head direction so game systems
+            // (interaction raycast, world HUD positioning) match where the player looks in VR.
+            // Set rotations on the FPSController hierarchy, not just the camera:
+            //   FPSController → yaw (Y rotation)
+            //   Camera pivot  → pitch (X rotation)
+            //   Main Camera   → world rotation (fallback / for Camera.main references)
+            if (_fpsControllerTransform != null)
+            {
+                try
+                {
+                    Vector3 headEuler = _leftCam.transform.eulerAngles;
+                    // FPSController handles yaw — this is what the game reads for player facing
+                    _fpsControllerTransform.rotation = Quaternion.Euler(0f, headEuler.y, 0f);
+                    // Camera pivot handles pitch
+                    if (_cameraPivotTransform != null)
+                        _cameraPivotTransform.localRotation = Quaternion.Euler(headEuler.x, 0f, 0f);
+                    // Zero any remaining intermediate transforms
+                    if (_gameCam != null && _gameCam.parent != null && _gameCam.parent != _cameraPivotTransform)
+                        _gameCam.parent.localRotation = Quaternion.identity;
+                    // Set camera itself for direct Camera.main users
+                    if (_gameCamRef != null)
+                        _gameCamRef.transform.rotation = _leftCam.transform.rotation;
+                }
+                catch { }
+            }
+            else if (_gameCamRef != null)
+            {
+                // Fallback: just set camera world rotation directly
+                try { _gameCamRef.transform.rotation = _leftCam.transform.rotation; }
+                catch { }
+            }
         }
         else
         {
@@ -707,11 +761,27 @@ public class VRCamera : MonoBehaviour
             UpdateSnapTurn();
             UpdateLocomotion();
             UpdateMenuButton();
+            UpdateJump();
+            UpdateInteract();
+            UpdateCrouch();
+            UpdateSprint();
+            UpdateNotebook();
+            UpdateFlashlight();
+            UpdateInventory();
         }
 
-        // One-shot movement system discovery (runs once after stereo is ready and game cam found)
-        if (!_movementDiscoveryDone && _gameCam != null)
-            DiscoverMovementSystem();
+        // One-shot movement system discovery (runs once after stereo is ready and game cam found).
+        // Skip discovery when game camera has cullingMask=0 — that means we're on the main menu,
+        // where FPSController exists but there's no ground geometry → gravity would pull us through the floor.
+        if (!_movementDiscoveryDone && _gameCam != null && _gameCamRef != null)
+        {
+            try
+            {
+                if (_gameCamRef.cullingMask != 0)
+                    DiscoverMovementSystem();
+            }
+            catch { }
+        }
     }
 
     private void BuildCameraRig()
@@ -2878,7 +2948,11 @@ public class VRCamera : MonoBehaviour
         float headYaw = _leftCam != null ? _leftCam.transform.eulerAngles.y : transform.eulerAngles.y;
         Vector3 fwd   = Quaternion.Euler(0f, headYaw, 0f) * Vector3.forward;
         Vector3 right = Quaternion.Euler(0f, headYaw, 0f) * Vector3.right;
-        Vector3 hMove = (fwd * dy + right * dx) * MoveSpeed;
+        bool alwaysRun = PlayerPrefs.GetInt("alwaysRun", 0) != 0;
+        float baseSpeed  = alwaysRun ? MoveSpeed * SprintMultiplier : MoveSpeed;
+        float altSpeed   = alwaysRun ? MoveSpeed : MoveSpeed * SprintMultiplier;
+        float speed = _sprintActive ? altSpeed : baseSpeed;
+        Vector3 hMove = (fwd * dy + right * dx) * speed;
 
         // Call CharacterController.Move() to drive player locomotion.
         // Guard: verify CC is still alive before touching it (destroyed objects aren't null
@@ -2958,6 +3032,231 @@ public class VRCamera : MonoBehaviour
         _canvasTick = UICanvasScanRate;
     }
 
+    /// <summary>
+    /// Right A → Jump.
+    /// Drives CharacterController.Move() with upward velocity directly, since we've disabled
+    /// FirstPersonController (which would normally process Space key jump).
+    /// Also sends Space key as fallback for any other game systems that check it.
+    /// </summary>
+    private float _jumpVerticalVelocity;
+    private const float JumpForce = 5.0f;   // m/s upward impulse
+    private const float Gravity   = -15.0f; // m/s² (slightly stronger than real for game feel)
+    private void UpdateJump()
+    {
+        if (_sceneLoadGrace > 0) { _jumpVerticalVelocity = 0f; return; }
+        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+        if (_playerCC == null) return;
+        // Only apply gravity/jump when movement discovery is done (= we're in-game, not main menu)
+        if (!_movementDiscoveryDone) { _jumpVerticalVelocity = 0f; return; }
+
+        OpenXRManager.GetButtonAState(out bool pressed);
+        bool edge = pressed && !_jumpBtnPrev;
+        _jumpBtnPrev = pressed;
+
+        // Guard: verify CC is still alive
+        try
+        {
+            if (_playerCC.gameObject == null || !_playerCC.gameObject.activeInHierarchy)
+            { _playerCC = null; return; }
+        }
+        catch { _playerCC = null; return; }
+
+        // Apply gravity every frame
+        if (_playerCC.isGrounded)
+            _jumpVerticalVelocity = -0.5f; // small downward to keep grounded
+        else
+            _jumpVerticalVelocity += Gravity * Time.deltaTime;
+
+        // Clamp terminal velocity to prevent runaway falling
+        if (_jumpVerticalVelocity < -20f) _jumpVerticalVelocity = -20f;
+
+        // Jump impulse on press edge, only when grounded
+        if (edge && _playerCC.isGrounded)
+        {
+            _jumpVerticalVelocity = JumpForce;
+            Log.LogInfo("[VRCamera] Jump");
+        }
+
+        // Apply vertical movement
+        if (Mathf.Abs(_jumpVerticalVelocity) > 0.01f)
+        {
+            try
+            {
+                _playerCC.Move(new Vector3(0f, _jumpVerticalVelocity * Time.deltaTime, 0f));
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[VRCamera] Jump Move failed: {ex.Message}");
+                _jumpVerticalVelocity = 0f;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Left trigger → world interaction via left controller aiming.
+    /// While trigger is held: points the game camera (Camera.main) at the left controller's
+    /// aim direction so the game's InteractionController raycast follows the left hand.
+    /// On press edge: simulates left mouse button click.
+    /// On release: restores camera to VR head direction.
+    /// </summary>
+    private bool _interactAiming;  // true while left trigger is held and camera is redirected
+    private void UpdateInteract()
+    {
+        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+        OpenXRManager.GetTriggerState(false, out bool pressed);
+
+        // While trigger is held, point game camera at left controller aim direction.
+        // The game's InteractionController raycasts from Camera.main each frame —
+        // this makes it follow the left hand instead of VR head.
+        if (pressed && _gameCamRef != null && _leftControllerGO != null)
+        {
+            _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation;
+            _interactAiming = true;
+        }
+        else if (_interactAiming && !pressed)
+        {
+            // Restore camera rotation to VR head when trigger released
+            _interactAiming = false;
+        }
+
+        bool edge = pressed && !_interactBtnPrev;
+        _interactBtnPrev = pressed;
+        if (!edge) return;
+        try
+        {
+            // Primary: left mouse button (game uses LMB for pick up, interact, attack)
+            const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+            const uint MOUSEEVENTF_LEFTUP   = 0x0004;
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+            mouse_event(MOUSEEVENTF_LEFTUP,   0, 0, 0, UIntPtr.Zero);
+            Log.LogInfo("[VRCamera] Interact (LMB via left controller aim)");
+        }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateInteract: {ex.Message}"); }
+    }
+
+    /// <summary>Left X → C (crouch toggle).</summary>
+    private void UpdateCrouch()
+    {
+        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+        OpenXRManager.GetButtonXState(out bool pressed);
+        bool edge = pressed && !_crouchBtnPrev;
+        _crouchBtnPrev = pressed;
+        if (!edge) return;
+        try
+        {
+            const byte VK_C = 0x43;
+            const uint KEYEVENTF_KEYUP = 0x0002;
+            keybd_event(VK_C, 0, 0,               UIntPtr.Zero);
+            keybd_event(VK_C, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            Log.LogInfo("[VRCamera] Crouch (C)");
+        }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateCrouch: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Left thumbstick click → Sprint toggle (Shift held/released).
+    /// Also auto-stops sprint when the left stick returns to centre.
+    /// </summary>
+    private void UpdateSprint()
+    {
+        if (_playerCC == null) return;
+        if (VRSettingsPanel.RootGO?.activeSelf == true)
+        {
+            StopSprint();
+            return;
+        }
+
+        // Auto-stop when stick returns to centre (player stopped moving)
+        if (_sprintActive)
+        {
+            OpenXRManager.GetThumbstickState(false, out float lx, out float ly);
+            if (Mathf.Abs(lx) < MoveDeadZone && Mathf.Abs(ly) < MoveDeadZone)
+            {
+                StopSprint();
+                return;
+            }
+        }
+
+        OpenXRManager.GetThumbClickState(false, out bool clicked);
+        bool edge = clicked && !_sprintThumbPrev;
+        _sprintThumbPrev = clicked;
+        if (!edge) return;
+
+        if (_sprintActive) StopSprint();
+        else               StartSprint();
+    }
+
+    private void StartSprint()
+    {
+        if (_sprintActive) return;
+        _sprintActive = true;
+        Log.LogInfo("[VRCamera] Sprint start");
+    }
+
+    private void StopSprint()
+    {
+        if (!_sprintActive) return;
+        _sprintActive = false;
+        Log.LogInfo("[VRCamera] Sprint stop");
+    }
+
+    /// <summary>Right B → Tab (notebook/map).</summary>
+    private void UpdateNotebook()
+    {
+        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+        OpenXRManager.GetButtonBState(out bool pressed);
+        bool edge = pressed && !_notebookBtnPrev;
+        _notebookBtnPrev = pressed;
+        if (!edge) return;
+        try
+        {
+            const byte VK_TAB = 0x09;
+            const uint KEYEVENTF_KEYUP = 0x0002;
+            keybd_event(VK_TAB, 0, 0,               UIntPtr.Zero);
+            keybd_event(VK_TAB, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            Log.LogInfo("[VRCamera] Notebook (Tab)");
+        }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateNotebook: {ex.Message}"); }
+    }
+
+    /// <summary>Right thumbstick click → middle mouse button (flashlight toggle).</summary>
+    private void UpdateFlashlight()
+    {
+        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+        OpenXRManager.GetThumbClickState(true, out bool pressed);
+        bool edge = pressed && !_flashlightBtnPrev;
+        _flashlightBtnPrev = pressed;
+        if (!edge) return;
+        try
+        {
+            const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+            const uint MOUSEEVENTF_MIDDLEUP   = 0x0040;
+            mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, UIntPtr.Zero);
+            mouse_event(MOUSEEVENTF_MIDDLEUP,   0, 0, 0, UIntPtr.Zero);
+            Log.LogInfo("[VRCamera] Flashlight (middle mouse)");
+        }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateFlashlight: {ex.Message}"); }
+    }
+
+    /// <summary>Left grip → X (inventory).</summary>
+    private void UpdateInventory()
+    {
+        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+        OpenXRManager.GetGripState(false, out bool pressed);
+        bool edge = pressed && !_inventoryBtnPrev;
+        _inventoryBtnPrev = pressed;
+        if (!edge) return;
+        try
+        {
+            const byte VK_X = 0x58;
+            const uint KEYEVENTF_KEYUP = 0x0002;
+            keybd_event(VK_X, 0, 0,               UIntPtr.Zero);
+            keybd_event(VK_X, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            Log.LogInfo("[VRCamera] Inventory (X)");
+        }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateInventory: {ex.Message}"); }
+    }
+
     private void DiscoverMovementSystem()
     {
         _movementDiscoveryDone = true;
@@ -2997,6 +3296,7 @@ public class VRCamera : MonoBehaviour
         catch (Exception ex) { Log.LogWarning($"[Movement] Player0: {ex.Message}"); }
 
         // 3. Walk up from game camera to find CharacterController / Rigidbody; cache both.
+        //    Also enumerate all MonoBehaviours for diagnostic purposes (camera-look identification).
         //    Locomotion is driven via CharacterController.Move() — Rigidbody velocity is
         //    ignored by the game's kinematic FPS controller.
         try
@@ -3006,7 +3306,15 @@ public class VRCamera : MonoBehaviour
             {
                 var cc = t.GetComponent<CharacterController>();
                 var rb = t.GetComponent<Rigidbody>();
-                Log.LogInfo($"[Movement] Ancestor[{i}] '{t.gameObject.name}': CC={cc != null} RB={rb != null}");
+                // Enumerate ALL components for camera-look system identification
+                var allComps = t.GetComponents<Component>();
+                var compNames = new System.Text.StringBuilder();
+                foreach (var c in allComps)
+                {
+                    if (c == null) continue;
+                    try { compNames.Append($" {c.GetIl2CppType().Name}"); } catch { }
+                }
+                Log.LogInfo($"[Movement] Ancestor[{i}] '{t.gameObject.name}': CC={cc != null} RB={rb != null} components=[{compNames}]");
                 if (cc != null)
                 {
                     _playerCC = cc;
@@ -3019,6 +3327,58 @@ public class VRCamera : MonoBehaviour
             }
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] Walk-up: {ex.Message}"); }
+
+        // 3b. Cache hierarchy transforms for camera rotation sync.
+        //     Disable game's camera-look MonoBehaviours so VR head rotation takes over.
+        try
+        {
+            if (_playerCC != null)
+            {
+                _fpsControllerTransform = _playerCC.transform;
+
+                // Walk DOWN from game camera to find the pitch pivot.
+                // Hierarchy: FPSController → CameraLeanPivot → CamTransitionModifier → Main Camera
+                // We cache the first parent above Main Camera as the pitch pivot.
+                if (_gameCam != null && _gameCam.parent != null)
+                    _cameraPivotTransform = _gameCam.parent;
+
+                Log.LogInfo($"[Movement] Cached FPSController transform='{_fpsControllerTransform.gameObject.name}' " +
+                            $"cameraPivot='{_cameraPivotTransform?.gameObject.name ?? "NULL"}'");
+
+                // Disable camera-look MonoBehaviours that override VR head rotation.
+                // CameraController (on Main Camera): handles mouse-look pitch/effects.
+                // FirstPersonController (on FPSController): handles mouse-look yaw + WASD movement.
+                //   We drive movement via CharacterController.Move() so this is safe to disable.
+                // DO NOT disable: HDAdditionalCameraData (HDRP rendering), InteractionController (game interaction).
+                var disableTargets = new[] { "CameraController", "FirstPersonController" };
+                var t = _gameCam;
+                for (int i = 0; i < 10 && t != null; i++)
+                {
+                    var behaviours = t.GetComponents<MonoBehaviour>();
+                    foreach (var mb in behaviours)
+                    {
+                        if (mb == null) continue;
+                        try
+                        {
+                            string typeName = mb.GetIl2CppType().Name;
+                            bool shouldDisable = false;
+                            foreach (var target in disableTargets)
+                                if (typeName == target) { shouldDisable = true; break; }
+                            if (shouldDisable)
+                            {
+                                mb.enabled = false;
+                                Log.LogInfo($"[Movement] Disabled '{typeName}' on '{t.gameObject.name}'");
+                            }
+                        }
+                        catch { }
+                    }
+                    if (t == _fpsControllerTransform) break;
+                    t = t.parent;
+                }
+                _cameraLookDisabled = true;
+            }
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] Camera hierarchy setup: {ex.Message}"); }
 
         // 4. FindObjectOfType for the FPS controller (diagnostic position check)
         try
@@ -3141,6 +3501,10 @@ public class VRCamera : MonoBehaviour
                             _canvasTick     = 0;
                             _playerRb       = null;
                             _playerCC       = null;
+                            _fpsControllerTransform = null;
+                            _cameraPivotTransform   = null;
+                            _cameraLookDisabled     = false;
+                            StopSprint();
                             // NOTE: do NOT set _movementDiscoveryDone = false here.
                             // Doing so would trigger DiscoverMovementSystem() at the bottom of
                             // this same Update() frame (before SaveStateController runs in the
