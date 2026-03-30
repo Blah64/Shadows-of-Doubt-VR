@@ -161,27 +161,51 @@ When manually calling `Camera.Render()` to a RenderTexture in HDRP:
 - CaseCanvas bright white background: **disabled** ✓
 - **World graphics (walls, floors, lighting): working** ✓ (Phase 10)
 
-## Phase 11 movement status (IN PROGRESS)
+## Phase 11 status (COMPLETE — 2026-03-30)
 
-Already implemented in VRCamera.cs — **needs functional testing**:
+All movement and interaction bindings implemented and tested:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Thumbstick locomotion | Working ✓ | Left stick → `CharacterController.Move()` at 4 m/s |
 | Snap turn | Working ✓ | Right stick X → ±30° VROrigin rotation |
-| Menu button (ESC) | Working ✓ | Left Y/menu → ESC key simulation |
-| Sprint | Working ✓ | Left stick click, wired to game's `alwaysRun` setting |
+| Menu button (ESC) | Working ✓ | Left Y/menu → ESC key simulation (1.5s cooldown) |
+| Sprint | Working ✓ | Left stick click toggle, auto-stops on stick release |
 | Left laser beam | Working ✓ | LineRenderer on left controller, toggle in VR Settings |
 | Held item tracking | Working ✓ | `InteractionController.carryingObject` → VR controller |
 | Item hand selection | Working ✓ | VR Settings toggle: Left/Right hand |
-| Jump | **Not implemented** | Needs A button binding in OpenXRManager |
-| World interact | **Not implemented** | Needs button binding → 'E' key simulation |
+| VR arm display | Working ✓ | Both arms track controllers, per-hand rotation offsets |
+| Jump | Working ✓ | Right A → CharacterController vertical velocity + gravity |
+| World interact | Working ✓ | Left trigger → LMB + camera redirected to left controller aim |
+| Crouch | Working ✓ | Left X → C key simulation |
+| Notebook/map | Working ✓ | Right B → Tab key simulation |
+| Flashlight | Working ✓ | Right stick click → middle mouse button |
+| Inventory | Working ✓ | Left grip → X key simulation |
 
-OpenXR actions currently bound in OpenXRManager.cs:
+### VR controller button map
+| Button | Action |
+|--------|--------|
+| Left stick | Locomotion (4 m/s walk) |
+| Left stick click | Sprint toggle |
+| Right stick X | Snap turn ±30° |
+| Right stick click | Flashlight (middle mouse) |
+| Left Y / menu | ESC (pause menu) |
+| Left X | Crouch (C key) |
+| Left trigger | World interact (LMB + left-hand aim) |
+| Left grip | Inventory (X key) |
+| Right trigger | UI click |
+| Right A | Jump |
+| Right B | Notebook/map (Tab key) |
+
+### OpenXR actions bound in OpenXRManager.cs
 - `_poseAction` — both hand aim poses
-- `_triggerAction` — both triggers (right = UI click)
+- `_triggerAction` — both triggers (right = UI click, left = interact)
 - `_thumbAction` — both thumbsticks (left = locomotion, right = snap turn)
-- `_gripAction` — both grips (unused beyond binding)
+- `_gripAction` — both grips (left = inventory)
 - `_menuButtonAction` — left Y + left menu button → ESC
+- `_buttonAAction` — right A → jump
+- `_buttonBAction` — right B → notebook
+- `_buttonXAction` — left X → crouch
+- `_thumbClickAction` — both thumbstick clicks (left = sprint, right = flashlight)
 
 ## CRITICAL: Held item tracking — two separate systems (discovered 2026-03-29)
 The game has TWO independent item systems:
@@ -202,6 +226,19 @@ The game has TWO independent item systems:
 
 **VR approach**: override `InteractionController.carryingObject.transform.position/rotation` every frame
 (in Update AND pre-render) to the VR controller position + 0.3m forward offset.
+
+## CRITICAL: VR arm display — per-hand rotation and positioning (Phase 11)
+The game's arm meshes are in pixel-space coordinates (hundreds of units) and oriented for flat-screen FPS.
+VR arm display works by:
+- Reparenting `LagPivot` to VROrigin, scaling `FirstPersonModels` by `ArmScale` (0.0002) for pixel→meter conversion
+- Forcing `Arms` GO active, zeroing intermediate transforms every frame (Animator resets them)
+- Per-hand rotation offsets to align FPS arm mesh with VR controller aim pose:
+  - Right: `Quaternion.Euler(90, 90, 0)` — pitch + yaw
+  - Left: `Quaternion.Euler(90, -90, 0)` — pitch + mirrored yaw
+- Fist-offset positioning: arm positioned so the fist child (not elbow) aligns with the VR controller
+- `ArmForwardOffset` (-0.25m) slides arm along controller forward axis so game hand matches real hand
+- `PositionArmAtController(arm, fist, ctrlGO, rotOffset)` applies rotation then fist-offset then forward shift
+- Called in both `UpdateHeldItemTracking` (frame update) and `ForceItemPositionPreRender` (pre-render)
 
 ## Known canvas names (from LogOutput.log)
 | Canvas | Size | Status |
@@ -226,4 +263,4 @@ The game has TWO independent item systems:
 - **Phase 8 complete** (git `12172ad`): VR settings panel ✓ — 4 tabs, all settings wired, FMOD audio, Settings button intercept
 - **Phase 9 complete** (2026-03-29): All canvas/UI issues resolved — see HANDOVER.md for full details
 - **Phase 10 complete** (2026-03-30): World graphics — flipYMode + HDRP Volume config fix (`546a4b5`)
-- **Phase 11 (current)**: Movement — locomotion testing + jump + world interact bindings
+- **Phase 11 complete** (2026-03-30): Movement — all controls bound, held item + arm tracking, VR arm display (`255dafc`)

@@ -1,134 +1,132 @@
 # SoDVR — Technical Handover
 
-**Date**: 2026-03-30 (updated end of Phase 10)
-**Phase**: 10 complete (world graphics) — next priority: movement/locomotion
+**Date**: 2026-03-30 (updated end of Phase 11)
+**Phase**: 11 complete (movement + controls + arm display) — next priority: Phase 12 comfort/polish
 
 ---
 
-## Phase 10: World Graphics — COMPLETE ✓
+## Phase 11: Movement & Controls — COMPLETE ✓
 
-**Problem**: Walls, floors invisible. Lighting broken (dark areas fully lit).
+### What was implemented
 
-**Root Cause**:
-1. VR cameras had default HDRP Volume configuration → no scene lighting
-2. GL.invertCulling + projection Y-negate caused double face-winding reversal → front-faces culled
+**Controller bindings** — full button map wired in OpenXRManager.cs + VRCamera.cs:
 
-**Solution**:
-1. **Copy game camera HDRP settings** to VR eye cameras:
-   - `volumeLayerMask` (most critical — ensures Volume influence)
-   - `probeLayerMask`, `clearColorMode`, `backgroundColorHDR`
-   - `cullingMask`, `nearClipPlane`, `farClipPlane`
+| Button | Action | Method |
+|--------|--------|--------|
+| Left stick | Locomotion (4 m/s) | `UpdateLocomotion()` — `CharacterController.Move()` |
+| Left stick click | Sprint toggle | `UpdateSprint()` — auto-stops on stick release |
+| Right stick X | Snap turn ±30° | `UpdateSnapTurn()` |
+| Right stick click | Flashlight | `UpdateFlashlight()` — middle mouse button |
+| Left Y / menu | ESC (pause menu) | `UpdateMenuButton()` — 1.5s real-time cooldown |
+| Left X | Crouch (C key) | `UpdateCrouch()` |
+| Left trigger | World interact | `UpdateInteract()` — LMB + camera redirected to left controller aim |
+| Left grip | Inventory (X key) | `UpdateInventory()` |
+| Right trigger | UI click | `TryClickCanvas()` — existing from Phase 7 |
+| Right A | Jump | `UpdateJump()` — CharacterController vertical velocity + gravity |
+| Right B | Notebook/map (Tab) | `UpdateNotebook()` |
 
-2. **Use `HDAdditionalCameraData.flipYMode = ForceFlipY`**:
-   - HDRP handles both Y-flip and culling correction internally
-   - Replaces hacky GL.invertCulling + projection Y-negate
-   - Single atomic operation → no winding double-correction
+**Held item tracking** — two systems:
+1. Carried world objects (`InteractionController.carryingObject`) — transform overridden to VR controller position + 0.3m forward every frame
+2. First-person arms (`LagPivot` → `FirstPersonModels` → `Arms`) — reparented to VROrigin, scaled, positioned at controllers
 
-**Result**: ✓ Walls visible ✓ Floors visible ✓ Lighting works ✓ Right-side-up
+**VR arm display**:
+- `LagPivot` reparented to VROrigin
+- `FirstPersonModels` scaled by `ArmScale` (0.0002) for pixel→meter conversion
+- `Arms` forced active, intermediate transforms zeroed every frame
+- Per-hand rotation offsets: Right `Euler(90,90,0)`, Left `Euler(90,-90,0)`
+- Fist-offset: arm positioned so fist child (not elbow) aligns with controller
+- `ArmForwardOffset` (-0.25m) slides arm along controller forward for hand alignment
+- Applied in both `UpdateHeldItemTracking` and `ForceItemPositionPreRender`
 
----
-
-## What Was Fixed This Session
-
-### Phase 10: World graphics — FIXED ✓
-
-### CanvasScaler inflation — FIXED ✓
-`ConvertCanvasToWorldSpace` now disables CanvasScaler before switching to WorldSpace.
-`sizeDelta` stays at reference resolution (e.g. 1920×1080) instead of ballooning to 2720×1680.
-Canvases are correctly sized at their TargetWorldWidth values.
-
-### HDRP exposure workaround — WORKING ✓
-No exposure isolation possible in IL2CPP HDRP 12. Workaround: HDR material colour boost.
-- **Text** (`isText=true`): `StrengthenMenuTextMaterial` sets `_FaceColor`/`_Color` to `(32,32,32,1)`. Now applied to ALL canvases (was previously only Menu/Panel/CaseBoard).
-- **Non-text non-bg graphics**: material color × 4 (`Mathf.Max(c.r, 0.01f) * 4f`). Covers panels, borders, images.
-- **Additive items** (`Mobile/Particles/Additive` shader): shader replaced with `UI/Default`, `mat.color=(1,1,1,0.85)`. Vertex color drives appearance.
-
-### Mobile/Particles/Additive shader — FIXED ✓
-Legacy mobile shader does not render in HDRP WorldSpace pipeline. All items classified
-as `isAdditive` (name contains "Additive", "Particle", or "Add") now get shader swapped
-to `UI/Default` at material creation time. Icons, borders, glows now visible.
-
-### Canvas scale drift — FIXED ✓
-The game resets canvas localScale when opening UI panels (WindowCanvas → scale 1.0 when
-opening notebook). The reparent/scale-enforce pass now re-applies correct scale every scan
-cycle for ALL root managed canvases. Log line: `ScaleFix 'WindowCanvas': 1.0 → 0.000625`.
-
-### Notebook/notes size — FIXED ✓
-Root cause was scale drift (above). After fix: Note worldSize=(0.42,0.54)m, Notebook=(0.76,0.66)m.
-
-### CaseCanvas — DISABLED ✓
-CaseCanvas had only 4 items (Viewport, ContentContainer, BG, ControllerSelection) and was
-rendering as a bright white background washing out windows in front of it. `canvas.enabled=false`
-applied at scan time. Actual case-board content lives elsewhere.
-
-### Crash prevention — IMPLEMENTED ✓
-- **RescanCanvasAlpha rate limit**: 600-frame cooldown per canvas (preventing MinimapCanvas
-  from creating 1367 new materials every 90-frame scan cycle)
-- **Material cache cap**: `s_uiZTestMats` capped at 2000 entries. Warning logged when hit.
-  Both caches clear on `BuildCameraRig` (scene reload).
+**VR Settings Panel additions** (VRSettingsPanel.cs):
+- Left Laser beam toggle
+- Item Hand selection (Left/Right)
 
 ---
 
-## Current UI Canvas State (2026-03-29)
+## What Was Fixed This Session (Phase 11)
+
+### Arm rotation alignment — FIXED ✓
+Arms initially pointed wrong direction. Per-hand rotation offsets solved it:
+- Right arm: `Quaternion.Euler(90, 90, 0)` — confirmed good
+- Left arm: `Quaternion.Euler(90, -90, 0)` — mirrored yaw
+
+### Arm size tuning — FIXED ✓
+`ArmScale` reduced from 0.0004 → 0.0002 for correct hand proportions.
+
+### Arm position alignment — FIXED ✓
+- Fist-offset positioning ensures game hand (not elbow) aligns with controller
+- `ArmForwardOffset = -0.25m` slides arm back along controller forward axis
+
+### Floating during pause menu — FIXED ✓
+Jump/gravity uses `Time.unscaledDeltaTime` so gravity works even when `timeScale=0`.
+Player no longer floats in the air while ESC menu is open.
+
+---
+
+## Previous Phases Summary
+
+### Phase 10: World Graphics — COMPLETE ✓
+- `HDAdditionalCameraData.flipYMode = ForceFlipY` — HDRP handles Y-flip + culling atomically
+- VR eye cameras copy game camera's HDRP settings (especially `volumeLayerMask`)
+- Walls, floors, lighting all correct
+
+### Phase 9: Canvas/UI — COMPLETE ✓
+- All game canvases converted to WorldSpace, placed in front of head
+- CanvasScaler disabled before WorldSpace conversion
+- HDR material colour boost for text/icons visibility
+- Additive shader replacement (Mobile/Particles → UI/Default)
+- Canvas scale drift enforcement every scan cycle
+- Material cache cap + rescan rate-limit for crash prevention
+
+### Phase 8: VR Settings Panel — COMPLETE ✓
+- 4-tab panel (Audio, Display, Controls, Movement)
+- FMOD audio controls, all settings wired
+- Settings button intercept from main menu
+
+### Phase 7: Controller Input — COMPLETE ✓
+- Controller pose tracking, trigger click, cursor dot
+
+### Phase 6: Camera & UI — COMPLETE ✓
+- Stereo rendering, head tracking, UI canvases visible
+
+### Phase 5: OpenXR Init — COMPLETE ✓
+- Standard OpenXR loader, stereo image in headset
+
+---
+
+## Current UI Canvas State
 
 | Canvas | Size | Status |
 |--------|------|--------|
-| MenuCanvas | 1.20m | Working — text visible ✓ |
-| WindowCanvas (notes/notebook) | 1.20m | Working — correct size after scale fix ✓ |
-| ActionPanelCanvas | 1.60m | Working — icons/text visible ✓ |
+| MenuCanvas | 1.20m | Working ✓ |
+| WindowCanvas (notes/notebook) | 1.20m | Working ✓ |
+| ActionPanelCanvas | 1.60m | Working ✓ |
 | DialogCanvas | 1.20m | Working ✓ |
 | BioDisplayCanvas | 1.80m | Working ✓ |
 | GameCanvas/HUD | 1.50m | Working ✓ |
 | TooltipCanvas | 0.80m | Working ✓ |
-| PopupMessage | 1.20m | Working ✓ (scale fixed every cycle — game resets it) |
-| VRSettingsPanelInternal | 1.60m | Working — text visible ✓ |
-| CaseCanvas | — | **Disabled** — was bright white background |
-| MinimapCanvas | 1.50m | Partially — content present but needs review |
-
-### Known remaining UI issues (deferred)
-- Some panels may still have minor visibility issues (brightness tuning)
-- Additive items now show as semi-transparent white overlays — not full original colours
-- PopupMessage gets scale-reset by game frequently (fixed each cycle, slight lag)
+| PopupMessage | 1.20m | Working ✓ (scale enforced each cycle) |
+| VRSettingsPanelInternal | 1.60m | Working ✓ |
+| CaseCanvas | — | Disabled (bright white background) |
+| MinimapCanvas | 1.50m | Partially working |
 
 ---
 
-## Next Priority: Phase 11 — Movement
+## Known Issues / Polish Opportunities (Phase 12+)
 
-The movement infrastructure already exists in VRCamera.cs but has not been fully tested since Phase 10. Specific tasks:
-
-### 11a — Verify locomotion and snap turn (test first)
-- Load into game world, try left stick to walk → should move via `CharacterController.Move()`
-- Try right stick X → should snap-turn ±30°
-- Check logs: `[Movement] Cached playerCC on '...'` should appear after game cam found
-- If playerCC not found: `DiscoverMovementSystem()` walk-up from game cam may be failing — check log
-
-### 11b — Jump (not implemented)
-- Need: new OpenXR boolean action for right-hand A button
-- Binding: `/user/hand/right/input/a/click`
-- Add `_jumpAction` to OpenXRManager, `GetJumpButtonState()` public API
-- Implement `UpdateJump()` in VRCamera: detect press edge, simulate Space key (`keybd_event(0x20, ...)`)
-- OR inject directly: call game's jump method via Rewired axis injection if CharacterController approach isn't reliable
-
-### 11c — World interact (not implemented)
-- In-game 'E' to interact with objects/doors/NPCs
-- Suggested binding: right A button for jump, right grip button or left trigger for interact
-- Implement `UpdateInteract()` in VRCamera: detect press edge, simulate 'E' key (`keybd_event(0x45, ...)`)
-
-### 11d — Controller binding review
-| Action | Button | Status |
-|--------|--------|--------|
-| UI click | Right trigger | Working ✓ |
-| Locomotion | Left stick | Implemented, needs test |
-| Snap turn | Right stick X | Implemented, needs test |
-| Menu/ESC | Left Y/menu | Working ✓ |
-| Jump | Right A | **Not bound** |
-| World interact | TBD | **Not bound** |
-| Left trigger | Unbound | Could be: crouch? interact? |
-| Both grips | Bound but unused | Could be: run/sprint? |
+- **CaseCanvas disabled** — was bright white background; actual case-board content lives elsewhere
+- **MinimapCanvas** — partially working, needs review
+- **Some additive items** — show as semi-transparent white overlays, not original colours
+- **PopupMessage** — game resets scale frequently (fixed each cycle, slight visual lag)
+- **Comfort options** not implemented: vignette, configurable snap-turn degrees, IPD adjustment
+- **VR arm rotation** may need per-item tuning (different held items may have different orientations)
+- **Left controller full tracking** — left laser beam works, but dual-hand physics interactions not implemented
+- **Trigger stopping issue** — user reported previously, not yet diagnosed
 
 ---
 
-## Canvas System Architecture (current)
+## Canvas System Architecture
 
 ```
 Every 90 frames — ScanAndConvertCanvases():
@@ -143,38 +141,14 @@ Every 90 frames — ScanAndConvertCanvases():
           - ForceUIZTestAlways() — patch all graphics materials
           - Add GraphicRaycaster
   3. Reparent pass: for each root canvas with scaled parent → SetParent(null, true)
-     + scale enforcement: re-apply correct scale if drifted (catches game resets)
-     + skips canvases with sizeDelta.x < 1 (zero-size canvases)
-  4. RescanCanvasAlpha (with 600-frame cooldown per canvas):
-     → RelaxMenuCanvasClipping (Menu/Panel/CaseBoard only)
-     → RelaxMenuTextMaterials (Menu/Panel/CaseBoard only — StrengthenMenuTextMaterial)
-     → ForceUIZTestAlways on new/changed graphics
-  5. Nested canvas discovery:
-     → GetComponentsInChildren<Canvas> on each root
-     → Skip (Clone) canvases, Loading Icon
-     → Disable nested CanvasScaler
-     → ForceUIZTestAlways on nested canvas
-     → Add to _managedCanvases + _nestedCanvasIds
+     + scale enforcement: re-apply correct scale if drifted
+  4. RescanCanvasAlpha (with 600-frame cooldown per canvas)
+  5. Nested canvas discovery + ForceUIZTestAlways
 
 Every frame — PositionCanvases():
   → HUD canvases: parented to HUDAnchor (fixed at dist/angle)
   → Menu/Panel/CaseBoard/Default: placed in front of head ONCE on first visibility
   → Tooltip: repositioned every frame
-  → Nested canvases: skipped (follow parent)
-  → Scale enforcement applies each scan, not each frame
-```
-
-### ForceUIZTestAlways material classification:
-```
-isAdditive = shader name contains "Additive", "Particle", or "Add"
-isBg       = GO name contains "background" or equals "BG"
-isText     = IsTextGraphic(g) — TMP_Text or Text component
-
-Material created once per (origMaterialID, boostType) pair:
-  isAdditive → shader = UI/Default, renderQueue=3001, color=(1,1,1,0.85)
-  isBg       → renderQueue=3000, color.a = UIBackgroundAlpha (0.07)
-  isText     → renderQueue=3009, StrengthenMenuTextMaterial(_FaceColor/_Color=32)
-  other      → renderQueue=3008, color *= 4 (min 0.01 per channel)
 ```
 
 ---
@@ -188,20 +162,14 @@ Material created once per (origMaterialID, boostType) pair:
 | XrSwapchainImageD3D11KHR | 1000003001 | `unchecked((int)0x3B9B3379)` |
 | XrGraphicsRequirementsD3D11KHR | 1000003002 | `unchecked((int)0x3B9B337A)` |
 
-Base types (SESSION_CREATE_INFO=8 etc.) use spec values unchanged.
-
 ### openxr-oculus-compatibility layer
-Must be disabled before `xrCreateInstance` — see `DisableUnityOpenXRLayer()` in `OpenXRManager.cs`.
+Must be disabled before `xrCreateInstance` — see `DisableUnityOpenXRLayer()`.
 
 ### Swapchain format
-`RenderTextureFormat.ARGB32` → format 28 (`DXGI_FORMAT_R8G8B8A8_UNORM`). `_preferredFormats = {28,29,87,91}`.
+`RenderTextureFormat.ARGB32` → format 28 (`DXGI_FORMAT_R8G8B8A8_UNORM`).
 
-### CRITICAL: HDRP flipYMode for RenderTexture rendering (Phase 10)
-When manually calling `Camera.Render()` to a RenderTexture in HDRP:
-- **DO NOT use**: `GL.invertCulling = true` + projection Y-negation together. Both reverse clip-space winding → double-correction → front-faces culled → walls invisible.
-- **DO use**: `HDAdditionalCameraData.flipYMode = ForceFlipY`. HDRP handles both image Y-flip AND culling correction atomically.
-- VR eye cameras MUST copy game camera's HDRP settings, especially `volumeLayerMask` (controls which Volumes provide lighting/sky).
-- Without correct `volumeLayerMask`, VR cameras won't pick up scene lighting/exposure/fog → rendering appears dark/unlit.
+### HDRP flipYMode
+Use `HDAdditionalCameraData.flipYMode = ForceFlipY` — never combine `GL.invertCulling` with projection Y-negation.
 
 ---
 
@@ -209,22 +177,16 @@ When manually calling `Camera.Render()` to a RenderTexture in HDRP:
 
 | Pitfall | Detail |
 |---------|--------|
-| `GetComponentInParent<Button>()` | Always returns null in IL2CPP — walk transform hierarchy manually |
-| `AddListener` on `new Button.ButtonClickedEvent()` | Silently fails — use `TryClickCanvas` GO instance ID intercept instead |
-| `btn.GetInstanceID()` | Returns COMPONENT id — use `btn.gameObject.GetInstanceID()` for GO comparisons |
-| `btn.onClick = new Button.ButtonClickedEvent()` | Kills persistent prefab-baked listeners — use to suppress game button default behaviour |
+| `GetComponentInParent<Button>()` | Always returns null — walk hierarchy manually |
+| `AddListener` on `new ButtonClickedEvent()` | Silently fails — use GO instance ID intercept |
+| `btn.GetInstanceID()` | Returns component id — use `btn.gameObject.GetInstanceID()` |
 | `Graphic.color` vs `mat.color` | Must set both for transparency in HDRP UI |
-| `g.color = ...` per-frame | Calls `SetVertexDirty()` → canvas mesh rebuild lag. Rate-limit. |
+| `g.color = ...` per-frame | Calls `SetVertexDirty()` → rebuild lag. Rate-limit. |
 | `Resources.FindObjectsOfTypeAll<Canvas>()` | More reliable than `FindObjectsOfType` in IL2CPP |
-| `TMP_Text.color` vs `Graphic.color` | TMP overrides base color — must cast to TMP_Text and set `.color` |
-| `FrameSettingsField.ExposureControl` | Cannot be overridden per-camera in HDRP 12 IL2CPP |
-| `AddComponent<RectTransform>()` on new GO | Returns null — use `AddComponent<Image>()` first, then `GetComponent<RectTransform>()` |
-| `DontDestroyOnLoad` on VRMod GOs | Required — scene transition destroys all non-persistent objects |
-| `canvas.enabled` per-frame toggle | Causes material instance flood → crash. Always state-track changes. |
-| `AudioListener.volume` | Zero effect on FMOD — use `FMODUnity.RuntimeManager.GetBus("bus:/").setVolume()` |
-| `CanvasScaler` + WorldSpace | Disable CanvasScaler BEFORE switching to WorldSpace — already implemented ✓ |
-| `Mobile/Particles/Additive` in HDRP WorldSpace | Does not render — replace shader with UI/Default ✓ |
-| Game resets canvas localScale | Reparented canvases have scale re-enforced every scan cycle ✓ |
+| `AddComponent<RectTransform>()` on new GO | Returns null — add Image first, then GetComponent |
+| `DontDestroyOnLoad` on VRMod GOs | Required — scene transition destroys non-persistent objects |
+| `CanvasScaler` + WorldSpace | Disable CanvasScaler BEFORE switching to WorldSpace |
+| `Mobile/Particles/Additive` in HDRP WorldSpace | Does not render — replace shader with UI/Default |
 
 ---
 
@@ -244,10 +206,9 @@ FMODUnity.RuntimeManager.GetVCA("vca:/Soundtrack").setVolume(vol);   // per-chan
 | File | Purpose |
 |------|---------|
 | `VRMod/SoDVR/OpenXRManager.cs` | OpenXR init, session, swapchain, frame loop, action sets |
-| `VRMod/SoDVR/VR/VRCamera.cs` | Stereo render loop, UI canvas management, controller click |
+| `VRMod/SoDVR/VR/VRCamera.cs` | Stereo render loop, UI canvas management, movement, arm display |
 | `VRMod/SoDVR/VR/VRSettingsPanel.cs` | VR Settings panel — 4 tabs, all settings wired |
 | `VRMod/SoDVR/Plugin.cs` | BepInEx entry point — do not change |
-| `VRMod/FAILURE-CaseBoard.md` | Full log of failed approaches for case board / UI polish |
 | `BepInEx/plugins/SoDVR.dll` | Deployed plugin (flat layout — never subdirectory) |
 | `BepInEx/LogOutput.log` | Runtime log |
 
@@ -259,8 +220,7 @@ FMODUnity.RuntimeManager.GetVCA("vca:/Soundtrack").setVolume(vol);   // per-chan
 - [x] Phase 6: Camera positioning, head tracking, UI canvases visible in VR
 - [x] Phase 7: Controller pose + trigger click + cursor dot tracking
 - [x] Phase 8: VR Settings Panel — 4 tabs, FMOD audio, Settings button intercept (`12172ad`)
-- [x] **Phase 9**: Canvas sizes fixed, UI text/icons visible, crash prevention, notebook sizing
-- [x] **Phase 10**: World graphics — walls/floors visible, lighting correct, HDRP Volume config (`546a4b5`)
-- [ ] **Phase 11 (next)**: Movement — thumbstick locomotion, snap turn, jump, interact bindings
-- [ ] Phase 12: Comfort options (vignette, snap-turn degrees, IPD)
-- [ ] Phase 13: Left controller full tracking + dual-hand interactions
+- [x] Phase 9: Canvas sizes fixed, UI text/icons visible, crash prevention, notebook sizing
+- [x] Phase 10: World graphics — walls/floors visible, lighting correct (`546a4b5`)
+- [x] **Phase 11**: Movement — all controls bound, held items + arm display (`255dafc`)
+- [ ] **Phase 12 (next)**: Comfort options (vignette, snap-turn config, IPD) + polish
