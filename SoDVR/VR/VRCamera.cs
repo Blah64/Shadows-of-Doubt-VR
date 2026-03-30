@@ -84,6 +84,7 @@ public class VRCamera : MonoBehaviour
     // and then stays at that world position so the player can look around it freely.
     private readonly Dictionary<int, Canvas> _managedCanvases = new();
     private int _canvasTick; // counts Update() calls; resets at UICanvasScanRate
+    private int _forceScanFrames; // when >0, force a scan every frame (counts down)
     // Rate-limit RescanCanvasAlpha: maps canvas instance ID → frame number of last rescan.
     // Prevents rescanning the same canvas every 90 frames (huge canvases like MinimapCanvas
     // create 1300+ materials per rescan cycle, causing D3D device loss crashes).
@@ -212,10 +213,25 @@ public class VRCamera : MonoBehaviour
     private Vector3    _gripDragOffset;       // world offset from controller to canvas at grab time
     private Quaternion _gripDragRotOffset;    // rotation offset at grab time
     private bool       _gripWasPressed;       // previous frame grip state (edge detection)
-    // Relative offsets (position only) from primary CaseCanvas to other CaseBoard canvases.
+    // Relative offsets (position + rotation) from primary CaseCanvas to other CaseBoard canvases.
     // Preserved across opens so the user's layout is maintained.
-    private readonly Dictionary<int, Vector3> _caseBoardOffsets = new();
+    private readonly Dictionary<int, (Vector3 pos, Quaternion rot)> _caseBoardOffsets = new();
     private int _caseBoardPrimaryId = -1;     // CaseCanvas instance ID (primary anchor)
+    // Grip-drag offset stored relative to ActionPanelCanvas (the case board selection UI).
+    // ActionPanelCanvas recentres each time the case board opens, so offsets stay consistent.
+    private readonly Dictionary<int, (Vector3 offset, Quaternion rot)> _gripDragAnchorOffsets = new();
+    private Canvas? _actionPanelCanvas;       // ActionPanelCanvas reference — anchor for grip-drag offsets
+    private int     _actionPanelId = -1;
+    private bool _caseBoardChildDumped;  // one-time diagnostic flag
+    private bool _caseBoardDiagDone;   // one-time CaseBoard visibility diagnostic
+    private int  _placementIndex;     // incremental depth offset counter per placement cycle
+    private int  _clickDiagCount;     // click component diagnostic counter
+
+    // Canvases without CanvasGroup that have enough active Graphics to be considered
+    // "actually showing content".  Updated every scan cycle.  Used by depth scan / click
+    // system to skip MenuCanvas when the pause menu is hidden (game hides it without CG).
+    private readonly HashSet<int> _noGroupInteractable = new();
+    private const int MinActiveGraphicsForInteractable = 5;
 
     // Canvas instance IDs that belong to VRMod itself (settings panel, cursor, etc.).
     // Every mutation pass (RescanCanvasAlpha, etc.) must skip canvases in this set —
@@ -447,7 +463,9 @@ public class VRCamera : MonoBehaviour
 
         // Scan for new screen-space canvases and convert them to WorldSpace.
         // Skipped during the post-scene-load grace period.
-        if (++_canvasTick >= UICanvasScanRate && _sceneLoadGrace == 0)
+        bool forceScan = _forceScanFrames > 0;
+        if (forceScan) _forceScanFrames--;
+        if ((++_canvasTick >= UICanvasScanRate || forceScan) && _sceneLoadGrace == 0)
         {
             _canvasTick = 0;
             try { ScanAndConvertCanvases(); }
@@ -1245,6 +1263,11 @@ public class VRCamera : MonoBehaviour
                 // which overrides our LateUpdate position writes on LagPivot.
                 ForceItemPositionPreRender();
 
+                // Force CaseCanvas to follow ActionPanelCanvas every frame.
+                // The game continuously repositions CaseCanvas to Camera.main-relative coords,
+                // so we must override it every frame to keep it near the VR player.
+                EnforceCaseCanvasPosition();
+
                 // No GL.invertCulling — HDRP flipYMode handles both Y-flip and culling.
                 _rightCam.Render();
                 _leftCam.Render();
@@ -1374,9 +1397,7 @@ public class VRCamera : MonoBehaviour
                     {
                         if (child == null || child == canvas.transform) continue;
                         string cn = child.gameObject.name ?? "";
-                        if (cn.Equals("BG", StringComparison.OrdinalIgnoreCase) ||
-                            cn.Equals("Viewport", StringComparison.OrdinalIgnoreCase) ||
-                            cn.Equals("ContentContainer", StringComparison.OrdinalIgnoreCase))
+                        if (cn.Equals("BG", StringComparison.OrdinalIgnoreCase))
                         {
                             // Hide background elements by making their graphics transparent
                             var bg = child.GetComponent<Graphic>();
@@ -1385,6 +1406,10 @@ public class VRCamera : MonoBehaviour
                             Log.LogInfo($"[VRCamera] CaseCanvas: suppressed BG element '{cn}'");
                         }
                     }
+                    // Disable GraphicRaycaster so CaseCanvas doesn't intercept clicks
+                    // meant for notes/notebook on WindowCanvas in front of it.
+                    var caseGR = canvas.GetComponent<GraphicRaycaster>();
+                    if (caseGR != null) caseGR.enabled = false;
                 }
                 catch { }
                 // Fall through to normal conversion below
@@ -1399,6 +1424,18 @@ public class VRCamera : MonoBehaviour
             {
                 _menuCanvasRef = canvas;
                 PatchMenuSettingsButton(canvas);
+            }
+            // Cache ActionPanelCanvas — used as anchor for grip-drag offset persistence.
+            if (string.Equals(cname, "ActionPanelCanvas", StringComparison.OrdinalIgnoreCase))
+            {
+                _actionPanelCanvas = canvas;
+                _actionPanelId = id;
+            }
+            // Cache CaseCanvas — enforced to follow ActionPanelCanvas every frame.
+            if (string.Equals(cname, "CaseCanvas", StringComparison.OrdinalIgnoreCase))
+            {
+                _casePanelCanvas = canvas;
+                _casePanelId = id;
             }
         }
 
@@ -1591,6 +1628,32 @@ public class VRCamera : MonoBehaviour
                 var  mcMode     = _menuCanvasRef.renderMode;
                 int  mcFades    = _managedFades.Count;
                 Log.LogInfo($"[VRCamera] MenuCanvasDiag: enabled={mcEnabled} active={mcActive} mode={mcMode} managedFades={mcFades}");
+            }
+            catch { }
+        }
+
+        // Update no-CanvasGroup interactable cache.
+        // For canvases without a CanvasGroup, we can't detect visibility via alpha.
+        // Instead, count active Graphics — if below threshold, the canvas is "hidden"
+        // (e.g. MenuCanvas has ~3 active decorative Graphics when the pause menu is closed,
+        // but hundreds when the menu is actually open).
+        _noGroupInteractable.Clear();
+        foreach (var kvp in _managedCanvases)
+        {
+            var c = kvp.Value;
+            if (c == null || !c.gameObject.activeSelf || !c.enabled) continue;
+            // Only check canvases without CanvasGroup — others use CG alpha.
+            try
+            {
+                var cg = c.GetComponent<CanvasGroup>();
+                if (cg != null) continue;  // CanvasGroup exists → handled by alpha check
+            }
+            catch { continue; }
+            try
+            {
+                var graphics = c.GetComponentsInChildren<Graphic>(false);  // false = active only
+                if (graphics.Count >= MinActiveGraphicsForInteractable)
+                    _noGroupInteractable.Add(kvp.Key);
             }
             catch { }
         }
@@ -2695,6 +2758,57 @@ public class VRCamera : MonoBehaviour
 
         int cursorId = _cursorCanvas != null ? _cursorCanvas.GetInstanceID() : -1;
 
+        // One-time CaseCanvas child dump — understand what interactive elements exist
+        if (!_caseBoardChildDumped && Time.frameCount % 60 == 0)
+        {
+            foreach (var kvp in _managedCanvases)
+            {
+                if (kvp.Value == null) continue;
+                string dn = kvp.Value.gameObject.name ?? "";
+                if (!dn.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!kvp.Value.gameObject.activeSelf) continue;
+                _caseBoardChildDumped = true;
+
+                // Dump direct children and their component types
+                var root = kvp.Value.transform;
+                Log.LogInfo($"[VRCamera] CaseCanvasDump: {root.childCount} direct children, renderMode={kvp.Value.renderMode}");
+                for (int ci = 0; ci < root.childCount && ci < 20; ci++)
+                {
+                    var ch = root.GetChild(ci);
+                    if (ch == null) continue;
+                    string chName = ch.gameObject.name ?? "?";
+                    bool chActive = ch.gameObject.activeSelf;
+                    // List component type names
+                    var comps = ch.GetComponents<Component>();
+                    var compNames = new System.Text.StringBuilder();
+                    foreach (var comp in comps)
+                    {
+                        if (comp == null) continue;
+                        try { compNames.Append(comp.GetIl2CppType()?.Name ?? "?").Append(","); } catch { }
+                    }
+                    Log.LogInfo($"[VRCamera]   child[{ci}] '{chName}' active={chActive} comps=[{compNames}]");
+
+                    // Dump grandchildren (1 level deeper)
+                    for (int gi = 0; gi < ch.childCount && gi < 10; gi++)
+                    {
+                        var gc = ch.GetChild(gi);
+                        if (gc == null) continue;
+                        string gcName = gc.gameObject.name ?? "?";
+                        bool gcActive = gc.gameObject.activeSelf;
+                        var gComps = gc.GetComponents<Component>();
+                        var gCompNames = new System.Text.StringBuilder();
+                        foreach (var comp in gComps)
+                        {
+                            if (comp == null) continue;
+                            try { gCompNames.Append(comp.GetIl2CppType()?.Name ?? "?").Append(","); } catch { }
+                        }
+                        Log.LogInfo($"[VRCamera]     grandchild[{gi}] '{gcName}' active={gcActive} comps=[{gCompNames}]");
+                    }
+                }
+                break;
+            }
+        }
+
         // Active-state tracking: detect false→true transitions to trigger recentre.
         foreach (var kvp in _managedCanvases)
         {
@@ -2714,11 +2828,35 @@ public class VRCamera : MonoBehaviour
                 // Clear rescan cooldown so material drift is fixed immediately
                 // when a dialog becomes visible (game sets text content on show).
                 _lastRescanFrame.Remove(tid);
+
+                // When ActionPanelCanvas becomes visible (case board opens),
+                // force-recentre ALL CaseBoard canvases + WindowCanvas so everything
+                // moves to the player's current position.  Notes/notebook are children
+                // of WindowCanvas (InterfaceController.windowCanvas), not CaseCanvas.
+                string tn = kvp.Value.gameObject.name ?? "";
+                if (tn.Equals("ActionPanelCanvas", StringComparison.OrdinalIgnoreCase))
+                {
+                    _caseBoardPrimaryId = -1; // reset primary so it's re-elected
+                    foreach (var cb in _managedCanvases)
+                    {
+                        if (cb.Value == null) continue;
+                        string cbName = cb.Value.gameObject.name ?? "";
+                        var cbCat = GetCanvasCategory(cbName);
+                        if (cbCat == CanvasCategory.CaseBoard
+                            || cbName.Equals("WindowCanvas", StringComparison.OrdinalIgnoreCase))
+                        {
+                            _positionedCanvases.Remove(cb.Key);
+                            _lastRescanFrame.Remove(cb.Key);
+                        }
+                    }
+                    Log.LogInfo("[VRCamera] ActionPanelCanvas activated — recentring CaseBoard + WindowCanvas");
+                }
             }
 
             _canvasWasActive[tid] = nowActive;
         }
 
+        _placementIndex = 0;
         foreach (var kvp in _managedCanvases)
         {
             var canvas = kvp.Value;
@@ -2842,14 +2980,34 @@ public class VRCamera : MonoBehaviour
             // ── Menu, Panel, CaseBoard, Default ──────────────────────────────
             // Skip if already positioned and not needing recentre.
             if (_positionedCanvases.Contains(id)) continue;
+            _placementIndex++; // incremental depth offset to prevent z-fighting
             // Skip if not currently visible (will be placed when it activates).
-            if (!IsCanvasVisible(canvas)) continue;
+            // Exception: CaseBoard canvases are always positioned — the game may
+            // fade them in via CanvasGroup after our positioning pass.
+            if (!IsCanvasVisible(canvas) && cat != CanvasCategory.CaseBoard) continue;
 
             float dist = catDefs.Distance;
             float vOff = catDefs.VerticalOffset;
 
             // PopupMessage/TutorialMessage: now nested under TooltipCanvas, handled in dialog mode above.
             string cname = canvas.gameObject.name ?? "";
+            // One-time CaseCanvas diagnostic: log CanvasGroup state to understand visibility
+            if (cat == CanvasCategory.CaseBoard && !_caseBoardDiagDone)
+            {
+                try
+                {
+                    var cg = canvas.GetComponent<CanvasGroup>();
+                    float cgA = cg != null ? cg.alpha : -1f;
+                    bool cgBR = cg != null ? cg.blocksRaycasts : true;
+                    bool vis = IsCanvasVisible(canvas);
+                    int graphicCount = 0;
+                    try { graphicCount = canvas.GetComponentsInChildren<Graphic>(false).Count; } catch { }
+                    Log.LogInfo($"[VRCamera] CaseBoardDiag '{cname}': CGalpha={cgA:F2} blocks={cgBR} visible={vis} activeGraphics={graphicCount} active={canvas.gameObject.activeSelf} enabled={canvas.enabled}");
+                }
+                catch { }
+                if (cname.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase))
+                    _caseBoardDiagDone = true;
+            }
             // ActionPanelCanvas: 0.15m closer than CaseBoard so action buttons are in front
             if (cname.Equals("ActionPanelCanvas", StringComparison.OrdinalIgnoreCase))
                 dist = GetCategoryDefaults(CanvasCategory.CaseBoard).Distance - 0.15f;
@@ -2869,10 +3027,10 @@ public class VRCamera : MonoBehaviour
                         && _positionedCanvases.Contains(_caseBoardPrimaryId))
                     {
                         // Apply stored relative offset from primary
-                        if (_caseBoardOffsets.TryGetValue(id, out var offset))
+                        if (_caseBoardOffsets.TryGetValue(id, out var stored))
                         {
-                            canvas.transform.position = primary.transform.position + offset;
-                            canvas.transform.rotation = primary.transform.rotation;
+                            canvas.transform.position = primary.transform.position + stored.pos;
+                            canvas.transform.rotation = stored.rot;
                             _positionedCanvases.Add(id);
                             continue;
                         }
@@ -2887,11 +3045,34 @@ public class VRCamera : MonoBehaviour
                 }
             }
 
-            canvas.transform.position = headPos + forward * dist + Vector3.up * vOff;
-            canvas.transform.rotation = yawOnly;
-            _positionedCanvases.Add(id);
-
-            Log.LogInfo($"[VRCamera] Placed '{cname}' [{cat}] dist={dist:F2}m yaw={headYaw:F1}°");
+            // If user previously grip-dragged this canvas, restore relative to
+            // ActionPanelCanvas (case board selection UI).  Offset is in anchor-local
+            // space so it rotates with the anchor when the case board reopens.
+            if (_gripDragAnchorOffsets.TryGetValue(id, out var anchorOff) &&
+                _actionPanelCanvas != null && _positionedCanvases.Contains(_actionPanelId))
+            {
+                Quaternion anchorRot = _actionPanelCanvas.transform.rotation;
+                canvas.transform.position = _actionPanelCanvas.transform.position + anchorRot * anchorOff.offset;
+                canvas.transform.rotation = anchorRot * anchorOff.rot;
+                _positionedCanvases.Add(id);
+                Log.LogInfo($"[VRCamera] Restored '{cname}' [{cat}] from ActionPanel-relative offset");
+            }
+            else if (_gripDragAnchorOffsets.TryGetValue(id, out _) &&
+                     _actionPanelCanvas != null && !_positionedCanvases.Contains(_actionPanelId))
+            {
+                // ActionPanelCanvas not positioned yet this cycle — defer to next frame
+                // so we don't fall through to default placement and lose the offset.
+                continue;
+            }
+            else
+            {
+                // Incremental depth offset (0.03m per canvas) prevents z-fighting between coplanar canvases
+                float depthJitter = _placementIndex * 0.03f;
+                canvas.transform.position = headPos + forward * (dist - depthJitter) + Vector3.up * vOff;
+                canvas.transform.rotation = yawOnly;
+                _positionedCanvases.Add(id);
+                Log.LogInfo($"[VRCamera] Placed '{cname}' [{cat}] dist={dist - depthJitter:F2}m yaw={headYaw:F1}°");
+            }
         }
 
         // Sync map/content nested canvases to CaseCanvas transform.
@@ -2920,6 +3101,39 @@ public class VRCamera : MonoBehaviour
         }
         catch { }
         return true;
+    }
+
+    /// <summary>
+    /// Returns true when a canvas should be skipped in the depth scan / click system.
+    /// Covers two cases:
+    ///   1. CanvasGroup on the canvas or any ancestor has alpha &lt; 0.1 or blocksRaycasts=false.
+    ///   2. No CanvasGroup at all AND not enough active Graphics to be considered "showing content"
+    ///      (e.g. MenuCanvas when the pause menu is hidden has ~3 decorative Graphics).
+    /// </summary>
+    private bool IsCanvasEffectivelyHidden(Canvas c)
+    {
+        bool hasCanvasGroup = false;
+        try
+        {
+            var groups = c.GetComponentsInParent<CanvasGroup>(true);
+            foreach (var cg in groups)
+            {
+                if (cg == null) continue;
+                hasCanvasGroup = true;
+                if (cg.alpha < 0.1f || !cg.blocksRaycasts) return true;
+            }
+        }
+        catch { }
+
+        // No CanvasGroup — use the cached active-Graphics count from the scan cycle.
+        // Canvases with fewer than MinActiveGraphicsForInteractable active Graphics
+        // are treated as hidden (e.g. MenuCanvas with only Border elements visible).
+        if (!hasCanvasGroup)
+        {
+            int cid = c.GetInstanceID();
+            if (!_noGroupInteractable.Contains(cid)) return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -3062,15 +3276,8 @@ public class VRCamera : MonoBehaviour
                 var c = kvp.Value;
                 if (c == null) continue;
                 if (!c.gameObject.activeSelf || !c.enabled) continue;
-                // Skip canvases hidden via CanvasGroup.alpha (invisible wall prevention).
-                // These canvases remain activeSelf=true but are visually transparent;
-                // the ray should pass through them as if they don't exist.
-                try
-                {
-                    var cg = c.GetComponent<CanvasGroup>();
-                    if (cg != null && cg.alpha < 0.1f) continue;
-                }
-                catch { }
+                // Skip canvases hidden via CanvasGroup OR all-children-inactive (MenuCanvas).
+                if (IsCanvasEffectivelyHidden(c)) continue;
                 // Exclude cursor canvas — by ref AND by name as belt-and-suspenders.
                 if (_cursorCanvas != null && c.GetInstanceID() == _cursorCanvas.GetInstanceID()) continue;
                 if (c.gameObject.name?.IndexOf("VRCursor", StringComparison.OrdinalIgnoreCase) >= 0) continue;
@@ -3107,6 +3314,45 @@ public class VRCamera : MonoBehaviour
 
             if (foundHit && bestCanvas != null)
             {
+                // Periodic aim dot diagnostic — every 120 frames log which canvas has the dot
+                if (Time.frameCount % 120 == 0)
+                {
+                    float cgA = -1f;
+                    bool cgB = true;
+                    try { var cg3 = bestCanvas.GetComponent<CanvasGroup>(); if (cg3 != null) { cgA = cg3.alpha; cgB = cg3.blocksRaycasts; } } catch { }
+                    Log.LogInfo($"[VRCamera] AimDot → '{bestCanvas.gameObject.name}' depth={bestDepth:F2} cgAlpha={cgA:F2} blocks={cgB}");
+
+                    // CaseCanvas depth-scan diagnostic: trace why it was skipped
+                    foreach (var dkvp in _managedCanvases)
+                    {
+                        var dc = dkvp.Value;
+                        if (dc == null) continue;
+                        string dcn = dc.gameObject.name ?? "";
+                        if (!dcn.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase)) continue;
+                        bool dActive = dc.gameObject.activeSelf && dc.enabled;
+                        bool dHidden = IsCanvasEffectivelyHidden(dc);
+                        bool dNested = _nestedCanvasIds.Contains(dkvp.Key);
+                        bool dPositioned = _positionedCanvases.Contains(dkvp.Key);
+                        var dPl = new Plane(-dc.transform.forward, dc.transform.position);
+                        bool dPlaneHit = dPl.Raycast(new Ray(dCtrlPos, dCtrlFwd), out float dHitDist) && dHitDist > 0f;
+                        bool dBoundsOk = false;
+                        if (dPlaneHit)
+                        {
+                            Vector3 dlp = dc.transform.InverseTransformPoint(dCtrlPos + dCtrlFwd * dHitDist);
+                            var drt = dc.GetComponent<RectTransform>();
+                            if (drt != null)
+                            {
+                                Vector2 dhs = drt.sizeDelta * 0.5f;
+                                dBoundsOk = Mathf.Abs(dlp.x) <= dhs.x && Mathf.Abs(dlp.y) <= dhs.y;
+                            }
+                        }
+                        float dDepth = Vector3.Dot(dc.transform.position - dHeadPos, dHeadFwd);
+                        int childCount = 0;
+                        try { childCount = dc.GetComponentsInChildren<Graphic>(false).Count; } catch { }
+                        Log.LogInfo($"[VRCamera] CaseCanvasTrace: active={dActive} hidden={dHidden} nested={dNested} positioned={dPositioned} planeHit={dPlaneHit} bounds={dBoundsOk} depth={dDepth:F2} graphics={childCount} worldPos=({dc.transform.position.x:F2},{dc.transform.position.y:F2},{dc.transform.position.z:F2})");
+                        break;
+                    }
+                }
                 _cursorHasTarget   = true;
                 _cursorTargetPos   = bestCanvas.transform.position;
                 _cursorTargetRot   = bestCanvas.transform.rotation;
@@ -3235,7 +3481,23 @@ public class VRCamera : MonoBehaviour
                 primary != null)
             {
                 int dragId = _gripDragCanvas.GetInstanceID();
-                _caseBoardOffsets[dragId] = _gripDragCanvas.transform.position - primary.transform.position;
+                _caseBoardOffsets[dragId] = (
+                    _gripDragCanvas.transform.position - primary.transform.position,
+                    _gripDragCanvas.transform.rotation
+                );
+            }
+
+            // Store offset in ActionPanelCanvas's LOCAL coordinate space.
+            // This means the offset rotates with the anchor — when the case board
+            // reopens facing a different direction, the arrangement is preserved.
+            if (_actionPanelCanvas != null)
+            {
+                int dragId = _gripDragCanvas.GetInstanceID();
+                Quaternion invAnchorRot = Quaternion.Inverse(_actionPanelCanvas.transform.rotation);
+                _gripDragAnchorOffsets[dragId] = (
+                    invAnchorRot * (_gripDragCanvas.transform.position - _actionPanelCanvas.transform.position),
+                    invAnchorRot * _gripDragCanvas.transform.rotation
+                );
             }
 
             Log.LogInfo($"[VRCamera] GripDrag end: '{_gripDragCanvas.gameObject.name}'");
@@ -3825,6 +4087,24 @@ public class VRCamera : MonoBehaviour
         arm.position += ctrlT.forward * ArmForwardOffset;
     }
 
+    /// <summary>Force CaseCanvas to follow ActionPanelCanvas. Called every frame because the game
+    /// continuously repositions CaseCanvas to Camera.main-relative world coords.</summary>
+    private void EnforceCaseCanvasPosition()
+    {
+        if (_casePanelCanvas == null || _actionPanelCanvas == null) return;
+        try
+        {
+            if (!_actionPanelCanvas.gameObject.activeSelf) return;
+            // Place CaseCanvas 0.15m BEHIND ActionPanelCanvas (further from player)
+            // so the corkboard doesn't block action panel button clicks.
+            // "forward" points toward the player, so +forward moves it behind (further away).
+            var apT = _actionPanelCanvas.transform;
+            _casePanelCanvas.transform.position = apT.position + apT.forward * 0.15f;
+            _casePanelCanvas.transform.rotation = apT.rotation;
+        }
+        catch { }
+    }
+
     /// <summary>Called right before each VR eye camera renders — last chance to position items + arms.</summary>
     private void ForceItemPositionPreRender()
     {
@@ -4178,8 +4458,8 @@ public class VRCamera : MonoBehaviour
             // Skip HUD and Ignored canvases — not interactable, must not steal clicks.
             var clickCat = GetCanvasCategory(canvas.gameObject.name);
             if (clickCat == CanvasCategory.HUD || clickCat == CanvasCategory.Ignored) continue;
-            // Skip alpha-hidden canvases (ghost canvas prevention).
-            try { var cg = canvas.GetComponent<CanvasGroup>(); if (cg != null && cg.alpha < 0.1f) continue; } catch { }
+            // Skip canvases hidden via CanvasGroup OR all-children-inactive (MenuCanvas).
+            if (IsCanvasEffectivelyHidden(canvas)) continue;
             // Skip nested canvases — their clicks are handled via the parent canvas.
             if (_nestedCanvasIds.Contains(kvp.Key)) continue;
             var plane = new Plane(-canvas.transform.forward, canvas.transform.position);
@@ -4236,6 +4516,11 @@ public class VRCamera : MonoBehaviour
                 var results = new Il2CppSystem.Collections.Generic.List<RaycastResult>();
                 gr.Raycast(ped, results);
 
+                // Log CaseCanvas click attempts even when no results
+                string hcName = hitCanvas.gameObject.name ?? "";
+                if (hcName.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase))
+                    Log.LogInfo($"[VRCamera] CaseCanvas click test: results={results.Count} screenPt=({screenPt.x:F0},{screenPt.y:F0},{screenPt.z:F2})");
+
                 if (results.Count > 0)
                 {
                     var go = results[0].gameObject;
@@ -4289,10 +4574,105 @@ public class VRCamera : MonoBehaviour
                         }
                     }
 
-                    ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerEnterHandler);
-                    ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerDownHandler);
-                    ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerUpHandler);
-                    ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerClickHandler);
+                    // Set PointerEventData fields that Unity's handlers check.
+                    ped.pointerEnter       = go;
+                    ped.pointerPress       = go;
+                    ped.rawPointerPress    = go;
+                    ped.pointerDrag        = go;
+                    ped.pressPosition      = ped.position;
+                    ped.pointerCurrentRaycast = results[0];
+                    ped.pointerPressRaycast   = results[0];
+                    ped.eligibleForClick   = true;
+                    ped.button             = PointerEventData.InputButton.Left;
+
+                    // Log component types on clicked GO + parent hierarchy
+                    if (_clickDiagCount < 10)
+                    {
+                        _clickDiagCount++;
+                        try
+                        {
+                            var tr = go.transform;
+                            for (int lvl = 0; lvl < 6 && tr != null; lvl++)
+                            {
+                                var comps = tr.gameObject.GetComponents<Component>();
+                                var sb = new System.Text.StringBuilder();
+                                foreach (var comp in comps)
+                                {
+                                    if (comp == null) continue;
+                                    sb.Append(comp.GetIl2CppType()?.Name ?? "?");
+                                    sb.Append(',');
+                                }
+                                Log.LogInfo($"[VRCamera] ClickHier[{lvl}] '{tr.gameObject.name}' comps=[{sb}]");
+                                tr = tr.parent;
+                            }
+                        }
+                        catch { }
+                    }
+
+                    // ── Button detection ────────────────────────────────────────────
+                    // Check for a Button FIRST. If found, use ONLY the manual persistent-
+                    // listener invocation and skip ExecuteEvents entirely. This prevents
+                    // double-fire: ExecuteEvents.pointerClickHandler/submitHandler can
+                    // also trigger Button.onClick, causing the action to fire twice.
+                    bool handledByButton = false;
+                    try
+                    {
+                        var btr = go.transform;
+                        for (int bl = 0; bl < 6 && btr != null; bl++)
+                        {
+                            var btn = btr.GetComponent<Button>();
+                            if (btn != null)
+                            {
+                                handledByButton = true;
+                                int persistentCount = btn.onClick.GetPersistentEventCount();
+
+                                // Fire persistent onClick listeners only — replicate the game's
+                                // OnPointerClick listener-toggle logic WITHOUT calling OnLeftClick,
+                                // which fires the OnPress delegate and causes double-fire.
+                                try
+                                {
+                                    for (int pi = 0; pi < persistentCount; pi++)
+                                        btn.onClick.SetPersistentListenerState(pi, UnityEngine.Events.UnityEventCallState.RuntimeOnly);
+                                    btn.onClick.Invoke();
+                                    for (int pi = 0; pi < persistentCount; pi++)
+                                        btn.onClick.SetPersistentListenerState(pi, UnityEngine.Events.UnityEventCallState.Off);
+                                }
+                                catch (Exception oce) { Log.LogWarning($"[VRCamera] onClick persistent invoke: {oce.Message}"); }
+
+                                // Force canvas scans for the next 30 frames so newly spawned UI is found promptly
+                                _forceScanFrames = 30;
+                                // Recentre WindowCanvas so newly spawned notes/notebook appear near player
+                                foreach (var wkvp in _managedCanvases)
+                                {
+                                    if (wkvp.Value == null) continue;
+                                    string wn = wkvp.Value.gameObject.name ?? "";
+                                    if (wn.Equals("WindowCanvas", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        _positionedCanvases.Remove(wkvp.Key);
+                                        break;
+                                    }
+                                }
+
+                                Log.LogInfo($"[VRCamera] Button invoked (persistent only): '{btr.gameObject.name}' persistent={persistentCount}");
+                                break;
+                            }
+                            btr = btr.parent;
+                        }
+                    }
+                    catch (Exception bex) { Log.LogWarning($"[VRCamera] Button invoke: {bex.Message}"); }
+
+                    // ── Non-button click handling ───────────────────────────────────
+                    // Only fire ExecuteEvents if no Button was found — this handles
+                    // custom IPointerClickHandler implementations (e.g. notes, toggles).
+                    if (!handledByButton)
+                    {
+                        ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerEnterHandler);
+                        ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerDownHandler);
+                        ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerUpHandler);
+                        ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerClickHandler);
+                        ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.submitHandler);
+                    }
+
                     return; // handled — stop checking further canvases
                 }
                 // No graphic at this canvas plane — fall through to next closest canvas
