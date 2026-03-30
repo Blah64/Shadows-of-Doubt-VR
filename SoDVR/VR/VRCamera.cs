@@ -228,6 +228,7 @@ public class VRCamera : MonoBehaviour
     private GameObject?   _rightControllerGO;
     private GameObject?   _leftControllerGO;
     private LineRenderer? _laserLine;         // laser pointer beam from right controller
+    private LineRenderer? _leftLaserLine;     // laser pointer beam from left controller (interact)
 
     // ── Scene-change guard ────────────────────────────────────────────────────
     // When Unity loads a new scene (save load, new game) we stop calling
@@ -262,6 +263,10 @@ public class VRCamera : MonoBehaviour
     private Transform?        _fpsControllerTransform; // FPSController — controls player yaw
     private Transform?        _cameraPivotTransform;   // first child above Main Camera for pitch (CamTransitionModifier or CameraLeanPivot)
     private bool              _cameraLookDisabled;     // true after we've disabled the game's mouse-look components
+    private FirstPersonItemController? _fpsItemController; // cached for item hand tracking
+    private Transform? _lagPivotTransform;                  // LagPivot — reparented to controller
+    private Transform? _lagPivotOrigParent;                 // original parent (3DUI) for restore
+    private InteractionController? _interactionController;  // cached for carried-object tracking
     private const float MoveDeadZone = 0.15f;
     private const float MoveSpeed       = 4.0f;   // m/s at full deflection
     private const float SprintMultiplier = 1.8f;  // sprint speed = MoveSpeed * this
@@ -394,6 +399,15 @@ public class VRCamera : MonoBehaviour
                 _fpsControllerTransform = null;
                 _cameraPivotTransform   = null;
                 _cameraLookDisabled     = false;
+                // Restore LagPivot to original parent before clearing references
+                if (_lagPivotTransform != null && _lagPivotOrigParent != null)
+                {
+                    try { _lagPivotTransform.SetParent(_lagPivotOrigParent, false); } catch { }
+                }
+                _fpsItemController      = null;
+                _interactionController  = null;
+                _lagPivotTransform      = null;
+                _lagPivotOrigParent     = null;
                 StopSprint();
                 Log.LogInfo("[VRCamera] Game camera lost — same-scene reload detected; canvas scan paused 120 frames, movement state reset.");
             }
@@ -768,6 +782,7 @@ public class VRCamera : MonoBehaviour
             UpdateNotebook();
             UpdateFlashlight();
             UpdateInventory();
+            UpdateHeldItemTracking();
         }
 
         // One-shot movement system discovery (runs once after stereo is ready and game cam found).
@@ -883,6 +898,37 @@ public class VRCamera : MonoBehaviour
             Log.LogInfo("[VRCamera] VRLaserBeam created");
         }
         catch (Exception ex) { Log.LogWarning($"[VRCamera] Laser beam creation failed: {ex.Message}"); }
+
+        // Left hand laser pointer — same style, toggled via VR Settings "Left Laser".
+        try
+        {
+            var leftLaserGO = new GameObject("VRLeftLaserBeam");
+            UnityEngine.Object.DontDestroyOnLoad(leftLaserGO);
+            leftLaserGO.transform.SetParent(leftCtrlGO.transform, false);
+            _leftLaserLine = leftLaserGO.AddComponent<LineRenderer>();
+            _leftLaserLine.useWorldSpace  = true;
+            _leftLaserLine.positionCount  = 2;
+            _leftLaserLine.startWidth     = 0.012f;
+            _leftLaserLine.endWidth       = 0.006f;
+            _leftLaserLine.numCapVertices = 4;
+            _leftLaserLine.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            _leftLaserLine.receiveShadows = false;
+            var leftLaserShader = Shader.Find("HDRP/Unlit") ?? Shader.Find("Unlit/Color") ?? Shader.Find("Sprites/Default");
+            if (leftLaserShader != null)
+            {
+                var leftLaserMat = new Material(leftLaserShader);
+                leftLaserMat.name = "VRLeftLaserMat";
+                var leftLaserColor = new Color(0f, 4096f, 4096f, 1f); // same HDR cyan
+                leftLaserMat.color = leftLaserColor;
+                try { leftLaserMat.SetColor("_UnlitColor", leftLaserColor); } catch { }
+                try { leftLaserMat.SetColor("_BaseColor",  leftLaserColor); } catch { }
+                leftLaserMat.renderQueue = 5000;
+                _leftLaserLine.material = leftLaserMat;
+            }
+            _leftLaserLine.enabled = false;
+            Log.LogInfo("[VRCamera] VRLeftLaserBeam created");
+        }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] Left laser creation failed: {ex.Message}"); }
 
         // Cursor dot: ScreenSpaceOverlay canvas created here, converted to WorldSpace by
         // ScanAndConvertCanvases — same pipeline as all game canvases, giving HDRP registration.
@@ -1179,6 +1225,11 @@ public class VRCamera : MonoBehaviour
             {
                 if ((_frameCount % (RenderEveryNFrames * 4)) == 0)
                     Canvas.ForceUpdateCanvases();
+
+                // Force item position AFTER canvas layout but BEFORE rendering.
+                // Canvas.ForceUpdateCanvases() above recalculates RectTransform positions,
+                // which overrides our LateUpdate position writes on LagPivot.
+                ForceItemPositionPreRender();
 
                 // No GL.invertCulling — HDRP flipYMode handles both Y-flip and culling.
                 _rightCam.Render();
@@ -2690,6 +2741,28 @@ public class VRCamera : MonoBehaviour
             catch { }
         }
 
+        // Left laser pointer: toggled via VR Settings "Left Laser" toggle.
+        if (_leftLaserLine != null && _leftControllerGO != null)
+        {
+            bool showLeft = VRSettingsPanel.LeftLaserEnabled;
+            if (showLeft)
+            {
+                try
+                {
+                    Vector3 lStart = _leftControllerGO.transform.position;
+                    Vector3 lEnd   = lStart + _leftControllerGO.transform.forward * 3.0f;
+                    _leftLaserLine.SetPosition(0, lStart);
+                    _leftLaserLine.SetPosition(1, lEnd);
+                    if (!_leftLaserLine.enabled) _leftLaserLine.enabled = true;
+                }
+                catch { }
+            }
+            else if (_leftLaserLine.enabled)
+            {
+                _leftLaserLine.enabled = false;
+            }
+        }
+
         // Depth scan: find the nearest managed canvas (excluding cursor canvas) that the
         // controller ray actually hits within its rect. Store that canvas's head-forward depth
         // so PositionCanvases can place the cursor just 0.01m in front of it next frame.
@@ -3044,13 +3117,24 @@ public class VRCamera : MonoBehaviour
     private void UpdateJump()
     {
         if (_sceneLoadGrace > 0) { _jumpVerticalVelocity = 0f; return; }
-        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
         if (_playerCC == null) return;
         // Only apply gravity/jump when movement discovery is done (= we're in-game, not main menu)
         if (!_movementDiscoveryDone) { _jumpVerticalVelocity = 0f; return; }
 
-        OpenXRManager.GetButtonAState(out bool pressed);
-        bool edge = pressed && !_jumpBtnPrev;
+        // Use unscaledDeltaTime so gravity works even when game is paused (timeScale=0).
+        // Without this, the player floats in the air while ESC menu is open and doesn't
+        // come back down when the menu is closed.
+        float dt = Time.unscaledDeltaTime;
+        if (dt <= 0f || dt > 0.2f) return; // skip on zero-dt or huge spikes
+
+        // Only read jump button when VR settings panel is NOT open
+        bool pressed = false;
+        bool edge = false;
+        if (VRSettingsPanel.RootGO == null || !VRSettingsPanel.RootGO.activeSelf)
+        {
+            OpenXRManager.GetButtonAState(out pressed);
+            edge = pressed && !_jumpBtnPrev;
+        }
         _jumpBtnPrev = pressed;
 
         // Guard: verify CC is still alive
@@ -3065,7 +3149,7 @@ public class VRCamera : MonoBehaviour
         if (_playerCC.isGrounded)
             _jumpVerticalVelocity = -0.5f; // small downward to keep grounded
         else
-            _jumpVerticalVelocity += Gravity * Time.deltaTime;
+            _jumpVerticalVelocity += Gravity * dt;
 
         // Clamp terminal velocity to prevent runaway falling
         if (_jumpVerticalVelocity < -20f) _jumpVerticalVelocity = -20f;
@@ -3077,12 +3161,12 @@ public class VRCamera : MonoBehaviour
             Log.LogInfo("[VRCamera] Jump");
         }
 
-        // Apply vertical movement
+        // Apply vertical movement — always, even during pause, to prevent floating
         if (Mathf.Abs(_jumpVerticalVelocity) > 0.01f)
         {
             try
             {
-                _playerCC.Move(new Vector3(0f, _jumpVerticalVelocity * Time.deltaTime, 0f));
+                _playerCC.Move(new Vector3(0f, _jumpVerticalVelocity * dt, 0f));
             }
             catch (Exception ex)
             {
@@ -3257,6 +3341,100 @@ public class VRCamera : MonoBehaviour
         catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateInventory: {ex.Message}"); }
     }
 
+    /// <summary>
+    /// Syncs carried world objects to the VR controller.
+    /// The game has two item systems:
+    /// 1. First-person arms (LagPivot → Arms) — for inventory items (small, no world model)
+    /// 2. Carried objects (InteractionController.carryingObject) — for large world items
+    /// This method handles BOTH by overriding the carried object's transform.
+    /// </summary>
+    private bool _lagPivotReparented;
+    private bool _lastItemHandRight;
+    private int _carryDiagCounter;
+    private void UpdateHeldItemTracking()
+    {
+        // Strategy 1: Override carried world objects (InteractionController.carryingObject)
+        if (_interactionController != null)
+        {
+            try
+            {
+                var co = _interactionController.carryingObject;
+                if (co != null)
+                {
+                    var ctrlGO = VRSettingsPanel.ItemHandRight ? _rightControllerGO : _leftControllerGO;
+                    if (ctrlGO != null)
+                    {
+                        // Position the carried object at the controller, offset slightly forward
+                        var ctrlT = ctrlGO.transform;
+                        co.transform.position = ctrlT.position + ctrlT.forward * 0.3f;
+                        co.transform.rotation = ctrlT.rotation;
+
+                        _carryDiagCounter++;
+                        if (_carryDiagCounter % 300 == 1)
+                            Log.LogInfo($"[VRCamera] Carrying '{co.gameObject.name}' → controller pos=({ctrlT.position.x:F1},{ctrlT.position.y:F1},{ctrlT.position.z:F1})");
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // Strategy 2: Override LagPivot for first-person arm items
+        if (_lagPivotTransform == null) return;
+        try
+        {
+            var ctrlGO = VRSettingsPanel.ItemHandRight ? _rightControllerGO : _leftControllerGO;
+            if (ctrlGO == null) return;
+
+            bool right = VRSettingsPanel.ItemHandRight;
+            if (!_lagPivotReparented || right != _lastItemHandRight)
+            {
+                _lagPivotTransform.SetParent(ctrlGO.transform, false);
+                _lagPivotTransform.localPosition = Vector3.zero;
+                _lagPivotTransform.localRotation = Quaternion.identity;
+                _lagPivotTransform.localScale = Vector3.one;
+                _lagPivotReparented = true;
+                _lastItemHandRight = right;
+                Log.LogInfo($"[VRCamera] LagPivot → '{ctrlGO.name}'");
+            }
+
+            _lagPivotTransform.position = ctrlGO.transform.position;
+            _lagPivotTransform.rotation = ctrlGO.transform.rotation;
+        }
+        catch { }
+    }
+
+    /// <summary>Called right before each VR eye camera renders — last chance to position items.</summary>
+    private void ForceItemPositionPreRender()
+    {
+        var ctrlGO = VRSettingsPanel.ItemHandRight ? _rightControllerGO : _leftControllerGO;
+        if (ctrlGO == null) return;
+
+        // Override carried world object position right before render
+        if (_interactionController != null)
+        {
+            try
+            {
+                var co = _interactionController.carryingObject;
+                if (co != null)
+                {
+                    var ctrlT = ctrlGO.transform;
+                    co.transform.position = ctrlT.position + ctrlT.forward * 0.3f;
+                    co.transform.rotation = ctrlT.rotation;
+                }
+            }
+            catch { }
+        }
+
+        // Override LagPivot for first-person arm items
+        if (_lagPivotTransform == null) return;
+        try
+        {
+            _lagPivotTransform.position = ctrlGO.transform.position;
+            _lagPivotTransform.rotation = ctrlGO.transform.rotation;
+        }
+        catch { }
+    }
+
     private void DiscoverMovementSystem()
     {
         _movementDiscoveryDone = true;
@@ -3415,6 +3593,127 @@ public class VRCamera : MonoBehaviour
             }
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] Rewired probe: {ex.Message}"); }
+
+        // 5b. Cache FirstPersonItemController for VR hand item tracking.
+        try
+        {
+            if (_playerCC != null)
+            {
+                var fpsIC = _playerCC.GetComponent<FirstPersonItemController>();
+                if (fpsIC != null)
+                {
+                    _fpsItemController = fpsIC;
+                    var lp = fpsIC.leftHandObjectParent;
+                    var rp = fpsIC.rightHandObjectParent;
+                    var ci = fpsIC.currentItem;
+                    // Log the full hierarchy from ItemContainer up to find what drives its position
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append($"[Movement] FirstPersonItemController found. ");
+                    sb.Append($"leftHandParent='{lp?.gameObject?.name ?? "NULL"}' ");
+                    sb.Append($"rightHandParent='{rp?.gameObject?.name ?? "NULL"}' ");
+                    sb.Append($"currentItem='{(ci != null ? "present" : "NULL")}' ");
+                    sb.Append($"lagPivot='{fpsIC.lagPivotTransform?.gameObject?.name ?? "NULL"}'");
+                    Log.LogInfo(sb.ToString());
+
+                    // Walk up from ItemContainer to find its full parent chain
+                    if (lp != null)
+                    {
+                        var walk = lp;
+                        var chain = new System.Text.StringBuilder("[Movement] ItemContainer hierarchy: ");
+                        for (int h = 0; h < 10 && walk != null; h++)
+                        {
+                            chain.Append($"'{walk.gameObject.name}' → ");
+                            walk = walk.parent;
+                        }
+                        chain.Append("(root)");
+                        Log.LogInfo(chain.ToString());
+                    }
+                    // Also walk from LagPivot
+                    var lag = fpsIC.lagPivotTransform;
+                    if (lag != null)
+                    {
+                        var walk2 = lag;
+                        var chain2 = new System.Text.StringBuilder("[Movement] LagPivot hierarchy: ");
+                        for (int h = 0; h < 10 && walk2 != null; h++)
+                        {
+                            chain2.Append($"'{walk2.gameObject.name}' → ");
+                            walk2 = walk2.parent;
+                        }
+                        chain2.Append("(root)");
+                        Log.LogInfo(chain2.ToString());
+
+                        // Log all children of LagPivot
+                        var childSb = new System.Text.StringBuilder("[Movement] LagPivot children: ");
+                        for (int c2 = 0; c2 < lag.childCount; c2++)
+                        {
+                            var child = lag.GetChild(c2);
+                            if (child != null) childSb.Append($"'{child.gameObject.name}' ");
+                        }
+                        Log.LogInfo(childSb.ToString());
+
+                        // Log components on LagPivot and descendants to find what drives position
+                        try
+                        {
+                            var diagNodes = new Transform[] { lag };
+                            // Also check FirstPersonModels (child of LagPivot)
+                            if (lag.childCount > 0) diagNodes = new Transform[] { lag, lag.GetChild(0) };
+                            foreach (var dNode in diagNodes)
+                            {
+                                if (dNode == null) continue;
+                                var comps = dNode.GetComponents<Component>();
+                                var cSb = new System.Text.StringBuilder($"[Movement] Components on '{dNode.gameObject.name}': ");
+                                foreach (var comp in comps)
+                                {
+                                    if (comp == null) continue;
+                                    try
+                                    {
+                                        string tn = comp.GetIl2CppType().Name;
+                                        cSb.Append($"{tn} ");
+                                        // If MonoBehaviour, note if enabled
+                                        var mb = comp.TryCast<MonoBehaviour>();
+                                        if (mb != null) cSb.Append($"(enabled={mb.enabled}) ");
+                                    }
+                                    catch { }
+                                }
+                                Log.LogInfo(cSb.ToString());
+                            }
+                        }
+                        catch { }
+
+                        // Cache LagPivot for per-frame position override in UpdateHeldItemTracking.
+                        // We do NOT reparent — the game's FirstPersonItemController sets LagPivot
+                        // position in Update(). We override it in LateUpdate() so our write wins.
+                        _lagPivotTransform = lag;
+                        _lagPivotOrigParent = lag.parent;
+                        Log.LogInfo($"[Movement] Cached LagPivot for hand tracking (parent='{lag.parent?.gameObject?.name ?? "NULL"}')");
+                    }
+                }
+                else
+                    Log.LogInfo("[Movement] FirstPersonItemController not found on FPSController.");
+            }
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] FPSItemController cache: {ex.Message}"); }
+
+        // 5c. Cache InteractionController for carried-object tracking.
+        // The game carries large objects by animating InteractableController.transform relative
+        // to Camera.main. We need to override this to follow the VR hand controller instead.
+        try
+        {
+            if (_playerCC != null)
+            {
+                var ic = _playerCC.GetComponent<InteractionController>();
+                if (ic != null)
+                {
+                    _interactionController = ic;
+                    Log.LogInfo($"[Movement] InteractionController found on '{_playerCC.gameObject.name}'");
+                    var co = ic.carryingObject;
+                    Log.LogInfo($"[Movement] carryingObject={(co != null ? co.gameObject.name : "NULL")}");
+                }
+                else
+                    Log.LogInfo("[Movement] InteractionController not found on FPSController.");
+            }
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] InteractionController cache: {ex.Message}"); }
 
         // 6. Camera.main diagnostic — confirm it's non-null so SaveStateController won't crash
         try

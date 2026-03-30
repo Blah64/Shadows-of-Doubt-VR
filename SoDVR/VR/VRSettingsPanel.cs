@@ -64,6 +64,10 @@ public static class VRSettingsPanel
     private static readonly Color ColBtnOff      = new(0.85f, 0.85f, 0.85f, 1f); // light grey
     private static readonly Color ColNavBtn      = new(0.65f, 0.75f, 1.00f, 1f); // lavender
 
+    // VR-specific toggle states (not saved to PlayerPrefs — session only)
+    public static bool LeftLaserEnabled = true;   // left hand laser pointer on/off
+    public static bool ItemHandRight    = false;  // false = left hand holds items, true = right
+
     // ── Init ──────────────────────────────────────────────────────────────────
 
     public static GameObject? Init(Action<int> removeFromPositioned)
@@ -392,6 +396,14 @@ public static class VRSettingsPanel
                 new[] { "0.5×", "0.75×", "1.0×", "1.25×", "1.5×", "2.0×", "2.5×" },
                 () => FloatToIdx(ReadFloat("virtualCursorSensitivity", 1f), vcVals),
                 v => SetPrefsFloat("virtualCursorSensitivity", vcVals[v]));
+
+            // ── VR-specific controls ──
+            AddToggleRow(controlsContent, ref cy, "Left Laser",
+                () => LeftLaserEnabled,
+                v => LeftLaserEnabled = v);
+            AddToggleRow(controlsContent, ref cy, "Item Hand: Right",
+                () => ItemHandRight,
+                v => ItemHandRight = v);
 
             FinalizeContent(controlsContent, cy);
 

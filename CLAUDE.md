@@ -166,9 +166,13 @@ When manually calling `Camera.Render()` to a RenderTexture in HDRP:
 Already implemented in VRCamera.cs — **needs functional testing**:
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Thumbstick locomotion | Implemented | Left stick → `CharacterController.Move()` at 4 m/s |
-| Snap turn | Implemented | Right stick X → ±30° VROrigin rotation |
+| Thumbstick locomotion | Working ✓ | Left stick → `CharacterController.Move()` at 4 m/s |
+| Snap turn | Working ✓ | Right stick X → ±30° VROrigin rotation |
 | Menu button (ESC) | Working ✓ | Left Y/menu → ESC key simulation |
+| Sprint | Working ✓ | Left stick click, wired to game's `alwaysRun` setting |
+| Left laser beam | Working ✓ | LineRenderer on left controller, toggle in VR Settings |
+| Held item tracking | Working ✓ | `InteractionController.carryingObject` → VR controller |
+| Item hand selection | Working ✓ | VR Settings toggle: Left/Right hand |
 | Jump | **Not implemented** | Needs A button binding in OpenXRManager |
 | World interact | **Not implemented** | Needs button binding → 'E' key simulation |
 
@@ -178,6 +182,26 @@ OpenXR actions currently bound in OpenXRManager.cs:
 - `_thumbAction` — both thumbsticks (left = locomotion, right = snap turn)
 - `_gripAction` — both grips (unused beyond binding)
 - `_menuButtonAction` — left Y + left menu button → ESC
+
+## CRITICAL: Held item tracking — two separate systems (discovered 2026-03-29)
+The game has TWO independent item systems:
+
+1. **First-person arms** (`3DUI` Canvas → `LagPivot` → `FirstPersonModels` → `Arms` → fingers/hands)
+   - For inventory items with hand models (pen, lockpick, camera)
+   - `FirstPersonItem` is a ScriptableObject (NOT a Component), `leftHandObject`/`rightHandObject` are prefab refs
+   - `Arms` GO is often `active=False`; arm meshes at extreme positions (hundreds of units off)
+   - Positioned via Canvas layout + Animator — LagPivot override alone does NOT work
+   - `leftHandObjectParent`/`rightHandObjectParent` on `FirstPersonItemController` are `ItemContainer` transforms
+
+2. **Carried world objects** (`InteractionController.carryingObject`)
+   - For large items picked up from the world (boxes, lamps, books, evidence)
+   - `InteractableController` is a MonoBehaviour ON the world object itself
+   - The game repositions this GO relative to Camera.main each frame
+   - **This is what players see most often** — override `carryingObject.transform` to the VR controller
+   - Found via `InteractionController` component on FPSController
+
+**VR approach**: override `InteractionController.carryingObject.transform.position/rotation` every frame
+(in Update AND pre-render) to the VR controller position + 0.3m forward offset.
 
 ## Known canvas names (from LogOutput.log)
 | Canvas | Size | Status |
