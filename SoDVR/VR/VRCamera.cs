@@ -185,7 +185,7 @@ public class VRCamera : MonoBehaviour
         ["fingerprintDisplayCanvas"]  = CanvasCategory.Panel,
         ["mapLayerCanvas"]            = CanvasCategory.Panel,
         ["PrototypeBuilderCanvas"]    = CanvasCategory.Panel,
-        ["ControlsDisplayCanvas"]     = CanvasCategory.Panel,
+        ["ControlsDisplayCanvas"]     = CanvasCategory.Ignored,  // VR has own controls; keyboard hints block aim dot
         ["UpgradesDisplayCanvas"]     = CanvasCategory.Panel,
 
         // Tooltip — tracks cursor depth, repositions every frame
@@ -232,6 +232,16 @@ public class VRCamera : MonoBehaviour
     // system to skip MenuCanvas when the pause menu is hidden (game hides it without CG).
     private readonly HashSet<int> _noGroupInteractable = new();
     private const int MinActiveGraphicsForInteractable = 5;
+
+    // WindowCanvas nested canvases (notes, notebook) cached during scan for per-frame Z-separation.
+    // Game layout resets localPosition.z every frame → must re-apply Z offsets in LateUpdate.
+    private readonly List<Canvas> _windowNestedList = new();
+
+    // Pause-mode locomotion: allow limited movement within a radius, warp back on unpause.
+    private bool    _pauseMovementActive;     // true while game is paused (case board / ESC menu)
+    private Vector3 _pauseOriginPos;          // player position when pause started
+    private const float PauseMoveRadius = 2.0f; // max distance (metres) from pause origin
+    private float   _suppressPauseWarpUntil; // realtime: don't warp-back until this time (save-load guard)
 
     // Canvas instance IDs that belong to VRMod itself (settings panel, cursor, etc.).
     // Every mutation pass (RescanCanvasAlpha, etc.) must skip canvases in this set —
@@ -310,11 +320,33 @@ public class VRCamera : MonoBehaviour
     private bool           _menuCanvasHidden;    // tracks last hide state to avoid per-frame toggles
     private int            _menuSettingsBtnId;   // instanceID of the patched Settings button in MenuCanvas
     private bool           _cursorVisible = false; // tracks SetActive state to avoid per-frame IL2CPP calls
+
+    // ── Multi-dot aim system ─────────────────────────────────────────────────
+    // World-space quads that show an aim dot on EVERY canvas the controller ray passes through,
+    // not just the nearest.  Lets user see where they're aiming on the pin board even with
+    // notes/notebook in front of it.
+    private readonly List<GameObject> _aimDotPool = new();
+    private const int   AimDotPoolSize = 8;
+    private const float AimDotSize     = 0.012f; // 1.2 cm world-space quad
+    private readonly List<(float depth, Canvas canvas, Vector3 worldHit)> _aimDotHits = new();
+    // Dedicated CaseCanvas (pin board) aim dot — separate from pool because
+    // CaseCanvas fails standard bounds checks (sizeDelta doesn't match visual extent).
+    private GameObject? _caseBoardDot;
+
     // ── New controller button state (edge detection) ──────────────────────────
     private bool _jumpBtnPrev;
     private bool _crouchBtnPrev;
     private bool _interactBtnPrev;
-    private bool _notebookBtnPrev;
+    private bool  _notebookBtnPrev;
+    private float _notebookCooldownUntil;
+    private bool  _notebookBtnNeedsRelease;
+    private int   _pendingTabUpFrame = -1;  // frame at which to send Tab key-up (-1 = none)
+    private float _jumpCooldownUntil;
+    private bool  _jumpBtnNeedsRelease;
+    private float _cbACooldownUntil;
+    private bool  _cbANeedsRelease;
+    private float _cbBCooldownUntil;
+    private bool  _cbBNeedsRelease;
     private bool _flashlightBtnPrev;
     private bool _inventoryBtnPrev;
     private bool _sprintThumbPrev;
@@ -323,6 +355,40 @@ public class VRCamera : MonoBehaviour
     private bool        _prevTrigger;
     private bool        _triggerNeedsRelease;  // latch: must fully release before next click fires
     private int         _triggerFireFrame = -100; // frame of last trigger click (frame-gap guard)
+
+    // ── Case board drag system ───────────────────────────────────────────────
+    // Supports hold-and-drag on the pin board: press → pointerDown, hold → beginDrag + drag,
+    // release → endDrag + pointerUp.  Short press (< threshold frames) fires pointerClick.
+    private bool              _cbDragActive;      // currently in a case board drag session
+    private bool              _cbDragStarted;     // beginDrag has been fired (movement threshold passed)
+    private GameObject?       _cbDragGO;          // the GO that was initially pressed
+    private Canvas?           _cbDragCanvas;       // which canvas it was on
+    private PointerEventData? _cbDragPED;          // kept across frames
+    private int               _cbDragPressFrame;   // frame when trigger was pressed
+    private const int         CbDragFrameThreshold = 5; // frames before drag kicks in
+
+    private bool              _cbDragIsNative;     // true = CaseCanvas drag using native mouse events
+    private float             _cbCursorPauseUntil; // pause continuous cursor tracking (e.g. after right-click)
+
+    // ── Direct RectTransform drag (bypasses EventSystem for CaseCanvas pins) ──
+    private bool              _cbDirectDrag;         // true = using direct RT manipulation instead of EventSystem
+    private RectTransform?    _cbDirectDragRT;       // the pin's RectTransform (citizen/PlayerStickyNote)
+    private RectTransform?    _cbDirectDragParentRT; // parent of pin (Pinned) — coordinate reference
+    private Vector2           _cbDirectDragStartLocal; // ray hit in parent-local coords at drag start
+    private Vector2           _cbDirectDragStartAnchored; // pin's anchoredPosition at drag start
+
+    // Middle-click drag (Right B → create string between pinned notes)
+    private bool              _cbMidDragActive;
+    private bool              _cbMidDragStarted;
+    private GameObject?       _cbMidDragGO;
+    private Canvas?           _cbMidDragCanvas;
+    private PointerEventData? _cbMidDragPED;
+
+    // Separate prev-state for A/B in case board context.
+    // UpdateJump/UpdateNotebook update their own prev fields BEFORE the trigger section runs,
+    // so we need independent tracking for edge detection here.
+    private bool _cbABtnPrev;
+    private bool _cbBBtnPrev;
     private float       _menuBtnCooldownUntil;   // Time.realtimeSinceStartup when lockout expires (wall-clock, not dt-scaled)
     private bool        _menuBtnNeedsRelease;    // true after fire; cleared only once button is physically released
     private int         _poseFrameCount;
@@ -335,6 +401,19 @@ public class VRCamera : MonoBehaviour
     // Win32 mouse event simulation — used for flashlight toggle (middle mouse button).
     [DllImport("user32.dll")]
     private static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
+
+    // Win32 cursor positioning — used to feed correct Input.mousePosition during case board drag.
+    [DllImport("user32.dll")]
+    private static extern bool SetCursorPos(int X, int Y);
+
+    [DllImport("user32.dll")]
+    private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetActiveWindow();
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct POINT { public int X, Y; }
 
     // Maps (origMaterialInstanceID << 5 | tier<<1 | isBackground) → patched clone.
     // Lower 5 bits: tier (0-9, 4 bits) + isBackground (1 bit).
@@ -399,6 +478,9 @@ public class VRCamera : MonoBehaviour
                 _sceneLoadGrace = 120;  // ~2 s at 60 fps
                 _canvasTick     = 0;
                 _movementDiscoveryDone = false;
+                _hasBeenGrounded = false;
+                _pauseMovementActive = false;
+                _suppressPauseWarpUntil = Time.realtimeSinceStartup + 15f; // suppress warp for 15s after load
                 Log.LogInfo($"[VRCamera] Scene changed (handle {_lastSceneHandle}→{sh}) — canvas scan paused for 120 frames.");
             }
             _lastSceneHandle = sh;
@@ -417,6 +499,9 @@ public class VRCamera : MonoBehaviour
                 _sceneLoadGrace = 120;
                 _canvasTick     = 0;
                 _movementDiscoveryDone = false;
+                _hasBeenGrounded = false;
+                _pauseMovementActive = false;
+                _suppressPauseWarpUntil = Time.realtimeSinceStartup + 15f; // suppress warp for 15s after load
                 _playerRb       = null;
                 _playerCC       = null;
                 _fpsControllerTransform = null;
@@ -454,10 +539,17 @@ public class VRCamera : MonoBehaviour
         if (graceWasActive && _sceneLoadGrace == 0)
         {
             Log.LogInfo($"[VRCamera] Grace expired at frame {_frameCount} — canvas scan will fire next tick.");
-            if (_movementDiscoveryDone)
+            // Only schedule rediscovery if playerCC was lost (null).
+            // When playerCC is still valid (same-scene reload, e.g. opening case board),
+            // keep _movementDiscoveryDone=true so jump/locomotion continue working.
+            if (_movementDiscoveryDone && _playerCC == null)
             {
                 _movementDiscoveryDone = false;
-                Log.LogInfo("[VRCamera] Grace expired — movement rediscovery scheduled.");
+                Log.LogInfo("[VRCamera] Grace expired — movement rediscovery scheduled (playerCC lost).");
+            }
+            else if (_movementDiscoveryDone)
+            {
+                Log.LogInfo("[VRCamera] Grace expired — playerCC still valid, skipping rediscovery.");
             }
         }
 
@@ -802,19 +894,26 @@ public class VRCamera : MonoBehaviour
         // Controller input — sync actions and update laser pointer each stereo frame
         if (OpenXRManager.ActionSetsReady)
         {
-            OpenXRManager.SyncActions();
-            UpdateControllerPose(_displayTime);
-            UpdateSnapTurn();
-            UpdateLocomotion();
-            UpdateMenuButton();
-            UpdateJump();
-            UpdateInteract();
-            UpdateCrouch();
-            UpdateSprint();
-            UpdateNotebook();
-            UpdateFlashlight();
-            UpdateInventory();
-            UpdateHeldItemTracking();
+            try
+            {
+                OpenXRManager.SyncActions();
+                UpdateControllerPose(_displayTime);
+                UpdateSnapTurn();
+                UpdateLocomotion();
+                UpdateMenuButton();
+                UpdateJump();
+                UpdateInteract();
+                UpdateCrouch();
+                UpdateSprint();
+                UpdateNotebook();
+                UpdateFlashlight();
+                UpdateInventory();
+                UpdateHeldItemTracking();
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[VRCamera] Controller input exception: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+            }
         }
 
         // One-shot movement system discovery (runs once after stereo is ready and game cam found).
@@ -1021,6 +1120,54 @@ public class VRCamera : MonoBehaviour
         catch (Exception ex)
         {
             Log.LogWarning($"[VRCamera] Cursor canvas creation failed: {ex.Message}");
+        }
+
+        // ── Multi-dot aim pool ────────────────────────────────────────────────────
+        try
+        {
+            var dotShader = Shader.Find("UI/Default");
+            for (int i = 0; i < AimDotPoolSize; i++)
+            {
+                var adGO = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                adGO.name = $"VRAimDot_{i}";
+                adGO.layer = UILayer;
+                adGO.transform.localScale = Vector3.one * AimDotSize;
+                // Remove collider — dot is visual only
+                var col = adGO.GetComponent<Collider>();
+                if (col != null) UnityEngine.Object.Destroy(col);
+                var mr = adGO.GetComponent<MeshRenderer>();
+                if (mr != null && dotShader != null)
+                {
+                    mr.material = new Material(dotShader);
+                    mr.material.color = new Color(1f, 1f, 1f, 0.9f);
+                    mr.material.renderQueue = 4000; // render on top of everything
+                }
+                adGO.SetActive(false);
+                DontDestroyOnLoad(adGO);
+                _aimDotPool.Add(adGO);
+            }
+            // Dedicated CaseCanvas (pin board) aim dot — slightly larger, distinct from pool
+            _caseBoardDot = GameObject.CreatePrimitive(PrimitiveType.Quad);
+            _caseBoardDot.name = "VRAimDot_CaseBoard";
+            _caseBoardDot.layer = UILayer;
+            _caseBoardDot.transform.localScale = Vector3.one * 0.015f; // 1.5cm — slightly larger
+            var cbCol = _caseBoardDot.GetComponent<Collider>();
+            if (cbCol != null) UnityEngine.Object.Destroy(cbCol);
+            var cbMr = _caseBoardDot.GetComponent<MeshRenderer>();
+            if (cbMr != null && dotShader != null)
+            {
+                cbMr.material = new Material(dotShader);
+                cbMr.material.color = new Color(1f, 0.9f, 0.5f, 0.95f); // warm yellow tint for pin board
+                cbMr.material.renderQueue = 4000;
+            }
+            _caseBoardDot.SetActive(false);
+            DontDestroyOnLoad(_caseBoardDot);
+
+            Log.LogInfo($"[VRCamera] Aim dot pool created: {_aimDotPool.Count} dots + 1 CaseBoard dot");
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"[VRCamera] Aim dot pool creation failed: {ex.Message}");
         }
 
         // ── Phase 1: VR Settings Panel ───────────────────────────────────────────
@@ -1230,7 +1377,8 @@ public class VRCamera : MonoBehaviour
         if (!_stereoReady || !_frameOpen) return;
         _frameOpen = false;
 
-        PositionCanvases();
+        try { PositionCanvases(); }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] PositionCanvases exception: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); }
 
         try
         {
@@ -1267,6 +1415,7 @@ public class VRCamera : MonoBehaviour
                 // The game continuously repositions CaseCanvas to Camera.main-relative coords,
                 // so we must override it every frame to keep it near the VR player.
                 EnforceCaseCanvasPosition();
+                EnforceWindowNestedZSeparation();
 
                 // No GL.invertCulling — HDRP flipYMode handles both Y-flip and culling.
                 _rightCam.Render();
@@ -1406,10 +1555,8 @@ public class VRCamera : MonoBehaviour
                             Log.LogInfo($"[VRCamera] CaseCanvas: suppressed BG element '{cn}'");
                         }
                     }
-                    // Disable GraphicRaycaster so CaseCanvas doesn't intercept clicks
-                    // meant for notes/notebook on WindowCanvas in front of it.
-                    var caseGR = canvas.GetComponent<GraphicRaycaster>();
-                    if (caseGR != null) caseGR.enabled = false;
+                    // Keep GraphicRaycaster enabled so pinned notes on the case board can be clicked.
+                    // BG element hits are filtered out in TryClickCanvas to prevent background steals.
                 }
                 catch { }
                 // Fall through to normal conversion below
@@ -1470,7 +1617,11 @@ public class VRCamera : MonoBehaviour
                 {
                     var gr = c.GetComponent<GraphicRaycaster>();
                     if (gr == null) c.gameObject.AddComponent<GraphicRaycaster>();
-                    if (_leftCam != null) c.worldCamera = _leftCam;
+                    string rpName = c.gameObject.name ?? "";
+                    if (_gameCamRef != null && string.Equals(rpName, "CaseCanvas", StringComparison.OrdinalIgnoreCase))
+                        c.worldCamera = _gameCamRef;
+                    else if (_leftCam != null)
+                        c.worldCamera = _leftCam;
                 }
                 catch { }
             }
@@ -1617,6 +1768,27 @@ public class VRCamera : MonoBehaviour
             foreach (var c in _managedCanvases.Values)
                 if (c != null && c.worldCamera == null) c.worldCamera = wcam;
         }
+
+        // Rebuild the WindowCanvas nested canvas list for per-frame Z-separation.
+        // (Actual Z offsets are applied in LateUpdate since game layout resets them every frame.)
+        try
+        {
+            _windowNestedList.Clear();
+            foreach (var kvp in _managedCanvases)
+            {
+                if (!_nestedCanvasIds.Contains(kvp.Key)) continue;
+                var nc = kvp.Value;
+                if (nc == null) continue;
+                Transform walker = nc.transform.parent;
+                for (int w = 0; w < 10 && walker != null; w++)
+                {
+                    if (walker.gameObject.name?.Equals("WindowCanvas", StringComparison.OrdinalIgnoreCase) == true)
+                    { _windowNestedList.Add(nc); break; }
+                    walker = walker.parent;
+                }
+            }
+        }
+        catch { }
 
         // Post-scan: dump MenuCanvas state so we can diagnose black-screen on startup.
         if (_menuCanvasRef != null && _frameCount <= 300)
@@ -2387,7 +2559,14 @@ public class VRCamera : MonoBehaviour
             var gr = canvas.GetComponent<GraphicRaycaster>();
             if (gr == null) gr = canvas.gameObject.AddComponent<GraphicRaycaster>();
             gr.blockingMask = 0;
-            if (_leftCam != null) canvas.worldCamera = _leftCam;
+            // CaseCanvas uses the game camera so the game's native Input.mousePosition →
+            // canvas.worldCamera pipeline works for drag/click interaction.
+            // All other canvases use _leftCam for VR GraphicRaycaster hit-testing.
+            string wcName = canvas.gameObject.name ?? "";
+            if (_gameCamRef != null && string.Equals(wcName, "CaseCanvas", StringComparison.OrdinalIgnoreCase))
+                canvas.worldCamera = _gameCamRef;
+            else if (_leftCam != null)
+                canvas.worldCamera = _leftCam;
         }
         catch (Exception ex) { Log.LogWarning($"[VRCamera] GraphicRaycaster setup: {ex.Message}"); }
 
@@ -2472,11 +2651,48 @@ public class VRCamera : MonoBehaviour
                 var g = graphics[i];
                 if (g == null) continue;
                 Material orig;
+                // Use sharedMaterial to avoid creating orphaned unique material instances.
+                // g.material (getter) creates a new instance that we'd immediately replace,
+                // leaking GPU resources. sharedMaterial reads the shared source without cloning.
                 try { orig = g.material; }
                 catch { continue; }
                 if (orig == null) continue;
 
                 string nm = g.gameObject.name;
+
+                // Stencil mask Graphics (MaskPattern, UI_Mask) are invisible in screen-space
+                // but become visible diamond patterns in WorldSpace because HDRP doesn't use
+                // the UI stencil buffer. Suppress them by making them fully transparent.
+                bool isMask = false;
+                try
+                {
+                    // Check for Mask component — its visual is the mask shape
+                    var mask = g.GetComponent<UnityEngine.UI.Mask>();
+                    if (mask != null) isMask = true;
+                    // Also check sprite name for patterns used as mask textures
+                    if (!isMask)
+                    {
+                        var img = g.TryCast<Image>();
+                        if (img != null && img.sprite != null)
+                        {
+                            string spName = img.sprite.name ?? "";
+                            if (spName.IndexOf("Mask", StringComparison.OrdinalIgnoreCase) >= 0
+                                && spName.IndexOf("Mask_", StringComparison.OrdinalIgnoreCase) < 0)
+                                isMask = true;
+                        }
+                    }
+                    // Also check GO name for mask patterns
+                    if (!isMask && nm.IndexOf("MaskPattern", StringComparison.OrdinalIgnoreCase) >= 0)
+                        isMask = true;
+                }
+                catch { }
+                if (isMask)
+                {
+                    try { g.color = new Color(g.color.r, g.color.g, g.color.b, 0f); } catch { }
+                    s_patchedGraphicPtrs.Add(g.Pointer);
+                    count++;
+                    continue;
+                }
                 string shaderName = orig.shader?.name ?? "";
                 bool isBg = nm.IndexOf("background", StringComparison.OrdinalIgnoreCase) >= 0
                          || nm.Equals("BG", StringComparison.OrdinalIgnoreCase);
@@ -2848,8 +3064,16 @@ public class VRCamera : MonoBehaviour
                             _positionedCanvases.Remove(cb.Key);
                             _lastRescanFrame.Remove(cb.Key);
                         }
+                        // MinimapCanvas: only recentre if user hasn't grip-dragged it to a custom position.
+                        // Once grip-dragged, its offset is stored and restored automatically.
+                        if (cbName.Equals("MinimapCanvas", StringComparison.OrdinalIgnoreCase)
+                            && !_gripDragAnchorOffsets.ContainsKey(cb.Key))
+                        {
+                            _positionedCanvases.Remove(cb.Key);
+                            _lastRescanFrame.Remove(cb.Key);
+                        }
                     }
-                    Log.LogInfo("[VRCamera] ActionPanelCanvas activated — recentring CaseBoard + WindowCanvas");
+                    Log.LogInfo("[VRCamera] ActionPanelCanvas activated — recentring CaseBoard + WindowCanvas (Minimap preserved if grip-dragged)");
                 }
             }
 
@@ -2913,6 +3137,24 @@ public class VRCamera : MonoBehaviour
             if (catDefs.RepositionEveryFrame)
             {
                 if (!canvas.gameObject.activeSelf || !canvas.enabled) continue;
+
+                // Context menu freeze: when ContextMenus has active children (a context menu
+                // is showing), stop repositioning TooltipCanvas so the menu stays world-locked.
+                bool contextMenuActive = false;
+                try
+                {
+                    var cmTr = canvas.transform.Find("ContextMenus");
+                    if (cmTr != null && cmTr.gameObject.activeSelf)
+                    {
+                        for (int ci = 0; ci < cmTr.childCount; ci++)
+                        {
+                            if (cmTr.GetChild(ci).gameObject.activeSelf)
+                            { contextMenuActive = true; break; }
+                        }
+                    }
+                }
+                catch { }
+                if (contextMenuActive) { continue; } // freeze position while context menu is open
 
                 // When PopupMessage or TutorialMessage is active, TooltipCanvas
                 // switches to dialog mode: positioned at Menu distance, head-facing,
@@ -3255,9 +3497,10 @@ public class VRCamera : MonoBehaviour
             }
         }
 
-        // Depth scan: find the nearest managed canvas (excluding cursor canvas) that the
-        // controller ray actually hits within its rect. Store that canvas's head-forward depth
-        // so PositionCanvases can place the cursor just 0.01m in front of it next frame.
+        // Depth scan: find ALL managed canvases the controller ray hits within their rects.
+        // The nearest hit drives the primary cursor canvas (for click targeting / tooltip depth).
+        // Every hit gets a world-space aim dot so the user can see aim on canvases behind others.
+        _aimDotHits.Clear();
         if (_rightControllerGO != null && _leftCam != null)
         {
             Vector3 dCtrlPos = _rightControllerGO.transform.position;
@@ -3267,8 +3510,6 @@ public class VRCamera : MonoBehaviour
             float   bestDepth     = float.MaxValue;
             Canvas? bestCanvas    = null;
             bool    foundHit      = false;
-            // nearestPlane: depth of the closest facing canvas plane, regardless of bounds.
-            // Seed to MaxValue so any canvas can update it.
             float nearestPlane = float.MaxValue;
 
             foreach (var kvp in _managedCanvases)
@@ -3276,23 +3517,16 @@ public class VRCamera : MonoBehaviour
                 var c = kvp.Value;
                 if (c == null) continue;
                 if (!c.gameObject.activeSelf || !c.enabled) continue;
-                // Skip canvases hidden via CanvasGroup OR all-children-inactive (MenuCanvas).
                 if (IsCanvasEffectivelyHidden(c)) continue;
-                // Exclude cursor canvas — by ref AND by name as belt-and-suspenders.
                 if (_cursorCanvas != null && c.GetInstanceID() == _cursorCanvas.GetInstanceID()) continue;
                 if (c.gameObject.name?.IndexOf("VRCursor", StringComparison.OrdinalIgnoreCase) >= 0) continue;
-                // Exclude every-frame canvases (tooltips) — they follow cursor depth, not the other way.
-                // Exception: when a dialog (PopupMessage/TutorialMessage) is active inside
-                // TooltipCanvas, it's in dialog mode and SHOULD participate in depth scan.
                 if (GetCategoryDefaults(GetCanvasCategory(c.gameObject.name)).RepositionEveryFrame)
                 {
                     bool dialogUp = (_popupMessageGO != null && _popupMessageGO.activeSelf)
                                  || (_tutorialMessageGO != null && _tutorialMessageGO.activeSelf);
                     if (!dialogUp) continue;
                 }
-                // Exclude HUD canvases — they sit far behind menus and must not pull cursor depth.
                 if (GetCanvasCategory(c.gameObject.name) == CanvasCategory.HUD) continue;
-                // Exclude nested canvases — their position is driven by the parent, not independently.
                 if (_nestedCanvasIds.Contains(kvp.Key)) continue;
 
                 var pl = new Plane(-c.transform.forward, c.transform.position);
@@ -3302,57 +3536,25 @@ public class VRCamera : MonoBehaviour
                 if (depth > 0f && depth < nearestPlane) nearestPlane = depth;
 
                 // Bounds check: only count as a hit when ray lands inside the canvas rect.
-                Vector3 lp = c.transform.InverseTransformPoint(dCtrlPos + dCtrlFwd * hitDist);
+                Vector3 worldHitPt = dCtrlPos + dCtrlFwd * hitDist;
+                Vector3 lp = c.transform.InverseTransformPoint(worldHitPt);
                 var rt = c.GetComponent<RectTransform>();
                 if (rt != null)
                 {
                     Vector2 hs = rt.sizeDelta * 0.5f;
                     if (Mathf.Abs(lp.x) > hs.x || Mathf.Abs(lp.y) > hs.y) continue;
                 }
+
+                // Record this hit for aim dot positioning
+                _aimDotHits.Add((depth, c, worldHitPt));
+
                 if (!foundHit || depth < bestDepth) { bestDepth = depth; bestCanvas = c; foundHit = true; }
             }
 
             if (foundHit && bestCanvas != null)
             {
-                // Periodic aim dot diagnostic — every 120 frames log which canvas has the dot
                 if (Time.frameCount % 120 == 0)
-                {
-                    float cgA = -1f;
-                    bool cgB = true;
-                    try { var cg3 = bestCanvas.GetComponent<CanvasGroup>(); if (cg3 != null) { cgA = cg3.alpha; cgB = cg3.blocksRaycasts; } } catch { }
-                    Log.LogInfo($"[VRCamera] AimDot → '{bestCanvas.gameObject.name}' depth={bestDepth:F2} cgAlpha={cgA:F2} blocks={cgB}");
-
-                    // CaseCanvas depth-scan diagnostic: trace why it was skipped
-                    foreach (var dkvp in _managedCanvases)
-                    {
-                        var dc = dkvp.Value;
-                        if (dc == null) continue;
-                        string dcn = dc.gameObject.name ?? "";
-                        if (!dcn.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase)) continue;
-                        bool dActive = dc.gameObject.activeSelf && dc.enabled;
-                        bool dHidden = IsCanvasEffectivelyHidden(dc);
-                        bool dNested = _nestedCanvasIds.Contains(dkvp.Key);
-                        bool dPositioned = _positionedCanvases.Contains(dkvp.Key);
-                        var dPl = new Plane(-dc.transform.forward, dc.transform.position);
-                        bool dPlaneHit = dPl.Raycast(new Ray(dCtrlPos, dCtrlFwd), out float dHitDist) && dHitDist > 0f;
-                        bool dBoundsOk = false;
-                        if (dPlaneHit)
-                        {
-                            Vector3 dlp = dc.transform.InverseTransformPoint(dCtrlPos + dCtrlFwd * dHitDist);
-                            var drt = dc.GetComponent<RectTransform>();
-                            if (drt != null)
-                            {
-                                Vector2 dhs = drt.sizeDelta * 0.5f;
-                                dBoundsOk = Mathf.Abs(dlp.x) <= dhs.x && Mathf.Abs(dlp.y) <= dhs.y;
-                            }
-                        }
-                        float dDepth = Vector3.Dot(dc.transform.position - dHeadPos, dHeadFwd);
-                        int childCount = 0;
-                        try { childCount = dc.GetComponentsInChildren<Graphic>(false).Count; } catch { }
-                        Log.LogInfo($"[VRCamera] CaseCanvasTrace: active={dActive} hidden={dHidden} nested={dNested} positioned={dPositioned} planeHit={dPlaneHit} bounds={dBoundsOk} depth={dDepth:F2} graphics={childCount} worldPos=({dc.transform.position.x:F2},{dc.transform.position.y:F2},{dc.transform.position.z:F2})");
-                        break;
-                    }
-                }
+                    Log.LogInfo($"[VRCamera] AimDot primary → '{bestCanvas.gameObject.name}' depth={bestDepth:F2} totalHits={_aimDotHits.Count}");
                 _cursorHasTarget   = true;
                 _cursorTargetPos   = bestCanvas.transform.position;
                 _cursorTargetRot   = bestCanvas.transform.rotation;
@@ -3361,24 +3563,364 @@ public class VRCamera : MonoBehaviour
             else
             {
                 _cursorHasTarget = false;
-                // Update depth from nearest facing plane so tooltips stay roughly right.
-                // If no canvas plane found at all, hold the previous depth.
                 if (nearestPlane < float.MaxValue) _cursorAimDepth = nearestPlane - 0.01f;
             }
         }
 
+        // Position world-space aim dots at every canvas hit point.
+        {
+            int dotIdx = 0;
+            for (int hi = 0; hi < _aimDotHits.Count && dotIdx < _aimDotPool.Count; hi++)
+            {
+                var hit = _aimDotHits[hi];
+                var dot = _aimDotPool[dotIdx];
+                try
+                {
+                    // Face the dot toward the head, 5mm in front of the canvas surface
+                    Vector3 toHead = (_leftCam != null)
+                        ? (_leftCam.transform.position - hit.worldHit).normalized
+                        : -hit.canvas.transform.forward;
+                    dot.transform.position = hit.worldHit + toHead * 0.005f;
+                    dot.transform.rotation = Quaternion.LookRotation(-toHead);
+                    if (!dot.activeSelf) dot.SetActive(true);
+                }
+                catch { }
+                dotIdx++;
+            }
+            // Hide unused dots
+            for (int i = dotIdx; i < _aimDotPool.Count; i++)
+            {
+                try { if (_aimDotPool[i].activeSelf) _aimDotPool[i].SetActive(false); } catch { }
+            }
+        }
+
+        // Dedicated CaseCanvas (pin board) aim dot — raycasts against the CaseCanvas plane
+        // WITHOUT bounds checking.  CaseCanvas's sizeDelta doesn't match its visual extent,
+        // so the standard bounds check always fails.  This dot only shows when the case board
+        // is open (ActionPanelCanvas active).
+        if (_caseBoardDot != null)
+        {
+            bool showCaseDot = false;
+            try
+            {
+                if (_casePanelCanvas != null
+                    && _actionPanelCanvas != null
+                    && _actionPanelCanvas.gameObject.activeSelf
+                    && _casePanelCanvas.gameObject.activeSelf
+                    && _rightControllerGO != null
+                    && _leftCam != null)
+                {
+                    Vector3 ctrlPos = _rightControllerGO.transform.position;
+                    Vector3 ctrlFwd = _rightControllerGO.transform.forward;
+                    var casePlane = new Plane(-_casePanelCanvas.transform.forward,
+                                              _casePanelCanvas.transform.position);
+                    if (casePlane.Raycast(new Ray(ctrlPos, ctrlFwd), out float caseDist) && caseDist > 0f)
+                    {
+                        Vector3 caseHit = ctrlPos + ctrlFwd * caseDist;
+                        Vector3 toHead = (_leftCam.transform.position - caseHit).normalized;
+                        _caseBoardDot.transform.position = caseHit + toHead * 0.005f;
+                        _caseBoardDot.transform.rotation = Quaternion.LookRotation(-toHead);
+                        showCaseDot = true;
+                    }
+                }
+            }
+            catch { }
+            if (showCaseDot && !_caseBoardDot.activeSelf) _caseBoardDot.SetActive(true);
+            else if (!showCaseDot && _caseBoardDot.activeSelf) _caseBoardDot.SetActive(false);
+        }
+
+        // ── Continuous cursor tracking for case board ──────────────
+        // Keep OS cursor (→ Input.mousePosition) updated every frame when the case board
+        // is open.  Paused briefly after right-click so the context menu stays visible
+        // (otherwise cursor tracking immediately pulls Input.mousePosition off the menu).
+        {
+            bool cbOpenCursor = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf;
+            if (cbOpenCursor && _gameCamRef != null && _rightControllerGO != null
+                && !_cbDragActive && Time.realtimeSinceStartup >= _cbCursorPauseUntil)
+            {
+                try
+                {
+                    Vector3 cPos = _rightControllerGO.transform.position;
+                    Vector3 cFwd = _rightControllerGO.transform.forward;
+                    GetCaseBoardScreenPos(cPos, cFwd, _casePanelCanvas, moveCursor: true);
+                }
+                catch { }
+            }
+        }
+
         OpenXRManager.GetTriggerState(true, out bool triggerNow);
+        bool triggerEdge = triggerNow && !_prevTrigger;
+        bool triggerRelease = !triggerNow && _prevTrigger;
         _prevTrigger = triggerNow;
 
-        if (_triggerNeedsRelease)
+        bool cbOpen = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf;
+        Vector3 rPos = _rightControllerGO.transform.position;
+        Vector3 rFwd = _rightControllerGO.transform.forward;
+
+        // ── Case board drag handling (left-click = trigger) ──────────────
+        if (_cbDragActive)
         {
-            if (!triggerNow) _triggerNeedsRelease = false;
+            if (triggerRelease)
+            {
+                try
+                {
+                    if (_cbDirectDrag)
+                    {
+                        // Direct drag end — just stop manipulating
+                        Log.LogInfo($"[VRCamera] CB direct drag end: '{_cbDragGO?.name}'");
+                    }
+                    else if (_cbDragStarted && _cbDragGO != null && _cbDragPED != null)
+                    {
+                        Vector2 endPos = GetCaseBoardScreenPos(rPos, rFwd, _cbDragCanvas, moveCursor: true);
+                        _cbDragPED.delta = endPos - _cbDragPED.position;
+                        _cbDragPED.position = endPos;
+                        ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.endDragHandler);
+                        ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.dropHandler);
+                        ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.pointerUpHandler);
+                        Log.LogInfo($"[VRCamera] CB drag end: '{_cbDragGO.name}'");
+                    }
+                    else if (_cbDragGO != null && _cbDragPED != null)
+                    {
+                        // Short press — fire persistent listeners (bypasses mouseInputMode guard)
+                        ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.pointerUpHandler);
+                        FireCaseBoardClick(_cbDragGO);
+                        Log.LogInfo($"[VRCamera] CB click: '{_cbDragGO.name}'");
+                    }
+                }
+                catch (Exception ex) { Log.LogWarning($"[VRCamera] CB drag release: {ex.Message}"); }
+                if (_cbDragIsNative)
+                {
+                    try { mouse_event(0x0004 /*LEFTUP*/, 0, 0, 0, UIntPtr.Zero); } catch { }
+                }
+                _cbDragActive = false; _cbDragStarted = false; _cbDragGO = null; _cbDragCanvas = null; _cbDragPED = null; _cbDragIsNative = false;
+                _cbDirectDrag = false; _cbDirectDragRT = null; _cbDirectDragParentRT = null;
+            }
+            else if (triggerNow)
+            {
+                // Direct RectTransform drag for CaseCanvas pins
+                if (_cbDirectDrag && _cbDirectDragRT != null && _cbDirectDragParentRT != null && _casePanelCanvas != null)
+                {
+                    try
+                    {
+                        var plane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+                        var ray = new Ray(rPos, rFwd);
+                        if (plane.Raycast(ray, out float d) && d > 0f)
+                        {
+                            Vector3 wp = rPos + rFwd * d;
+                            // Convert world point to parent-local 2D coordinates
+                            Vector3 local3 = _cbDirectDragParentRT.InverseTransformPoint(wp);
+                            Vector2 localNow = new Vector2(local3.x, local3.y);
+                            Vector2 delta = localNow - _cbDirectDragStartLocal;
+                            _cbDirectDragRT.anchoredPosition = _cbDirectDragStartAnchored + delta;
+                            if (!_cbDragStarted)
+                            {
+                                _cbDragStarted = true;
+                                Log.LogInfo($"[VRCamera] CB direct drag start: '{_cbDragGO?.name}' startAnch={_cbDirectDragStartAnchored}");
+                            }
+                        }
+                    }
+                    catch (Exception ex) { Log.LogWarning($"[VRCamera] CB direct drag update: {ex.Message}"); }
+                }
+                else if (_cbDragGO != null && _cbDragPED != null)
+                {
+                    // EventSystem-based drag for non-CaseCanvas canvases
+                    try
+                    {
+                        Vector2 newDragPos = GetCaseBoardScreenPos(rPos, rFwd, _cbDragCanvas, moveCursor: true);
+                        _cbDragPED.delta = newDragPos - _cbDragPED.position;
+                        _cbDragPED.position = newDragPos;
+                        if (!_cbDragStarted && (Time.frameCount - _cbDragPressFrame) >= CbDragFrameThreshold)
+                        {
+                            _cbDragStarted = true;
+                            ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.initializePotentialDrag);
+                            ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.beginDragHandler);
+                            Log.LogInfo($"[VRCamera] CB drag start: '{_cbDragGO.name}'");
+                        }
+                        if (_cbDragStarted)
+                            ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.dragHandler);
+                    }
+                    catch { }
+                }
+            }
         }
-        else if (triggerNow && (Time.frameCount - _triggerFireFrame) >= 20)
+        else if (triggerEdge && cbOpen && (Time.frameCount - _triggerFireFrame) >= 20)
         {
-            _triggerNeedsRelease = true;
-            _triggerFireFrame = Time.frameCount;
-            TryClickCanvas(_rightControllerGO.transform.position, _rightControllerGO.transform.forward);
+            _cbDragGO = TryFindCaseBoardTarget(rPos, rFwd,
+                out _cbDragCanvas, out _cbDragPED, PointerEventData.InputButton.Left);
+            if (_cbDragGO != null)
+            {
+                _cbDragActive = true;
+                _cbDragStarted = false;
+                _cbDragPressFrame = Time.frameCount;
+                _triggerFireFrame = Time.frameCount;
+                _cbDragIsNative = (_cbDragCanvas == _casePanelCanvas);
+                _cbDirectDrag = false;
+
+                // For CaseCanvas items: try to set up direct RectTransform drag
+                if (_cbDragIsNative)
+                {
+                    try
+                    {
+                        // Walk up from hit GO to find the DragCasePanel ancestor (citizen/PlayerStickyNote)
+                        RectTransform? pinRT = null;
+                        var walker = _cbDragGO.transform;
+                        for (int wi = 0; wi < 8 && walker != null; wi++)
+                        {
+                            // DragCasePanel is the draggable pin component
+                            var comps = walker.GetComponents<Component>();
+                            bool hasDCP = false;
+                            foreach (var comp in comps)
+                            {
+                                if (comp != null && comp.GetIl2CppType().Name == "DragCasePanel")
+                                { hasDCP = true; break; }
+                            }
+                            if (hasDCP)
+                            {
+                                pinRT = walker.GetComponent<RectTransform>();
+                                break;
+                            }
+                            walker = walker.parent;
+                        }
+
+                        if (pinRT != null && pinRT.parent != null)
+                        {
+                            var parentRT = pinRT.parent.GetComponent<RectTransform>();
+                            if (parentRT != null)
+                            {
+                                // Compute initial ray hit in parent-local coordinates
+                                var plane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+                                var ray = new Ray(rPos, rFwd);
+                                if (plane.Raycast(ray, out float d) && d > 0f)
+                                {
+                                    Vector3 wp = rPos + rFwd * d;
+                                    Vector3 local3 = parentRT.InverseTransformPoint(wp);
+                                    _cbDirectDragRT = pinRT;
+                                    _cbDirectDragParentRT = parentRT;
+                                    _cbDirectDragStartLocal = new Vector2(local3.x, local3.y);
+                                    _cbDirectDragStartAnchored = pinRT.anchoredPosition;
+                                    _cbDirectDrag = true;
+                                    Log.LogInfo($"[VRCamera] CB direct drag setup: pin='{pinRT.gameObject.name}' parent='{parentRT.gameObject.name}' anchored={pinRT.anchoredPosition} localHit=({local3.x:F1},{local3.y:F1})");
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex) { Log.LogWarning($"[VRCamera] CB direct drag setup: {ex.Message}"); }
+                }
+
+                if (!_cbDirectDrag)
+                {
+                    // Fallback: EventSystem-based drag
+                    GetCaseBoardScreenPos(rPos, rFwd, _cbDragCanvas, moveCursor: true);
+                    try
+                    {
+                        ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.pointerEnterHandler);
+                        ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.pointerDownHandler);
+                    }
+                    catch { }
+                    if (_cbDragIsNative)
+                    {
+                        try { mouse_event(0x0002 /*LEFTDOWN*/, 0, 0, 0, UIntPtr.Zero); } catch { }
+                    }
+                }
+            }
+            else
+            {
+                // Not on a CaseCanvas element — use regular instant-click for other canvases
+                _triggerNeedsRelease = true;
+                _triggerFireFrame = Time.frameCount;
+                TryClickCanvas(rPos, rFwd);
+            }
+        }
+        else if (!_cbDragActive)
+        {
+            if (_triggerNeedsRelease)
+            {
+                if (!triggerNow) _triggerNeedsRelease = false;
+            }
+            else if (triggerEdge && (Time.frameCount - _triggerFireFrame) >= 20)
+            {
+                _triggerNeedsRelease = true;
+                _triggerFireFrame = Time.frameCount;
+                TryClickCanvas(rPos, rFwd);
+            }
+        }
+
+        // ── Case board right-click: Right A → context menu (3-phase debounce) ──
+        if (cbOpen)
+        {
+            if (Time.realtimeSinceStartup >= _cbACooldownUntil)
+            {
+                OpenXRManager.GetButtonAState(out bool aPressed);
+                if (_cbANeedsRelease) { if (!aPressed) _cbANeedsRelease = false; }
+                else if (aPressed)
+                {
+                    GetCaseBoardScreenPos(rPos, rFwd, _casePanelCanvas, moveCursor: true);
+                    const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+                    const uint MOUSEEVENTF_RIGHTUP   = 0x0010;
+                    mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, UIntPtr.Zero);
+                    mouse_event(MOUSEEVENTF_RIGHTUP,   0, 0, 0, UIntPtr.Zero);
+                    _cbANeedsRelease = true;
+                    _cbACooldownUntil = Time.realtimeSinceStartup + 1.0f;
+                    // Pause continuous cursor tracking so the context menu stays visible
+                    _cbCursorPauseUntil = Time.realtimeSinceStartup + 3.0f;
+                    Log.LogInfo("[VRCamera] CB right-click (mouse_event)");
+                }
+            }
+        }
+
+        // ── Case board middle-click: Right B → create string (3-phase debounce + drag) ──
+        if (cbOpen)
+        {
+            const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+            const uint MOUSEEVENTF_MIDDLEUP   = 0x0040;
+
+            if (_cbMidDragActive)
+            {
+                // Mid-drag in progress: read button directly (no debounce, need release detection)
+                OpenXRManager.GetButtonBState(out bool bNow);
+                if (!bNow)
+                {
+                    GetCaseBoardScreenPos(rPos, rFwd, _casePanelCanvas, moveCursor: true);
+                    mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
+                    Log.LogInfo("[VRCamera] CB mid-drag end (mouse_event)");
+                    _cbMidDragActive = false; _cbMidDragStarted = false;
+                    _cbBNeedsRelease = true;
+                    _cbBCooldownUntil = Time.realtimeSinceStartup + 0.3f;
+                }
+                else
+                {
+                    GetCaseBoardScreenPos(rPos, rFwd, _casePanelCanvas, moveCursor: true);
+                    if (!_cbMidDragStarted)
+                    {
+                        _cbMidDragStarted = true;
+                        Log.LogInfo("[VRCamera] CB mid-drag start (mouse_event)");
+                    }
+                }
+            }
+            else if (Time.realtimeSinceStartup >= _cbBCooldownUntil)
+            {
+                OpenXRManager.GetButtonBState(out bool bPressed);
+                if (_cbBNeedsRelease) { if (!bPressed) _cbBNeedsRelease = false; }
+                else if (bPressed)
+                {
+                    GetCaseBoardScreenPos(rPos, rFwd, _casePanelCanvas, moveCursor: true);
+                    mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, UIntPtr.Zero);
+                    _cbMidDragActive = true;
+                    _cbMidDragStarted = false;
+                    Log.LogInfo("[VRCamera] CB mid-press (mouse_event)");
+                }
+            }
+        }
+        else
+        {
+            // Case board closed — clean up any stale drag state
+            if (_cbMidDragActive)
+            {
+                // Release middle button if held
+                const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
+                mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
+                _cbMidDragActive = false; _cbMidDragStarted = false;
+            }
         }
 
         // Thumbstick Y scrolls the VR settings panel when it is open.
@@ -3414,21 +3956,28 @@ public class VRCamera : MonoBehaviour
         bool gripReleased = !gripNow && _gripWasPressed;
         _gripWasPressed = gripNow;
 
-        // Start drag: grip pressed while controller ray hits a CaseBoard canvas
-        if (gripPressed && _gripDragCanvas == null && _rightControllerGO != null)
+        // Start drag: grip pressed while controller ray hits a case board element.
+        // Only active when case board is open (ActionPanelCanvas visible).
+        bool caseBoardOpen = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf;
+        if (gripPressed && _gripDragCanvas == null && _rightControllerGO != null && caseBoardOpen)
         {
             Vector3 ctrlPos = _rightControllerGO.transform.position;
             Vector3 ctrlFwd = _rightControllerGO.transform.forward;
             var ray = new Ray(ctrlPos, ctrlFwd);
+
+            // Collect all eligible canvas hits and pick the NEAREST one.
+            float   bestGripDist = float.MaxValue;
+            Canvas? bestGripCanvas = null;
 
             foreach (var kvp in _managedCanvases)
             {
                 var c = kvp.Value;
                 if (c == null || !IsCanvasVisible(c)) continue;
                 var dragCat = GetCanvasCategory(c.gameObject.name);
-                // Allow grip-drag on CaseBoard and Menu canvases (notebook, map, bio, location details)
-                // but NOT on CaseCanvas (just the background board) or HUD/Tooltip/Ignored.
-                if (dragCat != CanvasCategory.CaseBoard && dragCat != CanvasCategory.Menu) continue;
+                // Allow grip-drag on CaseBoard, Menu, and Panel canvases — but only those
+                // that appear during case board usage (notes, notepad, map, bio, location, minimap).
+                // Exclude CaseCanvas itself (the background board) and HUD/Tooltip/Ignored.
+                if (dragCat != CanvasCategory.CaseBoard && dragCat != CanvasCategory.Menu && dragCat != CanvasCategory.Panel) continue;
                 string cName = c.gameObject.name ?? "";
                 if (cName.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase)) continue;
 
@@ -3442,11 +3991,15 @@ public class VRCamera : MonoBehaviour
                     if (Mathf.Abs(lp.x) > hs.x || Mathf.Abs(lp.y) > hs.y) continue;
                 }
 
-                _gripDragCanvas    = c;
-                _gripDragOffset    = c.transform.position - ctrlPos;
-                _gripDragRotOffset = Quaternion.Inverse(_rightControllerGO.transform.rotation) * c.transform.rotation;
-                Log.LogInfo($"[VRCamera] GripDrag start: '{c.gameObject.name}'");
-                break;
+                if (dist < bestGripDist) { bestGripDist = dist; bestGripCanvas = c; }
+            }
+
+            if (bestGripCanvas != null)
+            {
+                _gripDragCanvas    = bestGripCanvas;
+                _gripDragOffset    = bestGripCanvas.transform.position - ctrlPos;
+                _gripDragRotOffset = Quaternion.Inverse(_rightControllerGO.transform.rotation) * bestGripCanvas.transform.rotation;
+                Log.LogInfo($"[VRCamera] GripDrag start: '{bestGripCanvas.gameObject.name}' dist={bestGripDist:F2}");
             }
         }
 
@@ -3554,9 +4107,47 @@ public class VRCamera : MonoBehaviour
         if (_sceneLoadGrace > 0) return;
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
 
+        // Pause-mode locomotion: allow limited movement within PauseMoveRadius.
+        // When pause starts, record origin. When pause ends, warp player back.
+        bool isPaused = (_actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf)
+                     || (_menuCanvasRef != null && !IsCanvasEffectivelyHidden(_menuCanvasRef));
+        if (isPaused)
+        {
+            if (!_pauseMovementActive)
+            {
+                // Pause just started — record origin
+                _pauseMovementActive = true;
+                _pauseOriginPos = _playerCC.transform.position;
+            }
+        }
+        else
+        {
+            if (_pauseMovementActive)
+            {
+                _pauseMovementActive = false;
+                // Warp player back to origin — but NOT during/after a save-load.
+                // _suppressPauseWarpUntil is set for 15s whenever a reload is detected.
+                if (Time.realtimeSinceStartup >= _suppressPauseWarpUntil)
+                {
+                    try
+                    {
+                        _playerCC.enabled = false;
+                        _playerCC.transform.position = _pauseOriginPos;
+                        _playerCC.enabled = true;
+                        Log.LogInfo("[VRCamera] Pause ended — warped back to pause origin.");
+                    }
+                    catch { }
+                }
+                else
+                {
+                    Log.LogInfo("[VRCamera] Pause ended — warp suppressed (within load grace window).");
+                }
+            }
+        }
+
         if (!OpenXRManager.GetThumbstickState(false, out float lx, out float ly)) return;
         if (Mathf.Abs(lx) <= MoveDeadZone && Mathf.Abs(ly) <= MoveDeadZone)
-            return;
+            return; // idle — gravity is handled by UpdateJump's idle Move()
 
         // Apply dead-zone scaling so motion starts smoothly at the threshold
         float dx = Mathf.Abs(lx) > MoveDeadZone ? lx : 0f;
@@ -3583,7 +4174,31 @@ public class VRCamera : MonoBehaviour
                 _playerCC = null;
                 return;
             }
-            _playerCC.Move(hMove * Time.deltaTime);
+            // Combine horizontal (scaled time) + vertical jump/gravity (unscaled time) into
+            // one Move() call.  Splitting them into two calls was causing isGrounded to be
+            // false when UpdateJump ran, because Unity updates isGrounded after each Move()
+            // and the horizontal-only first call gave no downward component.
+            float vDt = Time.unscaledDeltaTime;
+            if (vDt > 0.2f) vDt = 0.2f;
+            Vector3 fullMove = hMove * Time.deltaTime
+                             + new Vector3(0f, _jumpVerticalVelocity * vDt, 0f);
+            _playerCC.Move(fullMove);
+
+            // Clamp position to PauseMoveRadius during pause mode
+            if (_pauseMovementActive)
+            {
+                Vector3 pos = _playerCC.transform.position;
+                Vector3 delta = pos - _pauseOriginPos;
+                delta.y = 0f; // only clamp horizontal distance
+                if (delta.sqrMagnitude > PauseMoveRadius * PauseMoveRadius)
+                {
+                    Vector3 clamped = _pauseOriginPos + delta.normalized * PauseMoveRadius;
+                    clamped.y = pos.y; // preserve vertical
+                    _playerCC.enabled = false;
+                    _playerCC.transform.position = clamped;
+                    _playerCC.enabled = true;
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -3657,6 +4272,7 @@ public class VRCamera : MonoBehaviour
     /// Also sends Space key as fallback for any other game systems that check it.
     /// </summary>
     private float _jumpVerticalVelocity;
+    private bool  _hasBeenGrounded;          // true once isGrounded was true in current scene
     private const float JumpForce = 5.0f;   // m/s upward impulse
     private const float Gravity   = -15.0f; // m/s² (slightly stronger than real for game feel)
     private void UpdateJump()
@@ -3672,17 +4288,7 @@ public class VRCamera : MonoBehaviour
         float dt = Time.unscaledDeltaTime;
         if (dt <= 0f || dt > 0.2f) return; // skip on zero-dt or huge spikes
 
-        // Only read jump button when VR settings panel is NOT open
-        bool pressed = false;
-        bool edge = false;
-        if (VRSettingsPanel.RootGO == null || !VRSettingsPanel.RootGO.activeSelf)
-        {
-            OpenXRManager.GetButtonAState(out pressed);
-            edge = pressed && !_jumpBtnPrev;
-        }
-        _jumpBtnPrev = pressed;
-
-        // Guard: verify CC is still alive
+        // Guard: verify CC is still alive (needed for gravity even if button suppressed)
         try
         {
             if (_playerCC.gameObject == null || !_playerCC.gameObject.activeInHierarchy)
@@ -3690,34 +4296,79 @@ public class VRCamera : MonoBehaviour
         }
         catch { _playerCC = null; return; }
 
-        // Apply gravity every frame
-        if (_playerCC.isGrounded)
-            _jumpVerticalVelocity = -0.5f; // small downward to keep grounded
-        else
-            _jumpVerticalVelocity += Gravity * dt;
-
-        // Clamp terminal velocity to prevent runaway falling
-        if (_jumpVerticalVelocity < -20f) _jumpVerticalVelocity = -20f;
-
-        // Jump impulse on press edge, only when grounded
-        if (edge && _playerCC.isGrounded)
-        {
-            _jumpVerticalVelocity = JumpForce;
-            Log.LogInfo("[VRCamera] Jump");
-        }
-
-        // Apply vertical movement — always, even during pause, to prevent floating
-        if (Mathf.Abs(_jumpVerticalVelocity) > 0.01f)
+        // Track whether player has ever been grounded in this scene.
+        // Problem: isGrounded only updates after Move(), but we gate Move() on _hasBeenGrounded.
+        // Fix: use a raycast to detect ground below. At main menu there's no ground geometry,
+        // so the raycast fails and _hasBeenGrounded stays false → no gravity → no falling through void.
+        if (_playerCC.isGrounded) _hasBeenGrounded = true;
+        if (!_hasBeenGrounded)
         {
             try
             {
-                _playerCC.Move(new Vector3(0f, _jumpVerticalVelocity * dt, 0f));
+                var ccPos = _playerCC.transform.position;
+                if (Physics.Raycast(ccPos, Vector3.down, 5f))
+                    _hasBeenGrounded = true;
             }
-            catch (Exception ex)
-            {
-                Log.LogWarning($"[VRCamera] Jump Move failed: {ex.Message}");
-                _jumpVerticalVelocity = 0f;
-            }
+            catch { }
+        }
+
+        // Apply gravity every frame (only once we've confirmed ground exists)
+        if (!_hasBeenGrounded)
+        {
+            _jumpVerticalVelocity = 0f;
+        }
+        else if (_playerCC.isGrounded)
+            _jumpVerticalVelocity = -0.5f; // small downward to keep grounded
+        else
+            _jumpVerticalVelocity += Gravity * dt;
+        if (_jumpVerticalVelocity < -20f) _jumpVerticalVelocity = -20f;
+
+        // When thumbstick is idle, UpdateLocomotion doesn't call Move().
+        // Apply a gravity-only Move() here so isGrounded stays updated for jump.
+        // Always call Move() once _hasBeenGrounded is true — this pushes the CC
+        // to the ground and keeps isGrounded updated.
+        if (_hasBeenGrounded)
+        {
+            try { _playerCC.Move(new Vector3(0f, _jumpVerticalVelocity * dt, 0f)); }
+            catch { }
+        }
+
+        // ── 3-phase button debounce (same proven pattern as menu button) ──
+        // Only read jump button when VR settings panel AND case board are NOT open.
+        bool cbOpenJ = false;
+        try { cbOpenJ = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf; }
+        catch { cbOpenJ = false; }
+        bool vrSettingsOpen = VRSettingsPanel.RootGO != null && VRSettingsPanel.RootGO.activeSelf;
+
+        // Diagnostic: log jump state once per second
+        float now = Time.realtimeSinceStartup;
+        OpenXRManager.GetButtonAState(out bool aStateNow);
+        if ((int)now != (int)(now - dt)) // once per second
+        {
+            Log.LogInfo($"[VRCamera] JumpDiag: A={aStateNow} grounded={_playerCC.isGrounded} cbOpen={cbOpenJ} vrSettings={vrSettingsOpen} needsRelease={_jumpBtnNeedsRelease} cooldown={_jumpCooldownUntil:F1} now={now:F1}");
+        }
+
+        if (vrSettingsOpen || cbOpenJ)
+            return; // gravity applied above; suppress jump input
+
+        // Phase 1: time lockout — don't read button at all (prevents bounce corruption)
+        if (now < _jumpCooldownUntil) return;
+
+        // Phase 2: wait for physical release
+        if (_jumpBtnNeedsRelease) { if (!aStateNow) _jumpBtnNeedsRelease = false; return; }
+
+        // Phase 3: fire on press, only when grounded
+        if (!aStateNow) return;
+        if (_playerCC.isGrounded)
+        {
+            _jumpVerticalVelocity = JumpForce;
+            _jumpBtnNeedsRelease = true;
+            _jumpCooldownUntil = now + 0.3f;
+            Log.LogInfo("[VRCamera] Jump!");
+        }
+        else
+        {
+            Log.LogInfo($"[VRCamera] Jump pressed but NOT grounded (vel={_jumpVerticalVelocity:F2})");
         }
     }
 
@@ -3764,13 +4415,18 @@ public class VRCamera : MonoBehaviour
     }
 
     /// <summary>Left X → C (crouch toggle).</summary>
+    private float _crouchCooldownUntil;
+    private bool  _crouchNeedsRelease;
     private void UpdateCrouch()
     {
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+        // 3-phase debounce (same as menu button)
+        if (Time.realtimeSinceStartup < _crouchCooldownUntil) return;
         OpenXRManager.GetButtonXState(out bool pressed);
-        bool edge = pressed && !_crouchBtnPrev;
-        _crouchBtnPrev = pressed;
-        if (!edge) return;
+        if (_crouchNeedsRelease) { if (!pressed) _crouchNeedsRelease = false; return; }
+        if (!pressed) return;
+        _crouchNeedsRelease = true;
+        _crouchCooldownUntil = Time.realtimeSinceStartup + 0.3f;
         try
         {
             const byte VK_C = 0x43;
@@ -3829,21 +4485,45 @@ public class VRCamera : MonoBehaviour
         Log.LogInfo("[VRCamera] Sprint stop");
     }
 
-    /// <summary>Right B → Tab (notebook/map).</summary>
+    /// <summary>Right B → Tab (notebook/map).  3-phase debounce (same as menu button).</summary>
     private void UpdateNotebook()
     {
+        // Deferred Tab key-up: hold Tab DOWN for 2 frames so the game's Input.GetKey(Tab) sees it.
+        // Instant down+up in the same frame was being missed by the game, causing toggle to not stick.
+        if (_pendingTabUpFrame >= 0 && _frameCount >= _pendingTabUpFrame)
+        {
+            const byte VK_TAB_UP = 0x09;
+            const uint KEYEVENTF_KEYUP_2 = 0x0002;
+            try { keybd_event(VK_TAB_UP, 0, KEYEVENTF_KEYUP_2, UIntPtr.Zero); }
+            catch { }
+            _pendingTabUpFrame = -1;
+        }
+
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+
+        // Phase 1: time-based lockout — don't even read button state during cooldown.
+        // Reading state during cooldown caused bounce values to corrupt _prev, re-triggering.
+        if (Time.realtimeSinceStartup < _notebookCooldownUntil) return;
+
         OpenXRManager.GetButtonBState(out bool pressed);
-        bool edge = pressed && !_notebookBtnPrev;
-        _notebookBtnPrev = pressed;
-        if (!edge) return;
+
+        // Phase 2: wait for physical release after fire (guards against bounce after cooldown).
+        if (_notebookBtnNeedsRelease) { if (!pressed) _notebookBtnNeedsRelease = false; return; }
+
+        // Phase 3: fire on press.
+        if (!pressed) return;
+        // When case board is open, Right B = middle-click (create string) — suppress Tab
+        if (_actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf) return;
+
+        _notebookBtnNeedsRelease = true;
+        _notebookCooldownUntil = Time.realtimeSinceStartup + 1.0f;
         try
         {
             const byte VK_TAB = 0x09;
-            const uint KEYEVENTF_KEYUP = 0x0002;
-            keybd_event(VK_TAB, 0, 0,               UIntPtr.Zero);
-            keybd_event(VK_TAB, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
-            Log.LogInfo("[VRCamera] Notebook (Tab)");
+            // Send key DOWN only — key UP deferred to 3 frames later so game sees held state
+            keybd_event(VK_TAB, 0, 0, UIntPtr.Zero);
+            _pendingTabUpFrame = _frameCount + 3;
+            Log.LogInfo($"[VRCamera] Notebook (Tab DOWN) t={Time.realtimeSinceStartup:F3} cooldown={_notebookCooldownUntil:F3} upFrame={_pendingTabUpFrame}");
         }
         catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateNotebook: {ex.Message}"); }
     }
@@ -3868,20 +4548,35 @@ public class VRCamera : MonoBehaviour
     }
 
     /// <summary>Left grip → X (inventory).</summary>
+    private bool _gripAiming;  // true while left grip is held and camera is redirected for RMB
     private void UpdateInventory()
     {
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
         OpenXRManager.GetGripState(false, out bool pressed);
+
+        // While grip is held, point game camera at left controller aim direction
+        // (same pattern as left trigger for LMB — game raycasts from Camera.main).
+        if (pressed && _gameCamRef != null && _leftControllerGO != null)
+        {
+            _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation;
+            _gripAiming = true;
+        }
+        else if (_gripAiming && !pressed)
+        {
+            _gripAiming = false;
+        }
+
         bool edge = pressed && !_inventoryBtnPrev;
         _inventoryBtnPrev = pressed;
         if (!edge) return;
         try
         {
-            const byte VK_X = 0x58;
-            const uint KEYEVENTF_KEYUP = 0x0002;
-            keybd_event(VK_X, 0, 0,               UIntPtr.Zero);
-            keybd_event(VK_X, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
-            Log.LogInfo("[VRCamera] Inventory (X)");
+            // Right mouse button (game uses RMB for pick up evidence, secondary interact)
+            const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+            const uint MOUSEEVENTF_RIGHTUP   = 0x0010;
+            mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, UIntPtr.Zero);
+            mouse_event(MOUSEEVENTF_RIGHTUP,   0, 0, 0, UIntPtr.Zero);
+            Log.LogInfo("[VRCamera] World RMB (left grip + left controller aim)");
         }
         catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateInventory: {ex.Message}"); }
     }
@@ -4101,6 +4796,31 @@ public class VRCamera : MonoBehaviour
             var apT = _actionPanelCanvas.transform;
             _casePanelCanvas.transform.position = apT.position + apT.forward * 0.15f;
             _casePanelCanvas.transform.rotation = apT.rotation;
+        }
+        catch { }
+    }
+
+    /// <summary>Per-frame Z-separation for WindowCanvas nested canvases (notes, notebook).
+    /// Game layout resets localPosition.z every frame, so we must re-apply offsets here
+    /// (after the game's layout pass, before render) to prevent HDRP Z-fighting.</summary>
+    private void EnforceWindowNestedZSeparation()
+    {
+        if (_windowNestedList.Count < 2) return;
+        try
+        {
+            for (int i = 0; i < _windowNestedList.Count; i++)
+            {
+                var nc = _windowNestedList[i];
+                if (nc == null) continue;
+                var nrt = nc.GetComponent<RectTransform>();
+                if (nrt == null) continue;
+                var lp = nrt.localPosition;
+                // Each canvas gets a 30 canvas-unit offset (~19mm at default scale).
+                // Index 0 = furthest back, last index = front (z=0).
+                float zOff = (_windowNestedList.Count - 1 - i) * -30f;
+                lp.z = zOff;
+                nrt.localPosition = lp;
+            }
         }
         catch { }
     }
@@ -4437,6 +5157,265 @@ public class VRCamera : MonoBehaviour
         catch (Exception ex) { Log.LogWarning($"[Movement] Camera.main check: {ex.Message}"); }
     }
     /// <summary>
+    /// <summary>
+    /// Raycast against CaseCanvas to find an interactive element for drag/click.
+    /// Only considers CaseCanvas itself — ActionPanelCanvas and other canvases are excluded
+    /// so their decorative elements don't steal pin board interactions.
+    /// Returns the target GO and populates the canvas + PED for the session.
+    /// The <paramref name="mouseButton"/> selects which PointerEventData.InputButton to set
+    /// (Left = normal click/drag, Right = context menu, Middle = create string).
+    /// </summary>
+    private GameObject? TryFindCaseBoardTarget(Vector3 origin, Vector3 direction,
+                                                out Canvas? canvas, out PointerEventData? ped,
+                                                PointerEventData.InputButton mouseButton = PointerEventData.InputButton.Left)
+    {
+        canvas = null; ped = null;
+        if (_leftCam == null) return null;
+
+        var es = EventSystem.current;
+        if (es == null) return null;
+        var ray = new Ray(origin, direction);
+
+        // Collect candidate canvases: all visible managed canvases + CaseCanvas (no bounds check)
+        // Sort by ray distance (nearest first) so closest canvas wins
+        var candidates = new List<(float dist, Canvas c, Vector2 screenPos, bool isCaseCanvas)>();
+
+        // Always include CaseCanvas (no bounds check — sizeDelta doesn't match visual extent)
+        // Use _gameCamRef for screen pos — CaseCanvas.worldCamera = _gameCamRef, so PED positions
+        // must be in _gameCamRef screen space for DragCasePanel's coordinate conversion to work.
+        if (_casePanelCanvas != null && _casePanelCanvas.gameObject.activeSelf && _gameCamRef != null)
+        {
+            var casePlane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+            if (casePlane.Raycast(ray, out float caseDist) && caseDist > 0f)
+            {
+                Vector3 wp = origin + direction * caseDist;
+                Vector3 sp = _gameCamRef.WorldToScreenPoint(wp);
+                if (sp.z > 0f)
+                    candidates.Add((caseDist, _casePanelCanvas, new Vector2(sp.x, sp.y), true));
+            }
+        }
+
+        // Include all other visible managed canvases (WindowCanvas for notes/notepad, etc.)
+        foreach (var kvp in _managedCanvases)
+        {
+            var c = kvp.Value;
+            if (c == null || !c.gameObject.activeSelf) continue;
+            if (c == _casePanelCanvas) continue; // already added above
+            if (c.renderMode != RenderMode.WorldSpace) continue;
+
+            var cPlane = new Plane(-c.transform.forward, c.transform.position);
+            if (!cPlane.Raycast(ray, out float cDist) || cDist <= 0f) continue;
+
+            // Bounds check for non-CaseCanvas canvases
+            Vector3 wp = origin + direction * cDist;
+            Vector3 local = c.transform.InverseTransformPoint(wp);
+            var rect = c.GetComponent<RectTransform>();
+            if (rect == null) continue;
+            Vector2 sz = rect.rect.size;
+            Vector2 pivot = rect.pivot;
+            float lx = local.x + sz.x * pivot.x;
+            float ly = local.y + sz.y * pivot.y;
+            if (lx < 0 || lx > sz.x || ly < 0 || ly > sz.y) continue;
+
+            Vector3 sp = _leftCam.WorldToScreenPoint(wp);
+            candidates.Add((cDist, c, new Vector2(sp.x, sp.y), false));
+        }
+
+        // Sort nearest first
+        candidates.Sort((a, b) => a.dist.CompareTo(b.dist));
+
+        // Try each candidate — first one with a valid UI hit wins
+        foreach (var (dist, cCanvas, screenPos, isCaseCanvas) in candidates)
+        {
+            try
+            {
+                // CaseCanvas uses _gameCamRef as worldCamera; screenPos is already in _gameCamRef space.
+                // Other canvases use _leftCam; screenPos is in _leftCam space.
+                // No camera swap needed — each canvas's worldCamera matches its screenPos coordinate space.
+                if (cCanvas.worldCamera == null)
+                {
+                    if (_leftCam != null) cCanvas.worldCamera = _leftCam;
+                    else continue;
+                }
+
+                var gr = cCanvas.GetComponent<GraphicRaycaster>();
+                if (gr == null || !gr.enabled) continue;
+
+                var localPed = new PointerEventData(es);
+                localPed.position = screenPos;
+
+                var results = new Il2CppSystem.Collections.Generic.List<RaycastResult>();
+                gr.Raycast(localPed, results);
+                if (results.Count == 0) continue;
+
+                var go = results[0].gameObject;
+                if (go == null) continue;
+
+                // CaseCanvas: require a Button in hierarchy (skip background/container elements)
+                if (isCaseCanvas)
+                {
+                    bool hasBtn = false;
+                    var walker = go.transform;
+                    var compDiag = new System.Text.StringBuilder();
+                    for (int wi = 0; wi < 8 && walker != null; wi++)
+                    {
+                        if (walker.GetComponent<Button>() != null) hasBtn = true;
+                        // Log all components on each ancestor for diagnostics
+                        try
+                        {
+                            var comps = walker.GetComponents<Component>();
+                            compDiag.Append($"  [{wi}] '{walker.gameObject.name}': ");
+                            foreach (var comp in comps)
+                            {
+                                if (comp != null)
+                                    compDiag.Append(comp.GetIl2CppType().Name).Append(", ");
+                            }
+                            compDiag.AppendLine();
+                        }
+                        catch { }
+                        walker = walker.parent;
+                    }
+                    if (compDiag.Length > 0)
+                        Log.LogInfo($"[VRCamera] CBTarget hierarchy for '{go.name}':\n{compDiag}");
+                    if (!hasBtn) continue;
+                }
+
+                localPed.pointerEnter = go;
+                localPed.pointerPress = go;
+                localPed.rawPointerPress = go;
+                localPed.pointerDrag = go;
+                localPed.pressPosition = localPed.position;
+                localPed.pointerCurrentRaycast = results[0];
+                localPed.pointerPressRaycast = results[0];
+                localPed.eligibleForClick = true;
+                localPed.button = mouseButton;
+
+                canvas = cCanvas;
+                ped = localPed;
+                string cName = cCanvas.gameObject.name ?? "?";
+                Log.LogInfo($"[VRCamera] CaseBoard target: '{go.name}' on '{cName}' btn={mouseButton}");
+                return go;
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Raycast controller ray against CaseCanvas plane and return screen-space position.
+    /// Used during drag to update PointerEventData.position each frame.
+    /// </summary>
+    /// <summary>
+    /// Fires a click on a CaseCanvas element using persistent listener invocation (bypasses
+    /// ButtonController.mouseInputMode guard) + ExecuteEvents for 0-listener buttons.
+    /// Replicates the same logic as TryClickCanvas button handling.
+    /// </summary>
+    private void FireCaseBoardClick(GameObject go)
+    {
+        try
+        {
+            var walker = go.transform;
+            for (int bl = 0; bl < 8 && walker != null; bl++)
+            {
+                var btn = walker.GetComponent<Button>();
+                if (btn != null)
+                {
+                    int pCount = btn.onClick.GetPersistentEventCount();
+                    if (pCount > 0)
+                    {
+                        for (int pi = 0; pi < pCount; pi++)
+                            btn.onClick.SetPersistentListenerState(pi, UnityEngine.Events.UnityEventCallState.RuntimeOnly);
+                        btn.onClick.Invoke();
+                        for (int pi = 0; pi < pCount; pi++)
+                            btn.onClick.SetPersistentListenerState(pi, UnityEngine.Events.UnityEventCallState.Off);
+                        _forceScanFrames = 30;
+                        // Recentre WindowCanvas for newly spawned notes
+                        foreach (var wkvp in _managedCanvases)
+                        {
+                            if (wkvp.Value == null) continue;
+                            if ((wkvp.Value.gameObject.name ?? "").Equals("WindowCanvas", StringComparison.OrdinalIgnoreCase))
+                            { _positionedCanvases.Remove(wkvp.Key); break; }
+                        }
+                        Log.LogInfo($"[VRCamera] CB persistent click: '{walker.gameObject.name}' persistent={pCount}");
+                        return;
+                    }
+                    // 0 persistent listeners — use ExecuteEvents
+                    break;
+                }
+                walker = walker.parent;
+            }
+        }
+        catch { }
+        // Fallback: fire ExecuteEvents (for 0-listener buttons / custom IPointerClickHandler)
+        try
+        {
+            var es = EventSystem.current;
+            if (es != null)
+            {
+                var ped = new PointerEventData(es);
+                ped.pointerPress = go;
+                ped.button = PointerEventData.InputButton.Left;
+                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerClickHandler);
+                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.submitHandler);
+            }
+        }
+        catch { }
+    }
+
+    private Vector2 GetCaseBoardScreenPos(Vector3 origin, Vector3 direction, Canvas? targetCanvas = null,
+                                           bool moveCursor = false)
+    {
+        var c = targetCanvas ?? _casePanelCanvas;
+        if (c == null || _leftCam == null)
+            return Vector2.zero;
+        var plane = new Plane(-c.transform.forward, c.transform.position);
+        if (plane.Raycast(new Ray(origin, direction), out float d) && d > 0f)
+        {
+            Vector3 wp = origin + direction * d;
+            // Return screen coords matching the canvas's worldCamera for PointerEventData.
+            // CaseCanvas uses _gameCamRef (Screen space); all others use _leftCam (VR eye space).
+            bool isCaseC = (c == _casePanelCanvas && _gameCamRef != null);
+            Vector3 sp = isCaseC ? _gameCamRef.WorldToScreenPoint(wp)
+                                 : _leftCam.WorldToScreenPoint(wp);
+
+            // Move the OS cursor so Input.mousePosition matches — the game's case board
+            // reads Input.mousePosition directly for drag positioning, pin placement, etc.
+            // Use the GAME camera (renders to screen) for WorldToScreenPoint so the result
+            // is directly in Screen.width × Screen.height space.  The old code used _leftCam
+            // pixel space with viewport normalization, which failed because the VR eye camera
+            // has a completely different resolution/FOV from the game window.
+            if (moveCursor && _gameCamRef != null)
+            {
+                try
+                {
+                    Vector3 gameSp = _gameCamRef.WorldToScreenPoint(wp);
+                    if (gameSp.z > 0f) // point is in front of game camera
+                    {
+                        int clientX = Mathf.Clamp((int)gameSp.x, 0, Screen.width - 1);
+                        int clientY = Mathf.Clamp(Screen.height - 1 - (int)gameSp.y, 0, Screen.height - 1);
+                        IntPtr hwnd = GetActiveWindow();
+                        POINT pt;
+                        pt.X = clientX;
+                        pt.Y = clientY;
+                        ClientToScreen(hwnd, ref pt);
+                        SetCursorPos(pt.X, pt.Y);
+                        // Diagnostic: log coordinates once per second during drag
+                        if (_cbDragActive && (int)Time.realtimeSinceStartup != (int)(Time.realtimeSinceStartup - Time.unscaledDeltaTime))
+                        {
+                            Vector3 mousePos = Input.mousePosition;
+                            Log.LogInfo($"[VRCamera] CursorDiag: wp=({wp.x:F2},{wp.y:F2},{wp.z:F2}) gameSp=({gameSp.x:F0},{gameSp.y:F0},{gameSp.z:F1}) client=({clientX},{clientY}) screen=({pt.X},{pt.Y}) Input.mouse=({mousePos.x:F0},{mousePos.y:F0}) Screen=({Screen.width}x{Screen.height}) camPx=({_gameCamRef.pixelWidth}x{_gameCamRef.pixelHeight})");
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            return new Vector2(sp.x, sp.y);
+        }
+        return Vector2.zero;
+    }
+
+    /// <summary>
     /// Casts a ray from the right controller into all managed WorldSpace canvases.
     /// Finds the closest canvas plane intersection, uses GraphicRaycaster to resolve
     /// the UI element under that point, and fires a pointer click event.
@@ -4460,8 +5439,9 @@ public class VRCamera : MonoBehaviour
             if (clickCat == CanvasCategory.HUD || clickCat == CanvasCategory.Ignored) continue;
             // Skip canvases hidden via CanvasGroup OR all-children-inactive (MenuCanvas).
             if (IsCanvasEffectivelyHidden(canvas)) continue;
-            // Skip nested canvases — their clicks are handled via the parent canvas.
-            if (_nestedCanvasIds.Contains(kvp.Key)) continue;
+            // Include nested canvases in hit testing — they have their own GraphicRaycasters
+            // and their graphics are NOT visible to the parent canvas's raycaster.
+            // (Previously excluded, but that caused WindowCanvas to fall through to CaseCanvas.)
             var plane = new Plane(-canvas.transform.forward, canvas.transform.position);
             if (!plane.Raycast(ray, out float dist)) continue;
             if (dist <= 0f) continue;
@@ -4496,7 +5476,14 @@ public class VRCamera : MonoBehaviour
         }
 
         if (hits.Count == 0) return;
-        hits.Sort((a, b) => a.dist.CompareTo(b.dist));
+        // Sort by depth (nearest first).  Nested canvases within the same parent share the same
+        // plane distance, so break ties by sortingOrder descending — the highest sortingOrder is
+        // rendered on top and should receive clicks first.
+        hits.Sort((a, b) => {
+            int dc = a.dist.CompareTo(b.dist);
+            if (dc != 0) return dc;
+            return b.canvas.sortingOrder.CompareTo(a.canvas.sortingOrder);
+        });
 
         var es = EventSystem.current;
         if (es == null) return;
@@ -4505,7 +5492,7 @@ public class VRCamera : MonoBehaviour
         {
             if (hitCanvas.worldCamera == null) hitCanvas.worldCamera = _leftCam;
             var gr = hitCanvas.GetComponent<GraphicRaycaster>();
-            if (gr == null) continue;
+            if (gr == null || !gr.enabled) continue; // skip disabled raycasters
 
             Vector3 screenPt = _leftCam.WorldToScreenPoint(hitWorld);
             var ped = new PointerEventData(es);
@@ -4516,15 +5503,33 @@ public class VRCamera : MonoBehaviour
                 var results = new Il2CppSystem.Collections.Generic.List<RaycastResult>();
                 gr.Raycast(ped, results);
 
-                // Log CaseCanvas click attempts even when no results
-                string hcName = hitCanvas.gameObject.name ?? "";
-                if (hcName.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase))
-                    Log.LogInfo($"[VRCamera] CaseCanvas click test: results={results.Count} screenPt=({screenPt.x:F0},{screenPt.y:F0},{screenPt.z:F2})");
-
                 if (results.Count > 0)
                 {
                     var go = results[0].gameObject;
-                    Log.LogInfo($"[VRCamera] Trigger click: '{go?.name}' on '{hitCanvas.gameObject.name}'");
+
+                    // CaseCanvas interaction filter: only process clicks that land on (or inside)
+                    // a GameObject with a Button component in its hierarchy. Generic elements
+                    // like 'Text', 'Overlay', background panels consume the click via `return`
+                    // without doing anything useful, blocking real interactive elements underneath.
+                    string hitCanvasName = hitCanvas.gameObject.name ?? "";
+                    if (hitCanvasName.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase))
+                    {
+                        bool hasButton = false;
+                        try
+                        {
+                            var walker = go?.transform;
+                            for (int wi = 0; wi < 8 && walker != null; wi++)
+                            {
+                                if (walker.GetComponent<Button>() != null)
+                                { hasButton = true; break; }
+                                walker = walker.parent;
+                            }
+                        }
+                        catch { }
+                        if (!hasButton) continue; // skip non-interactive — fall through to next canvas
+                    }
+
+                    Log.LogInfo($"[VRCamera] Trigger click: '{go?.name}' on '{hitCanvasName}'");
 
                     // Detect save-load button clicks.  When the user clicks "Continue" or any
                     // "New Game"-style button, SaveStateController:LoadSaveState is about to
@@ -4540,6 +5545,8 @@ public class VRCamera : MonoBehaviour
                         {
                             _sceneLoadGrace = 180;   // ~3 s at 60 fps
                             _canvasTick     = 0;
+                            _pauseMovementActive = false;
+                            _suppressPauseWarpUntil = Time.realtimeSinceStartup + 15f; // suppress warp for 15s after load
                             _playerRb       = null;
                             _playerCC       = null;
                             _fpsControllerTransform = null;
@@ -4623,8 +5630,13 @@ public class VRCamera : MonoBehaviour
                             var btn = btr.GetComponent<Button>();
                             if (btn != null)
                             {
-                                handledByButton = true;
                                 int persistentCount = btn.onClick.GetPersistentEventCount();
+
+                                // Only claim this as Button-handled if there are persistent listeners
+                                // to fire. Buttons with 0 persistent listeners (e.g. PinButton with
+                                // PinFolderButtonController) need ExecuteEvents to fire their
+                                // OnPointerClick override, which does NOT have the mouseInputMode guard.
+                                handledByButton = persistentCount > 0;
 
                                 // Fire persistent onClick listeners only — replicate the game's
                                 // OnPointerClick listener-toggle logic WITHOUT calling OnLeftClick,
@@ -4723,6 +5735,7 @@ public class VRCamera : MonoBehaviour
 
     private void OnDestroy()
     {
+        Log.LogWarning($"[VRCamera] OnDestroy called! Stack trace:\n{Environment.StackTrace}");
         _stereoReady = false;
         if (_leftRT  != null) { _leftRT.Release();  Destroy(_leftRT);  }
         if (_rightRT != null) { _rightRT.Release(); Destroy(_rightRT); }
