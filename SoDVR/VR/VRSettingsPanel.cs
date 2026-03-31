@@ -1,6 +1,7 @@
 using BepInEx.Logging;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
@@ -68,6 +69,65 @@ public static class VRSettingsPanel
     public static bool LeftLaserEnabled = true;   // left hand laser pointer on/off
     public static bool ItemHandRight    = false;  // false = left hand holds items, true = right
 
+    // HUD position/size settings (session only, not persisted)
+    private static int _hudDistIdx   = 20; // default 2.5 m (index in 0.5..3.5 by 0.1)
+    private static int _hudSizeIdx   = 1;  // default Normal
+    private static int _hudHeightIdx = 1;  // default -0.15 m
+    private static int _hudHorizIdx  = 2;  // default center
+
+    // 31 values: 0.5, 0.6, ..., 3.5 (0.1 increments)
+    private static readonly float[]  _hudDistValues =
+        Enumerable.Range(5, 31).Select(i => (float)Math.Round(i * 0.1, 1)).ToArray();
+    private static readonly string[] _hudDistLabels =
+        Enumerable.Range(5, 31).Select(i => $"{i * 0.1:F1} m").ToArray();
+    private static readonly float[] _hudSizeValues   = { 0.75f, 1.0f, 1.25f };
+    private static readonly float[] _hudHeightValues = { -0.30f, -0.15f, 0.0f, 0.15f, 0.30f };
+    private static readonly float[] _hudHorizValues  = { -0.30f, -0.15f, 0.0f, 0.15f, 0.30f };
+
+    public static float HudDistance    => _hudDistValues[_hudDistIdx];
+    public static float HudSize        => _hudSizeValues[_hudSizeIdx];
+    public static float HudVertOffset  => _hudHeightValues[_hudHeightIdx];
+    public static float HudHorizOffset => _hudHorizValues[_hudHorizIdx];
+    public static bool  HudLaggyFollow = false;
+
+    // GO instance-ID → action map — avoids IL2CPP AddListener 3× fire bug.
+    // Populated in Init(); cleared at Init() start.  TryClickCanvas calls HandleClick().
+    private static readonly Dictionary<int, Action> _clickMap = new();
+
+    public static bool HandleClick(int goId)
+    {
+        if (!_clickMap.TryGetValue(goId, out var action)) return false;
+        try { action(); } catch (Exception ex) { Plugin.Log.LogWarning($"[VRSettings] HandleClick {goId}: {ex.Message}"); }
+        return true;
+    }
+
+    // ── HUD settings persistence ──────────────────────────────────────────────
+
+    private static void LoadHudSettings()
+    {
+        _hudDistIdx   = PlayerPrefs.GetInt("SoDVR.HudDistIdx",       20);
+        _hudSizeIdx   = PlayerPrefs.GetInt("SoDVR.HudSizeIdx",        1);
+        _hudHeightIdx = PlayerPrefs.GetInt("SoDVR.HudHeightIdx",      1);
+        _hudHorizIdx  = PlayerPrefs.GetInt("SoDVR.HudHorizIdx",       2);
+        HudLaggyFollow = PlayerPrefs.GetInt("SoDVR.HudLaggyFollow",   0) != 0;
+        // Clamp indices in case the option count changes between versions
+        _hudDistIdx   = Math.Max(0, Math.Min(_hudDistIdx,   _hudDistValues.Length - 1));
+        _hudSizeIdx   = Math.Max(0, Math.Min(_hudSizeIdx,   _hudSizeValues.Length - 1));
+        _hudHeightIdx = Math.Max(0, Math.Min(_hudHeightIdx, _hudHeightValues.Length - 1));
+        _hudHorizIdx  = Math.Max(0, Math.Min(_hudHorizIdx,  _hudHorizValues.Length - 1));
+        Plugin.Log.LogInfo($"[VRSettings] HUD settings loaded: dist={HudDistance:F1}m size={HudSize:F2} vert={HudVertOffset:F2} horiz={HudHorizOffset:F2} follow={HudLaggyFollow}");
+    }
+
+    private static void SaveHudSettings()
+    {
+        PlayerPrefs.SetInt("SoDVR.HudDistIdx",     _hudDistIdx);
+        PlayerPrefs.SetInt("SoDVR.HudSizeIdx",     _hudSizeIdx);
+        PlayerPrefs.SetInt("SoDVR.HudHeightIdx",   _hudHeightIdx);
+        PlayerPrefs.SetInt("SoDVR.HudHorizIdx",    _hudHorizIdx);
+        PlayerPrefs.SetInt("SoDVR.HudLaggyFollow", HudLaggyFollow ? 1 : 0);
+        PlayerPrefs.Save();
+    }
+
     // ── Init ──────────────────────────────────────────────────────────────────
 
     public static GameObject? Init(Action<int> removeFromPositioned)
@@ -75,6 +135,8 @@ public static class VRSettingsPanel
         _removeFromPositioned = removeFromPositioned;
         _toggleRefs.Clear();
         _staticImgRefs.Clear();
+        _clickMap.Clear();
+        LoadHudSettings();
         try
         {
             // ── Canvas ────────────────────────────────────────────────────────
@@ -118,7 +180,8 @@ public static class VRSettingsPanel
             closeBtnRT.anchoredPosition = new Vector2(-8f, -8f);
             closeBtnImg.color = new Color(1.00f, 0.45f, 0.40f, 1f); // red tint (mat ×4 → HDR)
             _staticImgRefs.Add((closeBtnImg, new Color(1.00f, 0.45f, 0.40f, 1f)));
-            closeBtnGO.AddComponent<Button>().onClick.AddListener(new Action(Hide));
+            closeBtnGO.AddComponent<Button>();
+            _clickMap[closeBtnGO.GetInstanceID()] = Hide;
             var closeLblGO   = MakeGO("CloseLabel", closeBtnGO.transform);
             var closeLblRT   = closeLblGO.AddComponent<RectTransform>();
             closeLblRT.anchorMin = Vector2.zero; closeLblRT.anchorMax = Vector2.one; closeLblRT.sizeDelta = Vector2.zero;
@@ -142,10 +205,10 @@ public static class VRSettingsPanel
                           out _controlsTabImg,  out var controlsBtn);
             MakeTabButton("GeneralTab",   "General",   tabRowGO.transform, new Vector2( 210f, 0f), false,
                           out _generalTabImg,   out var generalBtn);
-            graphicsBtn.onClick.AddListener(new Action(ActivateGraphicsTab));
-            audioBtn.onClick.AddListener(new Action(ActivateAudioTab));
-            controlsBtn.onClick.AddListener(new Action(ActivateControlsTab));
-            generalBtn.onClick.AddListener(new Action(ActivateGeneralTab));
+            _clickMap[graphicsBtn.gameObject.GetInstanceID()] = ActivateGraphicsTab;
+            _clickMap[audioBtn.gameObject.GetInstanceID()]    = ActivateAudioTab;
+            _clickMap[controlsBtn.gameObject.GetInstanceID()] = ActivateControlsTab;
+            _clickMap[generalBtn.gameObject.GetInstanceID()]  = ActivateGeneralTab;
 
             // ── Scrollable content panes (topOffset = -126 = below 70px title + 56px tabs) ──
             // No ScrollRect / RectMask2D — those corrupt HDRP stencil in WorldSpace canvas.
@@ -485,6 +548,47 @@ public static class VRSettingsPanel
                 () => StrToIdx(PlayerPrefs.GetString("gameLength", "Normal"), lenLabels),
                 v => SetPrefsStr("gameLength", lenLabels[v]));
 
+            // ── HUD section header ────────────────────────────────────────────
+            try
+            {
+                var hdrGO = MakeGO("Row_HUDHeader", generalContent.transform);
+                var hdrRT = hdrGO.GetComponent<RectTransform>() ?? hdrGO.AddComponent<RectTransform>();
+                hdrRT.anchorMin = new Vector2(0f, 1f); hdrRT.anchorMax = new Vector2(1f, 1f);
+                hdrRT.pivot = new Vector2(0.5f, 1f);
+                hdrRT.sizeDelta = new Vector2(0f, ROW_H);
+                hdrRT.anchoredPosition = new Vector2(0f, -gy2);
+                var hdrLbl = hdrGO.AddComponent<TextMeshProUGUI>();
+                hdrLbl.text = "─── HUD ───";
+                hdrLbl.fontSize = 28; hdrLbl.color = new Color(0.6f, 0.9f, 1f, 1f);
+                hdrLbl.alignment = TextAlignmentOptions.Midline; hdrLbl.raycastTarget = false;
+                gy2 += ROW_STEP;
+            }
+            catch (Exception ex) { Log.LogWarning($"[VRSettings] HUD header row: {ex.Message}"); }
+
+            AddPrevNextRow(generalContent, ref gy2, "HUD Distance",
+                _hudDistLabels,
+                () => _hudDistIdx,
+                v => { _hudDistIdx = v; SaveHudSettings(); });
+
+            AddPrevNextRow(generalContent, ref gy2, "HUD Size",
+                new[] { "Small", "Normal", "Large" },
+                () => _hudSizeIdx,
+                v => { _hudSizeIdx = v; SaveHudSettings(); });
+
+            AddPrevNextRow(generalContent, ref gy2, "HUD Height",
+                new[] { "-0.3 m", "-0.15 m", "0.0 m", "+0.15 m", "+0.3 m" },
+                () => _hudHeightIdx,
+                v => { _hudHeightIdx = v; SaveHudSettings(); });
+
+            AddPrevNextRow(generalContent, ref gy2, "HUD H.Offset",
+                new[] { "-0.3 m", "-0.15 m", "Center", "+0.15 m", "+0.3 m" },
+                () => _hudHorizIdx,
+                v => { _hudHorizIdx = v; SaveHudSettings(); });
+
+            AddToggleRow(generalContent, ref gy2, "HUD Follow",
+                () => HudLaggyFollow,
+                v => { HudLaggyFollow = v; SaveHudSettings(); });
+
             FinalizeContent(generalContent, gy2);
 
             // Start with Graphics tab active
@@ -765,14 +869,15 @@ public static class VRSettingsPanel
         SetToggleVisual(btnImg, btnTxt, curVal);
         _toggleRefs.Add((btnImg, btnTxt, getter));
 
-        btnGO.AddComponent<Button>().onClick.AddListener(new Action(() =>
+        btnGO.AddComponent<Button>();
+        _clickMap[btnGO.GetInstanceID()] = () =>
         {
             bool newVal = false;
             try { newVal = !getter(); } catch { }
             try { setter(newVal); } catch (Exception ex) { Log.LogWarning($"[VRSettings] toggle '{label}': {ex.Message}"); }
             SetToggleVisual(btnImg, btnTxt, newVal);
             Log.LogInfo($"[VRSettings] {label} → {(newVal ? "ON" : "OFF")}");
-        }));
+        };
 
         yTop += ROW_STEP;
     }
@@ -830,7 +935,8 @@ public static class VRSettingsPanel
         try { curIdx = ClampIdx(getter(), options.Length - 1); } catch { }
         valTxt.text = options[curIdx];
 
-        prevGO.AddComponent<Button>().onClick.AddListener(new Action(() =>
+        prevGO.AddComponent<Button>();
+        _clickMap[prevGO.GetInstanceID()] = () =>
         {
             int cur = 0;
             try { cur = getter(); } catch { }
@@ -838,9 +944,10 @@ public static class VRSettingsPanel
             try { setter(newIdx); } catch (Exception ex) { Log.LogWarning($"[VRSettings] prev '{label}': {ex.Message}"); }
             valTxt.text = options[ClampIdx(newIdx, options.Length - 1)];
             Log.LogInfo($"[VRSettings] {label} → {options[ClampIdx(newIdx, options.Length - 1)]}");
-        }));
+        };
 
-        nextGO.AddComponent<Button>().onClick.AddListener(new Action(() =>
+        nextGO.AddComponent<Button>();
+        _clickMap[nextGO.GetInstanceID()] = () =>
         {
             int cur = 0;
             try { cur = getter(); } catch { }
@@ -848,7 +955,7 @@ public static class VRSettingsPanel
             try { setter(newIdx); } catch (Exception ex) { Log.LogWarning($"[VRSettings] next '{label}': {ex.Message}"); }
             valTxt.text = options[ClampIdx(newIdx, options.Length - 1)];
             Log.LogInfo($"[VRSettings] {label} → {options[ClampIdx(newIdx, options.Length - 1)]}");
-        }));
+        };
 
         yTop += ROW_STEP;
     }

@@ -318,6 +318,7 @@ public class VRCamera : MonoBehaviour
     private Quaternion     _cursorTargetRot;      // world rot of nearest aimed-at canvas
     private Canvas?        _menuCanvasRef;       // MenuCanvas — hidden while VR settings panel is open
     private bool           _menuCanvasHidden;    // tracks last hide state to avoid per-frame toggles
+    private bool           _menuWasActive;       // tracks last isActiveAndEnabled to detect menu open transition
     private int            _menuSettingsBtnId;   // instanceID of the patched Settings button in MenuCanvas
     private bool           _cursorVisible = false; // tracks SetActive state to avoid per-frame IL2CPP calls
 
@@ -2622,9 +2623,22 @@ public class VRCamera : MonoBehaviour
                 // The actual VR panel open is handled in TryClickCanvas via _menuSettingsBtnId
                 // to avoid IL2CPP AddListener reliability issues on freshly-created events.
                 btn.onClick = new Button.ButtonClickedEvent();
-                _menuSettingsBtnId = btn.gameObject.GetInstanceID();
+                int btnId = btn.gameObject.GetInstanceID();
+                _menuSettingsBtnId = btnId;
+                // Log full parent chain so we can see which panel this button belongs to
+                var chain = new System.Text.StringBuilder();
+                var ctr = btn.transform;
+                for (int ci = 0; ci < 6 && ctr != null; ci++)
+                {
+                    chain.Append(ctr.gameObject.name);
+                    chain.Append('(');
+                    chain.Append(ctr.gameObject.GetInstanceID());
+                    chain.Append(')');
+                    if (ci < 5 && ctr.parent != null) chain.Append('→');
+                    ctr = ctr.parent;
+                }
                 patched++;
-                Log.LogInfo($"[VRCamera] Patched Settings button '{t.gameObject.name}' id={_menuSettingsBtnId}");
+                Log.LogInfo($"[VRCamera] Patched Settings button id={btnId} active={btn.gameObject.activeInHierarchy} chain: {chain}");
             }
             Log.LogInfo($"[VRCamera] PatchMenuSettingsButton: {patched} button(s) redirected to VR panel");
         }
@@ -2971,6 +2985,19 @@ public class VRCamera : MonoBehaviour
                     var mgr = _menuCanvasRef.GetComponent<GraphicRaycaster>();
                     if (mgr != null) mgr.enabled = !vrOpen;
                 }
+
+                // Re-patch Settings button on every menu open (game may reinitialise buttons)
+                bool menuNowActive = _menuCanvasRef.isActiveAndEnabled;
+                if (menuNowActive && !_menuWasActive)
+                {
+                    PatchMenuSettingsButton(_menuCanvasRef);
+                    // MenuCanvas just became interactable — add it to the no-CanvasGroup
+                    // interactable cache immediately so TryClickCanvas doesn't skip it.
+                    // The next forced scan will rebuild the cache from scratch.
+                    _noGroupInteractable.Add(_menuCanvasRef.GetInstanceID());
+                    _forceScanFrames = 1;
+                }
+                _menuWasActive = menuNowActive;
             }
             catch { }
         }
@@ -2983,9 +3010,36 @@ public class VRCamera : MonoBehaviour
         Quaternion yawOnly = Quaternion.Euler(0f, headYaw, 0f);
         Vector3 forward = yawOnly * Vector3.forward;
 
-        // Body-lock: keep HUDanchor aligned with VROrigin (snap-turn yaw, CC position).
-        // VROrigin already follows snap-turn rotations; _hudAnchor is its child so it inherits yaw.
-        // No explicit update needed — it tracks automatically via the transform hierarchy.
+        // ── HUD anchor scale (controlled by VR Settings) ─────────────────
+        float hudSc = VRSettingsPanel.HudSize;
+        if (_hudAnchor.localScale.x != hudSc)
+            _hudAnchor.localScale = new Vector3(hudSc, hudSc, hudSc);
+
+        // ── HUD anchor rotation: laggy head-follow OR body-locked ─────────
+        // transform.rotation = VROrigin (snap-turn yaw only).
+        // yawOnly = world-space head yaw from OpenXR pose via _leftCam.
+        // localRotation toward headRelative makes the HUD swing to follow head yaw with lag.
+        if (VRSettingsPanel.HudLaggyFollow)
+        {
+            float headPitch = _leftCam.transform.eulerAngles.x;
+            Quaternion pitchAndYaw = Quaternion.Euler(headPitch, headYaw, 0f);
+            Quaternion headRelative = Quaternion.Inverse(transform.rotation) * pitchAndYaw;
+            _hudAnchor.localRotation = Quaternion.Slerp(
+                _hudAnchor.localRotation, headRelative, Time.deltaTime * 4f);
+        }
+        else
+        {
+            _hudAnchor.localRotation = Quaternion.identity;
+        }
+
+        // ── HUD auto-hide: hide when pause menu or case board is open ─────
+        // Use _casePanelCanvas (CaseCanvas) — only active when pin board is open.
+        // _actionPanelCanvas is always active during gameplay so cannot be used here.
+        bool menuOpen      = _menuCanvasRef != null && _menuCanvasRef.isActiveAndEnabled;
+        bool caseBoardOpen = _casePanelCanvas != null && IsCanvasVisible(_casePanelCanvas);
+        bool hudShouldShow = !menuOpen && !caseBoardOpen;
+        if (_hudAnchor.gameObject.activeSelf != hudShouldShow)
+            _hudAnchor.gameObject.SetActive(hudShouldShow);
 
         int cursorId = _cursorCanvas != null ? _cursorCanvas.GetInstanceID() : -1;
 
@@ -3224,12 +3278,19 @@ public class VRCamera : MonoBehaviour
                     try
                     {
                         canvas.transform.SetParent(_hudAnchor, false);
-                        canvas.transform.localPosition = new Vector3(0f, catDefs.VerticalOffset, catDefs.Distance);
                         canvas.transform.localRotation = Quaternion.identity;
                         _positionedCanvases.Add(id);
-                        Log.LogInfo($"[VRCamera] HUD parented '{canvas.gameObject.name}' to HUDAnchor dist={catDefs.Distance:F2}m");
+                        Log.LogInfo($"[VRCamera] HUD parented '{canvas.gameObject.name}' to HUDAnchor");
                     }
                     catch (Exception ex) { Log.LogWarning($"[VRCamera] HUD parent: {ex.Message}"); }
+                }
+                // Sync position from VR Settings every frame — adjustments apply immediately
+                if (_positionedCanvases.Contains(id))
+                {
+                    canvas.transform.localPosition = new Vector3(
+                        VRSettingsPanel.HudHorizOffset,
+                        VRSettingsPanel.HudVertOffset,
+                        VRSettingsPanel.HudDistance);
                 }
                 continue;
             }
@@ -3675,6 +3736,11 @@ public class VRCamera : MonoBehaviour
         _prevTrigger = triggerNow;
 
         bool cbOpen = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf;
+        // When the pause menu OR VR Settings panel is open, force cbOpen=false so that
+        // trigger presses go through TryClickCanvas instead of the CaseBoard drag path.
+        bool menuIsOpen     = _menuCanvasRef != null && _menuCanvasRef.isActiveAndEnabled;
+        bool vrSettingsOpen = VRSettingsPanel.RootGO?.activeSelf == true;
+        if (menuIsOpen || vrSettingsOpen) cbOpen = false;
         Vector3 rPos = _rightControllerGO.transform.position;
         Vector3 rFwd = _rightControllerGO.transform.forward;
 
@@ -5591,15 +5657,47 @@ public class VRCamera : MonoBehaviour
                     if (_menuSettingsBtnId != 0)
                     {
                         var tr = go?.transform;
-                        for (int i = 0; i < 5 && tr != null; i++)
+                        bool settingsMatched = false;
+                        for (int i = 0; i < 8 && tr != null; i++)
                         {
                             if (tr.gameObject.GetInstanceID() == _menuSettingsBtnId)
                             {
                                 Log.LogInfo("[VRCamera] Settings button intercepted → VRSettingsPanel.Toggle");
                                 VRSettingsPanel.Toggle();
+                                settingsMatched = true;
                                 return;
                             }
                             tr = tr.parent;
+                        }
+                        // Log hierarchy when on MenuCanvas but Settings wasn't matched —
+                        // helps diagnose in-game ESC menu structure differences.
+                        if (!settingsMatched && hitCanvas == _menuCanvasRef)
+                        {
+                            var sb2 = new System.Text.StringBuilder();
+                            var dtr = go?.transform;
+                            for (int di = 0; di < 8 && dtr != null; di++)
+                            {
+                                sb2.Append(dtr.gameObject.name);
+                                sb2.Append('(');
+                                sb2.Append(dtr.gameObject.GetInstanceID());
+                                sb2.Append(')');
+                                if (di < 7 && dtr.parent != null) sb2.Append('→');
+                                dtr = dtr.parent;
+                            }
+                            Log.LogInfo($"[VRCamera] Settings missed (want={_menuSettingsBtnId}): {sb2}");
+                        }
+                    }
+
+                    // ── VRSettingsPanel button intercept ─────────────────────────────
+                    // Walk hierarchy so child GOs (e.g. labels with raycastTarget=false)
+                    // still resolve to the registered button parent.
+                    {
+                        var vtr = go?.transform;
+                        for (int vi = 0; vi < 5 && vtr != null; vi++)
+                        {
+                            if (VRSettingsPanel.HandleClick(vtr.gameObject.GetInstanceID()))
+                                return;
+                            vtr = vtr.parent;
                         }
                     }
 
