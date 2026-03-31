@@ -241,7 +241,7 @@ public class VRCamera : MonoBehaviour
     private bool    _pauseMovementActive;     // true while game is paused (case board / ESC menu)
     private Vector3 _pauseOriginPos;          // player position when pause started
     private const float PauseMoveRadius = 2.0f; // max distance (metres) from pause origin
-    private float   _suppressPauseWarpUntil; // realtime: don't warp-back until this time (save-load guard)
+
 
     // Canvas instance IDs that belong to VRMod itself (settings panel, cursor, etc.).
     // Every mutation pass (RescanCanvasAlpha, etc.) must skip canvases in this set —
@@ -480,7 +480,7 @@ public class VRCamera : MonoBehaviour
                 _movementDiscoveryDone = false;
                 _hasBeenGrounded = false;
                 _pauseMovementActive = false;
-                _suppressPauseWarpUntil = Time.realtimeSinceStartup + 15f; // suppress warp for 15s after load
+
                 Log.LogInfo($"[VRCamera] Scene changed (handle {_lastSceneHandle}→{sh}) — canvas scan paused for 120 frames.");
             }
             _lastSceneHandle = sh;
@@ -501,7 +501,7 @@ public class VRCamera : MonoBehaviour
                 _movementDiscoveryDone = false;
                 _hasBeenGrounded = false;
                 _pauseMovementActive = false;
-                _suppressPauseWarpUntil = Time.realtimeSinceStartup + 15f; // suppress warp for 15s after load
+
                 _playerRb       = null;
                 _playerCC       = null;
                 _fpsControllerTransform = null;
@@ -544,8 +544,12 @@ public class VRCamera : MonoBehaviour
             // keep _movementDiscoveryDone=true so jump/locomotion continue working.
             if (_movementDiscoveryDone && _playerCC == null)
             {
+                // For same-scene save/load: cullingMask is already 0 (we suppressed the camera),
+                // so the per-frame cullingMask gate would block rediscovery forever.
+                // Schedule rediscovery — the per-frame gate will run it once the menu is closed
+                // (i.e., the load is actually complete and the player is at the save position).
                 _movementDiscoveryDone = false;
-                Log.LogInfo("[VRCamera] Grace expired — movement rediscovery scheduled (playerCC lost).");
+                Log.LogInfo("[VRCamera] Grace expired — rediscovery deferred until menu closes (playerCC lost).");
             }
             else if (_movementDiscoveryDone)
             {
@@ -919,11 +923,22 @@ public class VRCamera : MonoBehaviour
         // One-shot movement system discovery (runs once after stereo is ready and game cam found).
         // Skip discovery when game camera has cullingMask=0 — that means we're on the main menu,
         // where FPSController exists but there's no ground geometry → gravity would pull us through the floor.
+        // Exception: after a same-scene save/load (playerCC was nulled, cullingMask stays 0 because
+        // we suppressed the camera), bypass the cullingMask gate once the menu is fully closed —
+        // at that point the save is complete and the player is at the correct position.
         if (!_movementDiscoveryDone && _gameCam != null && _gameCamRef != null)
         {
             try
             {
-                if (_gameCamRef.cullingMask != 0)
+                bool shouldDiscover = _gameCamRef.cullingMask != 0;
+                if (!shouldDiscover && _playerCC == null)
+                {
+                    // Post-save/load path: wait for menu to close before discovering.
+                    bool menuGone = (_menuCanvasRef == null || IsCanvasEffectivelyHidden(_menuCanvasRef))
+                                 && (_actionPanelCanvas == null || !_actionPanelCanvas.gameObject.activeSelf);
+                    if (menuGone) shouldDiscover = true;
+                }
+                if (shouldDiscover)
                     DiscoverMovementSystem();
             }
             catch { }
@@ -3290,7 +3305,12 @@ public class VRCamera : MonoBehaviour
             // If user previously grip-dragged this canvas, restore relative to
             // ActionPanelCanvas (case board selection UI).  Offset is in anchor-local
             // space so it rotates with the anchor when the case board reopens.
-            if (_gripDragAnchorOffsets.TryGetValue(id, out var anchorOff) &&
+            // Exception: ActionPanelCanvas IS the anchor — restoring it from its own
+            // offset would cause a deadlock (waits for itself to be positioned).
+            // Let it fall through to default head+forward placement instead.
+            bool isActionPanelAnchor = (id == _actionPanelId);
+            if (!isActionPanelAnchor &&
+                _gripDragAnchorOffsets.TryGetValue(id, out var anchorOff) &&
                 _actionPanelCanvas != null && _positionedCanvases.Contains(_actionPanelId))
             {
                 Quaternion anchorRot = _actionPanelCanvas.transform.rotation;
@@ -3299,7 +3319,8 @@ public class VRCamera : MonoBehaviour
                 _positionedCanvases.Add(id);
                 Log.LogInfo($"[VRCamera] Restored '{cname}' [{cat}] from ActionPanel-relative offset");
             }
-            else if (_gripDragAnchorOffsets.TryGetValue(id, out _) &&
+            else if (!isActionPanelAnchor &&
+                     _gripDragAnchorOffsets.TryGetValue(id, out _) &&
                      _actionPanelCanvas != null && !_positionedCanvases.Contains(_actionPanelId))
             {
                 // ActionPanelCanvas not positioned yet this cycle — defer to next frame
@@ -3980,6 +4001,7 @@ public class VRCamera : MonoBehaviour
                 if (dragCat != CanvasCategory.CaseBoard && dragCat != CanvasCategory.Menu && dragCat != CanvasCategory.Panel) continue;
                 string cName = c.gameObject.name ?? "";
                 if (cName.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase)) continue;
+                if (cName.Equals("ActionPanelCanvas", StringComparison.OrdinalIgnoreCase)) continue;
 
                 var pl = new Plane(-c.transform.forward, c.transform.position);
                 if (!pl.Raycast(ray, out float dist) || dist <= 0f) continue;
@@ -4125,23 +4147,9 @@ public class VRCamera : MonoBehaviour
             if (_pauseMovementActive)
             {
                 _pauseMovementActive = false;
-                // Warp player back to origin — but NOT during/after a save-load.
-                // _suppressPauseWarpUntil is set for 15s whenever a reload is detected.
-                if (Time.realtimeSinceStartup >= _suppressPauseWarpUntil)
-                {
-                    try
-                    {
-                        _playerCC.enabled = false;
-                        _playerCC.transform.position = _pauseOriginPos;
-                        _playerCC.enabled = true;
-                        Log.LogInfo("[VRCamera] Pause ended — warped back to pause origin.");
-                    }
-                    catch { }
-                }
-                else
-                {
-                    Log.LogInfo("[VRCamera] Pause ended — warp suppressed (within load grace window).");
-                }
+                // No warp-back: the 2 m clamp during pause already prevents VR locomotion
+                // exploits, and teleporting back on unpause caused visual snaps on save loads.
+                Log.LogInfo("[VRCamera] Pause ended — movement unlocked (no warp-back).");
             }
         }
 
@@ -5536,17 +5544,31 @@ public class VRCamera : MonoBehaviour
                     // reconstruct the entire physics hierarchy.  Apply the grace period NOW —
                     // before ExecuteEvents propagates the click — so canvas scanning and
                     // locomotion are fully quiesced before the Rigidbody/CharacterJoint teardown.
+                    // Walk UP the hierarchy — the raycasted GO may be a child (e.g. 'Border')
+                    // rather than the button itself ('Continue').
                     {
-                        string goNameLower = (go?.name ?? "").ToLowerInvariant();
-                        bool isSaveLoad = goNameLower.Contains("continue")
-                                       || goNameLower.Contains("new game")
-                                       || goNameLower.Contains("new city");
+                        bool isSaveLoad = false;
+                        string matchedName = "";
+                        var slWalker = go?.transform;
+                        for (int slI = 0; slI < 6 && slWalker != null; slI++)
+                        {
+                            string n = (slWalker.gameObject.name ?? "").ToLowerInvariant();
+                            if (n.Contains("continue") || n.Contains("new game") || n.Contains("new city"))
+                            {
+                                isSaveLoad = true;
+                                matchedName = slWalker.gameObject.name;
+                                break;
+                            }
+                            slWalker = slWalker.parent;
+                        }
                         if (isSaveLoad)
                         {
                             _sceneLoadGrace = 180;   // ~3 s at 60 fps
                             _canvasTick     = 0;
                             _pauseMovementActive = false;
-                            _suppressPauseWarpUntil = Time.realtimeSinceStartup + 15f; // suppress warp for 15s after load
+                            _hasBeenGrounded     = false;   // prevent gravity at default origin during load
+                            _jumpVerticalVelocity = 0f;
+
                             _playerRb       = null;
                             _playerCC       = null;
                             _fpsControllerTransform = null;
@@ -5560,7 +5582,7 @@ public class VRCamera : MonoBehaviour
                             // that the game is about to destroy.  Instead, just null _playerRb
                             // and guard UpdateLocomotion() with _sceneLoadGrace > 0.
 
-                            Log.LogInfo($"[VRCamera] Save/load trigger '{go?.name}' — grace=180, playerRb cleared.");
+                            Log.LogInfo($"[VRCamera] Save/load trigger '{matchedName}' (hit='{go?.name}') — grace=180, playerRb cleared.");
                         }
                     }
 
