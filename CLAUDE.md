@@ -240,20 +240,55 @@ VR arm display works by:
 - `PositionArmAtController(arm, fist, ctrlGO, rotOffset)` applies rotation then fist-offset then forward shift
 - Called in both `UpdateHeldItemTracking` (frame update) and `ForceItemPositionPreRender` (pre-render)
 
+## CRITICAL: Save/load same-scene reload — movement rediscovery (Phase 13)
+
+When the player loads a save from the main menu (same Unity scene reused):
+- The game camera is NOT destroyed/recreated — the "game camera lost" detection does NOT fire
+- Save/load is detected by intercepting the "Continue" button click in `TryClickCanvas`
+- **The GraphicRaycaster hits the child element (e.g. `'Border'`), NOT the button GO (`'Continue'`)** — must walk up the hierarchy (6 levels) to find the button name
+- On trigger: null `_playerCC`, `_playerRb`, clear `_pauseMovementActive`, `_hasBeenGrounded`, `_jumpVerticalVelocity` — start grace period (180 frames)
+- After grace: `_movementDiscoveryDone = false` BUT do NOT run `DiscoverMovementSystem()` immediately — player CC is still at origin `(0,1,0)`, game hasn't finished loading
+- Rediscovery runs in the **per-frame gate** only once `_menuCanvasRef` and `_actionPanelCanvas` confirm the menu is fully hidden (load complete, player at correct save position)
+- The per-frame gate normally checks `cullingMask != 0`, but our suppressed camera always has `cullingMask = 0` — bypass this check when `_playerCC == null` and menu is gone
+
+## CRITICAL: ActionPanelCanvas grip-drag — do not make it draggable (Phase 13)
+
+`ActionPanelCanvas` is the **anchor** for all other case board canvases. It must NOT be in the grip-draggable set:
+- Other canvases store their position as ActionPanelCanvas-relative offsets (`_gripDragAnchorOffsets`)
+- If ActionPanelCanvas itself is grip-dragged, it stores a self-referential (zero) offset
+- On reopen: restore code waits for `_positionedCanvases.Contains(_actionPanelId)` before placing it — but ActionPanelCanvas was just removed for recentre → **infinite deferral deadlock**
+- Fix: exclude `ActionPanelCanvas` from grip-drag candidates AND skip anchor-offset restore when `id == _actionPanelId`
+- Draggable: `LocationDetailsCanvas`, `BioDisplayCanvas`, `WindowCanvas`, `MinimapCanvas`, etc.
+- NOT draggable: `ActionPanelCanvas`, `CaseCanvas`
+
 ## Known canvas names (from LogOutput.log)
 | Canvas | Size | Status |
 |--------|------|--------|
 | `MenuCanvas` | 1.20m | Working ✓ |
 | `WindowCanvas` (notes/notebook) | 1.20m | Working ✓ |
-| `ActionPanelCanvas` | 1.60m | Working ✓ |
+| `ActionPanelCanvas` | 1.60m | Working ✓ (case board anchor, not grip-draggable) |
 | `DialogCanvas` | 1.20m | Working ✓ |
 | `BioDisplayCanvas` | 1.80m | Working ✓ |
 | `GameCanvas`/HUD | 1.50m | Working ✓ |
 | `TooltipCanvas` | 0.80m | Working ✓ |
 | `PopupMessage` | 1.20m | Working ✓ (scale enforced each cycle) |
 | `VRSettingsPanelInternal` | 1.60m | Working ✓ |
-| `CaseCanvas` | — | Disabled (was bright white background) |
+| `CaseCanvas` | 1.80m | Working ✓ (BG suppressed, pin board interactive) |
+| `LocationDetailsCanvas` | 1.80m | Working ✓ (grip-draggable) |
 | `MinimapCanvas` | 1.50m | Partially working |
+
+## Phase 12 status (COMPLETE — 2026-03-30)
+- Case board pin drag (direct RectTransform manipulation) ✓
+- Context menu world-lock (skip RepositionEveryFrame when ContextMenus active) ✓
+- Save/load warp investigation started
+
+## Phase 13 status (COMPLETE — 2026-03-30)
+- Save/load button detection via hierarchy walk (`'Border'` hit → walk to `'Continue'`) ✓
+- Movement rediscovery deferred until menu fully closes (load complete) ✓
+- Gravity guard during load (`_hasBeenGrounded = false` on trigger) ✓
+- ActionPanelCanvas grip-drag deadlock fixed ✓
+- ActionPanelCanvas excluded from grip-draggable canvas set ✓
+- Save-load warp eliminated ✓
 
 ## History
 - git `1be2b0e` — full VDXR-internal patching approach (archived checkpoint, do not rebase)
@@ -264,3 +299,5 @@ VR arm display works by:
 - **Phase 9 complete** (2026-03-29): All canvas/UI issues resolved — see HANDOVER.md for full details
 - **Phase 10 complete** (2026-03-30): World graphics — flipYMode + HDRP Volume config fix (`546a4b5`)
 - **Phase 11 complete** (2026-03-30): Movement — all controls bound, held item + arm tracking, VR arm display (`255dafc`)
+- **Phase 12 complete** (2026-03-30): Case board pin drag, context menu world-lock (`1ee8e9d`)
+- **Phase 13 complete** (2026-03-30): Save-load warp fix, ActionPanelCanvas grip-drag deadlock fix (`d0bd328`)

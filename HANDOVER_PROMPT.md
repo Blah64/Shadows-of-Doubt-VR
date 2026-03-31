@@ -14,7 +14,7 @@ Then read the main source files:
 - `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\OpenXRManager.cs`
 - `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\VR\VRSettingsPanel.cs`
 
-## What is working (Phase 11 complete — everything through movement)
+## What is working (Phase 13 complete)
 
 - Stereo rendering in headset ✓
 - Head tracking ✓
@@ -38,24 +38,26 @@ Then read the main source files:
 | Right B | Notebook/map (Tab key) |
 
 - **Held item tracking** — carried world objects follow VR controller ✓
-- **VR arm display** — both arms track their respective controllers with per-hand rotation offsets ✓
+- **VR arm display** — both arms track their respective controllers ✓
 - **Left laser beam** — LineRenderer on left controller, toggle in VR Settings ✓
+- **Case board** — pins/notes/evidence interactive, pin drag working ✓
+- **Save/load** — no warp after loading a save game ✓
+- **Case board grip-drag** — panels (map, notes, bio, etc.) relocatable; ActionPanelCanvas fixed in place ✓
 
 ## Known issues / polish opportunities
 
-- CaseCanvas disabled (was bright white background; case-board content is elsewhere)
 - MinimapCanvas partially working
 - Some additive items show as semi-transparent white, not original colours
 - PopupMessage gets scale-reset by game (fixed each scan cycle, slight lag)
-- Trigger stopping issue — user reported, not diagnosed
 - No comfort options yet (vignette, configurable snap-turn degrees, IPD)
 - VR arm rotation may need per-item tuning for different held items
+- Jump while stationary — may not work in some states (not diagnosed)
+- Notebook B-press — reportedly opens and instantly closes (not diagnosed)
 
 ## Build & deploy
 ```bash
 cd "E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod"
 dotnet build SoDVR/SoDVR.csproj -c Release
-rm -rf "../BepInEx/plugins/SoDVR"
 cp SoDVR/bin/Release/net6.0/SoDVR.dll "../BepInEx/plugins/SoDVR.dll"
 ```
 Log: `E:\SteamLibrary\steamapps\common\Shadows of Doubt\BepInEx\LogOutput.log`
