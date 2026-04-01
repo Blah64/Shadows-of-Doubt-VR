@@ -94,6 +94,9 @@ public class VRCamera : MonoBehaviour
     // Tracks which canvas IDs have already been placed in world space.
     // Once in this set the canvas transform is never moved again by us.
     private readonly HashSet<int>         _positionedCanvases = new();
+    // Last VR-placed world position + rotation for each canvas (set in LateUpdate/pre-render,
+    // re-enforced in Update before aim-dot scan so the game's overwrites don't desync visuals vs interaction).
+    private readonly Dictionary<int, (Vector3 pos, Quaternion rot)> _canvasVRPose = new();
     // Tracks the last-known active state of each managed canvas (by instance ID).
     // When a canvas transitions false→true AND its name is in s_recentreOnActivate,
     // we clear it from _positionedCanvases so it gets repositioned at the current head.
@@ -191,6 +194,12 @@ public class VRCamera : MonoBehaviour
         // Tooltip — tracks cursor depth, repositions every frame
         ["TooltipCanvas"]             = CanvasCategory.Tooltip,
         ["tooltipsCanvas"]            = CanvasCategory.Tooltip,
+
+        // Ignored nested canvases — must NOT be converted to WorldSpace independently.
+        // These live inside a parent managed canvas and inherit its scale/position/rotation.
+        // Converting them separately breaks their scale (100px initial sizeDelta → 0.016 scale),
+        // positions them far from their parent, and breaks all tooltip logic.
+        ["ContextMenus"]              = CanvasCategory.Ignored,  // nested inside TooltipCanvas; context menu + fast-action icons
     };
 
     // Per-category placement defaults.
@@ -200,19 +209,26 @@ public class VRCamera : MonoBehaviour
     private static readonly Dictionary<CanvasCategory, CanvasCategoryDefaults> s_categoryDefaults = new()
     {
         [CanvasCategory.Menu]      = new(1.8f,  0.00f, 1.2f, recentre: true),
-        [CanvasCategory.CaseBoard] = new(2.3f,  0.00f, 1.8f, recentre: true,  isGrip: true),
-        [CanvasCategory.Panel]     = new(2.1f,  0.00f, 1.6f, recentre: true),
+        [CanvasCategory.CaseBoard] = new(2.3f,  0.00f, 2.5f, recentre: true,  isGrip: true),  // wider: pins/notes more readable
+        [CanvasCategory.Panel]     = new(2.1f,  0.00f, 2.0f, recentre: true),                 // wider: action panel buttons bigger
         [CanvasCategory.HUD]       = new(2.5f, -0.15f, 1.5f, recentre: false, isHud: true),
-        [CanvasCategory.Tooltip]   = new(1.2f, -0.10f, 0.8f, recentre: false, everyFrame: true),
+        [CanvasCategory.Tooltip]   = new(1.2f, -0.10f, 1.2f, recentre: false, everyFrame: true), // wider: context menu text readable
         [CanvasCategory.Default]   = new(2.0f,  0.00f, 1.6f, recentre: false),
         [CanvasCategory.Ignored]   = new(0f,    0.00f, 1.6f, recentre: false),  // placeholder; never used
     };
 
     // ── CaseBoard grip-relocate ───────────────────────────────────────────────
-    private Canvas?    _gripDragCanvas;       // canvas currently being grip-dragged
-    private Vector3    _gripDragOffset;       // world offset from controller to canvas at grab time
-    private Quaternion _gripDragRotOffset;    // rotation offset at grab time
-    private bool       _gripWasPressed;       // previous frame grip state (edge detection)
+    private Canvas?    _gripDragCanvas;          // canvas currently being grip-dragged
+    private Vector3    _gripDragOffset;          // controller → hit-point offset in controller local space
+    private Vector3    _gripDragHitLocalOffset;  // hit-point → canvas-pivot offset in canvas local space (no scale)
+    private Quaternion _gripDragRotOffset;        // canvas rotation relative to controller at grab time
+    private bool       _gripWasPressed;           // previous frame grip state (edge detection)
+    private bool       _dialogCanvasPlaced;       // true once dialog-mode tooltip is placed (world-lock until dialog closes)
+    private bool       _prevContextMenuActive;    // previous frame context-menu active state (edge detection for force-rescan)
+    private bool       _contextMenuFreezeApplied; // true once we've computed the freeze pos/rot for context menu
+    private Vector3    _contextMenuFreezePos;    // world position to enforce while context menu is frozen
+    private Quaternion _contextMenuFreezeRot;    // world rotation to enforce while context menu is frozen
+    private Vector3    _contextMenuChildWorldPos; // actual world pos of context menu child after zeroing (set in pre-render)
     // Relative offsets (position + rotation) from primary CaseCanvas to other CaseBoard canvases.
     // Preserved across opens so the user's layout is maintained.
     private readonly Dictionary<int, (Vector3 pos, Quaternion rot)> _caseBoardOffsets = new();
@@ -366,17 +382,36 @@ public class VRCamera : MonoBehaviour
     private Canvas?           _cbDragCanvas;       // which canvas it was on
     private PointerEventData? _cbDragPED;          // kept across frames
     private int               _cbDragPressFrame;   // frame when trigger was pressed
-    private const int         CbDragFrameThreshold = 5; // frames before drag kicks in
+    private const int         CbDragFrameThreshold = 2; // frames before drag kicks in (world-space delta is immune to canvas repositioning)
 
     private bool              _cbDragIsNative;     // true = CaseCanvas drag using native mouse events
     private float             _cbCursorPauseUntil; // pause continuous cursor tracking (e.g. after right-click)
 
     // ── Direct RectTransform drag (bypasses EventSystem for CaseCanvas pins) ──
+    // Uses ray-plane intersection each frame → pin tracks aim dot 1:1.
+    // On release: if pin moved < ClickMaxCanvasUnits from start → revert + click.
     private bool              _cbDirectDrag;         // true = using direct RT manipulation instead of EventSystem
     private RectTransform?    _cbDirectDragRT;       // the pin's RectTransform (citizen/PlayerStickyNote)
     private RectTransform?    _cbDirectDragParentRT; // parent of pin (Pinned) — coordinate reference
-    private Vector2           _cbDirectDragStartLocal; // ray hit in parent-local coords at drag start
-    private Vector2           _cbDirectDragStartAnchored; // pin's anchoredPosition at drag start
+    private Vector2           _cbDirectDragGrabOffset; // offset from ray hit to pin center at grab time
+    private Vector2           _cbDirectDragStartAnchored; // pin's anchoredPosition at press (for revert on click)
+    private Vector2           _cbDirectDragStartHitLocal; // aim point in canvas coords at grab time
+    private bool              _cbDirectDragPastDeadZone; // true = aim moved past dead zone, pin is tracking
+    private const float       ClickMaxCanvasUnits = 200f; // dead zone: aim must move this far before pin starts tracking
+    private int               _cbPinDiagDone;      // 0 = not yet, 1 = done (one-shot diagnostic)
+
+    // ── Mouse-only fallback for pin clicks (2D physics system) ──
+    // When TryFindCaseBoardTarget returns null (pins use 2D physics, not GraphicRaycaster),
+    // we simulate mouse_event LEFTDOWN/LEFTUP and let the game's own system handle detection.
+    private bool              _cbMouseOnlyDrag;     // true = using mouse_event fallback (no GO target)
+
+    // ── Direct CursorRigidbody positioning (bypass screen→board projection) ──
+    // The game positions CursorRigidbody via Input.mousePosition → Camera.main → local coords.
+    // In VR, Camera.main rotation doesn't match the VR view → cursor lands at wrong board position.
+    // Fix: directly set CursorRigidbody.anchoredPosition from VR controller ray → board intersection.
+    private RectTransform?    _cbCursorRbRT;        // CursorRigidbody's RectTransform
+    private RectTransform?    _cbContentContainerRT; // ContentContainer parent (coordinate reference)
+    private bool              _cbCursorRbSearched;  // true = already searched (even if not found)
 
     // Middle-click drag (Right B → create string between pinned notes)
     private bool              _cbMidDragActive;
@@ -574,6 +609,7 @@ public class VRCamera : MonoBehaviour
         if (Input.GetKeyDown(KeyCode.F8))
         {
             _positionedCanvases.Clear();
+            _canvasVRPose.Clear();
             Log.LogInfo("[VRCamera] Recenter: canvases will be re-placed on next LateUpdate.");
         }
 
@@ -808,6 +844,17 @@ public class VRCamera : MonoBehaviour
         // Retry finding a game camera every 60 frames in case it wasn't available at rig build time.
         if (_gameCam == null && (_frameCount % 60) == 0) TryFindGameCamera();
         if (_gameCam != null) transform.position = _gameCam.position;
+
+        // Sync game camera rotation to VR head so that WorldToScreenPoint/ScreenPointToRay
+        // through Camera.main matches the VR view.  The game's case board cursor system
+        // projects Input.mousePosition through Camera.main to find board coordinates —
+        // if Camera.main's rotation doesn't match the VR head, the cursor lands at the
+        // wrong board position.  Camera.main is suppressed (cullingMask=0) so this is safe.
+        if (_gameCamRef != null && _leftCam != null)
+        {
+            try { _gameCamRef.transform.rotation = _leftCam.transform.rotation; }
+            catch { }
+        }
 
         // Deferred camera suppress: fire after the countdown reaches zero.
         // We keep the camera ENABLED (so Camera.main remains non-null for game systems
@@ -3207,34 +3254,102 @@ public class VRCamera : MonoBehaviour
             {
                 if (!canvas.gameObject.activeSelf || !canvas.enabled) continue;
 
-                // Context menu freeze: when ContextMenus has active children (a context menu
-                // is showing), stop repositioning TooltipCanvas so the menu stays world-locked.
-                bool contextMenuActive = false;
+                // Context menu freeze: when ContextMenus has active children (a right-click
+                // context menu is showing), world-lock TooltipCanvas so the menu stays put.
+                // Orient to match the pin board so the menu is coplanar with the board.
+                bool cbIsOpen = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf;
+                bool contextMenuFrozen = false;
                 try
                 {
                     var cmTr = canvas.transform.Find("ContextMenus");
                     if (cmTr != null && cmTr.gameObject.activeSelf)
-                    {
                         for (int ci = 0; ci < cmTr.childCount; ci++)
-                        {
-                            if (cmTr.GetChild(ci).gameObject.activeSelf)
-                            { contextMenuActive = true; break; }
-                        }
-                    }
+                            if (cmTr.GetChild(ci).gameObject.activeSelf) { contextMenuFrozen = true; break; }
                 }
                 catch { }
-                if (contextMenuActive) { continue; } // freeze position while context menu is open
+                if (contextMenuFrozen)
+                {
+                    if (!_contextMenuFreezeApplied)
+                    {
+                        // First freeze frame: compute snap position/rotation.
+                        float cmDist = catDefs.Distance;
+                        if (cmDist <= 0f) cmDist = 1.0f;
+                        _contextMenuFreezePos = headPos + forward * cmDist + Vector3.up * catDefs.VerticalOffset;
+                        _contextMenuFreezeRot = yawOnly;
+                        _contextMenuFreezeApplied = true;
+
+                        // Diagnostic: log ContextMenus and child transforms to understand facing
+                        try
+                        {
+                            var cmTrDiag = canvas.transform.Find("ContextMenus");
+                            if (cmTrDiag != null)
+                            {
+                                Log.LogInfo($"[VRCamera] CM diag: TooltipCanvas pos={canvas.transform.position} rot={canvas.transform.rotation.eulerAngles} scale={canvas.transform.localScale}");
+                                Log.LogInfo($"[VRCamera] CM diag: ContextMenus localPos={cmTrDiag.localPosition} localRot={cmTrDiag.localRotation.eulerAngles} localScale={cmTrDiag.localScale}");
+                                for (int dci = 0; dci < cmTrDiag.childCount; dci++)
+                                {
+                                    var dchild = cmTrDiag.GetChild(dci);
+                                    if (!dchild.gameObject.activeSelf) continue;
+                                    Log.LogInfo($"[VRCamera] CM diag: child '{dchild.gameObject.name}' localPos={dchild.localPosition} localRot={dchild.localRotation.eulerAngles} localScale={dchild.localScale} worldRot={dchild.rotation.eulerAngles}");
+                                    // Also check first grandchild
+                                    if (dchild.childCount > 0)
+                                    {
+                                        var gc = dchild.GetChild(0);
+                                        Log.LogInfo($"[VRCamera] CM diag:   grandchild '{gc.gameObject.name}' localRot={gc.localRotation.eulerAngles} worldRot={gc.rotation.eulerAngles}");
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        catch { }
+                        Log.LogInfo($"[VRCamera] Context menu freeze: dist={cmDist:F2} freezePos={_contextMenuFreezePos} freezeRot={_contextMenuFreezeRot.eulerAngles}");
+                    }
+
+                    // The game repositions context menu children at SCREEN COORDINATES every
+                    // frame.  In WorldSpace, this offset is 0.5-0.6m from canvas center.
+                    // Fix: zero the child's localPosition EVERY frame (not just the first).
+                    try
+                    {
+                        var cmTr2 = canvas.transform.Find("ContextMenus");
+                        if (cmTr2 != null)
+                        {
+                            for (int cci = 0; cci < cmTr2.childCount; cci++)
+                            {
+                                var child = cmTr2.GetChild(cci);
+                                if (!child.gameObject.activeSelf) continue;
+                                child.localPosition = Vector3.zero;
+                                child.localRotation = Quaternion.identity;
+                                child.localScale = Vector3.one;
+                                var childRT = child.GetComponent<RectTransform>();
+                                if (childRT != null) childRT.anchoredPosition = Vector2.zero;
+                                break; // only recentre the first active child
+                            }
+                        }
+                    }
+                    catch { }
+
+                    // Enforce position/rotation EVERY frame to prevent game from overwriting.
+                    canvas.transform.position = _contextMenuFreezePos;
+                    canvas.transform.rotation = _contextMenuFreezeRot;
+                    continue;
+                }
 
                 // When PopupMessage or TutorialMessage is active, TooltipCanvas
-                // switches to dialog mode: positioned at Menu distance, head-facing,
-                // so the nested dialog content appears as a proper menu panel.
+                // switches to dialog mode: positioned ONCE in front of head (world-locked after that).
+                // The player can grip-drag the dialog to reposition it freely.
                 bool dialogActive = (_popupMessageGO != null && _popupMessageGO.activeSelf)
                                  || (_tutorialMessageGO != null && _tutorialMessageGO.activeSelf);
                 if (dialogActive)
                 {
-                    float dialogDist = GetCategoryDefaults(CanvasCategory.Menu).Distance - 0.2f;
-                    canvas.transform.position = headPos + forward * dialogDist + Vector3.up * catDefs.VerticalOffset;
-                    canvas.transform.rotation = yawOnly;
+                    if (!_dialogCanvasPlaced)
+                    {
+                        // First frame the dialog is active — snap to head position.
+                        float dialogDist = GetCategoryDefaults(CanvasCategory.Menu).Distance - 0.2f;
+                        canvas.transform.position = headPos + forward * dialogDist + Vector3.up * catDefs.VerticalOffset;
+                        canvas.transform.rotation = yawOnly;
+                        _dialogCanvasPlaced = true;
+                    }
+                    // else: canvas is world-locked; let the player grip-drag it.
                     // Scale up TooltipCanvas to popup size while dialog is active.
                     try
                     {
@@ -3250,6 +3365,7 @@ public class VRCamera : MonoBehaviour
                 }
                 else
                 {
+                    _dialogCanvasPlaced = false; // dialog closed — allow fresh placement next time
                     float tooltipDist = _cursorAimDepth - 0.02f;
                     canvas.transform.position = headPos + forward * tooltipDist + Vector3.up * catDefs.VerticalOffset;
                     canvas.transform.rotation = yawOnly;
@@ -3579,6 +3695,49 @@ public class VRCamera : MonoBehaviour
             }
         }
 
+        // Pre-scan: re-enforce ALL canvas VR poses that were snapshotted in the last pre-render.
+        // The game overwrites canvas transforms between our LateUpdate/pre-render and this Update.
+        // By re-applying the snapshot, aim dot / click / grip-drag code sees the correct positions.
+        if (_canvasVRPose.Count > 0)
+        {
+            foreach (var kvpFz in _managedCanvases)
+            {
+                if (kvpFz.Value == null) continue;
+                if (!_canvasVRPose.TryGetValue(kvpFz.Key, out var vrPose)) continue;
+                kvpFz.Value.transform.position = vrPose.pos;
+                kvpFz.Value.transform.rotation = vrPose.rot;
+            }
+            // Also zero context-menu children (game resets to screen coords every frame)
+            if (_contextMenuFreezeApplied)
+            {
+                foreach (var kvpFz in _managedCanvases)
+                {
+                    if (kvpFz.Value == null) continue;
+                    if (GetCanvasCategory(kvpFz.Value.gameObject.name) != CanvasCategory.Tooltip) continue;
+                    try
+                    {
+                        var cmTrFz = kvpFz.Value.transform.Find("ContextMenus");
+                        if (cmTrFz != null)
+                        {
+                            for (int fzi = 0; fzi < cmTrFz.childCount; fzi++)
+                            {
+                                var fzChild = cmTrFz.GetChild(fzi);
+                                if (!fzChild.gameObject.activeSelf) continue;
+                                fzChild.localPosition = Vector3.zero;
+                                fzChild.localRotation = Quaternion.identity;
+                                fzChild.localScale    = Vector3.one;
+                                var fzRT = fzChild.GetComponent<RectTransform>();
+                                if (fzRT != null) fzRT.anchoredPosition = Vector2.zero;
+                                break;
+                            }
+                        }
+                    }
+                    catch { }
+                    break;
+                }
+            }
+        }
+
         // Depth scan: find ALL managed canvases the controller ray hits within their rects.
         // The nearest hit drives the primary cursor canvas (for click targeting / tooltip depth).
         // Every hit gets a world-space aim dot so the user can see aim on canvases behind others.
@@ -3606,7 +3765,9 @@ public class VRCamera : MonoBehaviour
                 {
                     bool dialogUp = (_popupMessageGO != null && _popupMessageGO.activeSelf)
                                  || (_tutorialMessageGO != null && _tutorialMessageGO.activeSelf);
-                    if (!dialogUp) continue;
+                    // Also include Tooltip canvas in aim dot when a context menu is showing
+                    // so the player can aim at and click context menu items.
+                    if (!dialogUp && !_prevContextMenuActive) continue;
                 }
                 if (GetCanvasCategory(c.gameObject.name) == CanvasCategory.HUD) continue;
                 if (_nestedCanvasIds.Contains(kvp.Key)) continue;
@@ -3623,8 +3784,42 @@ public class VRCamera : MonoBehaviour
                 var rt = c.GetComponent<RectTransform>();
                 if (rt != null)
                 {
-                    Vector2 hs = rt.sizeDelta * 0.5f;
-                    if (Mathf.Abs(lp.x) > hs.x || Mathf.Abs(lp.y) > hs.y) continue;
+                    bool boundsPass = false;
+
+                    // When context menu is active on TooltipCanvas, the parent canvas is huge
+                    // (1280×720) but the visible child is small (~230×712). Use child bounds.
+                    if (_contextMenuFreezeApplied && GetCanvasCategory(c.gameObject.name) == CanvasCategory.Tooltip)
+                    {
+                        try
+                        {
+                            var cmTrB = c.transform.Find("ContextMenus");
+                            if (cmTrB != null)
+                            {
+                                for (int cbi = 0; cbi < cmTrB.childCount; cbi++)
+                                {
+                                    var cbChild = cmTrB.GetChild(cbi);
+                                    if (!cbChild.gameObject.activeSelf) continue;
+                                    var cbRT = cbChild.GetComponent<RectTransform>();
+                                    if (cbRT != null)
+                                    {
+                                        Vector3 childLocal = cbChild.InverseTransformPoint(worldHitPt);
+                                        Vector2 chs = cbRT.sizeDelta * 0.5f;
+                                        boundsPass = Mathf.Abs(childLocal.x) <= chs.x && Mathf.Abs(childLocal.y) <= chs.y;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                    else
+                    {
+                        // Standard centered-pivot bounds check (works reliably in IL2CPP)
+                        Vector2 hs = rt.sizeDelta * 0.5f;
+                        boundsPass = Mathf.Abs(lp.x) <= hs.x && Mathf.Abs(lp.y) <= hs.y;
+                    }
+
+                    if (!boundsPass) continue;
                 }
 
                 // Record this hit for aim dot positioning
@@ -3712,19 +3907,108 @@ public class VRCamera : MonoBehaviour
         }
 
         // ── Continuous cursor tracking for case board ──────────────
-        // Keep OS cursor (→ Input.mousePosition) updated every frame when the case board
-        // is open.  Paused briefly after right-click so the context menu stays visible
-        // (otherwise cursor tracking immediately pulls Input.mousePosition off the menu).
+        // Directly position the game's CursorRigidbody from VR controller ray → board intersection.
+        // This bypasses the broken screen→board projection (game camera rotation mismatch).
         {
             bool cbOpenCursor = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf;
-            if (cbOpenCursor && _gameCamRef != null && _rightControllerGO != null
+
+            // Discover CursorRigidbody on first open (or after scene reload)
+            if (cbOpenCursor && !_cbCursorRbSearched && _casePanelCanvas != null)
+            {
+                _cbCursorRbSearched = true;
+                try
+                {
+                    // Hierarchy: CaseCanvas → CorkBoard → Viewport → ContentContainer → CursorRigidbody
+                    var corkBoard = _casePanelCanvas.transform.Find("CorkBoard");
+                    var viewport = corkBoard?.Find("Viewport");
+                    var contentContainer = viewport?.Find("ContentContainer");
+                    if (contentContainer != null)
+                    {
+                        _cbContentContainerRT = contentContainer.GetComponent<RectTransform>();
+                        var cursorRb = contentContainer.Find("CursorRigidbody");
+                        if (cursorRb != null)
+                        {
+                            _cbCursorRbRT = cursorRb.GetComponent<RectTransform>();
+                            Log.LogInfo($"[VRCamera] Found CursorRigidbody: anchoredPos={_cbCursorRbRT?.anchoredPosition} ContentContainer size={_cbContentContainerRT?.sizeDelta}");
+                        }
+                        else
+                            Log.LogWarning("[VRCamera] CursorRigidbody not found under ContentContainer");
+
+                        // ── Search ENTIRE SCENE for DragCasePanel / PinnedItemController ──
+                        // Pins are NOT children of ContentContainer.Pinned — find them anywhere.
+                        try
+                        {
+                            var allGOs = Resources.FindObjectsOfTypeAll<RectTransform>();
+                            int dcpCount = 0, picCount = 0;
+                            foreach (var rt in allGOs)
+                            {
+                                if (rt == null || rt.gameObject == null) continue;
+                                try
+                                {
+                                    var comps = rt.GetComponents<Component>();
+                                    bool hasDCP = false, hasPIC = false;
+                                    foreach (var comp in comps)
+                                    {
+                                        if (comp == null) continue;
+                                        string tn = comp.GetIl2CppType().Name;
+                                        if (tn == "DragCasePanel") hasDCP = true;
+                                        if (tn == "PinnedItemController") hasPIC = true;
+                                    }
+                                    if (hasDCP && dcpCount < 5)
+                                    {
+                                        dcpCount++;
+                                        string path = rt.gameObject.name;
+                                        var p = rt.parent;
+                                        for (int pi = 0; pi < 6 && p != null; pi++) { path = p.gameObject.name + "/" + path; p = p.parent; }
+                                        Log.LogInfo($"[VRCamera] CB PinSearch: DragCasePanel '{rt.gameObject.name}' path={path} worldPos={rt.position} anchoredPos={rt.anchoredPosition} active={rt.gameObject.activeSelf}");
+                                    }
+                                    if (hasPIC && picCount < 5)
+                                    {
+                                        picCount++;
+                                        string path = rt.gameObject.name;
+                                        var p = rt.parent;
+                                        for (int pi = 0; pi < 6 && p != null; pi++) { path = p.gameObject.name + "/" + path; p = p.parent; }
+                                        Log.LogInfo($"[VRCamera] CB PinSearch: PinnedItemController '{rt.gameObject.name}' path={path} worldPos={rt.position} anchoredPos={rt.anchoredPosition} active={rt.gameObject.activeSelf}");
+                                    }
+                                }
+                                catch { }
+                            }
+                            Log.LogInfo($"[VRCamera] CB PinSearch: found {dcpCount} DragCasePanel, {picCount} PinnedItemController");
+                        }
+                        catch (Exception ex) { Log.LogWarning($"[VRCamera] CB PinSearch: {ex.Message}"); }
+                    }
+                    else
+                        Log.LogWarning("[VRCamera] ContentContainer not found in CaseCanvas hierarchy");
+                }
+                catch (Exception ex) { Log.LogWarning($"[VRCamera] CursorRigidbody search: {ex.Message}"); }
+            }
+            // Reset search flag when board closes
+            if (!cbOpenCursor) _cbCursorRbSearched = false;
+
+            // Position CursorRigidbody directly from VR controller ray
+            if (cbOpenCursor && _rightControllerGO != null && _casePanelCanvas != null
                 && !_cbDragActive && Time.realtimeSinceStartup >= _cbCursorPauseUntil)
             {
                 try
                 {
                     Vector3 cPos = _rightControllerGO.transform.position;
                     Vector3 cFwd = _rightControllerGO.transform.forward;
-                    GetCaseBoardScreenPos(cPos, cFwd, _casePanelCanvas, moveCursor: true);
+
+                    // Still move OS cursor for backward compatibility / game systems that read Input.mousePosition
+                    if (_gameCamRef != null)
+                        GetCaseBoardScreenPos(cPos, cFwd, _casePanelCanvas, moveCursor: true);
+
+                    // Direct CursorRigidbody positioning: VR ray → board plane → rect-local coords
+                    if (_cbCursorRbRT != null && _cbContentContainerRT != null)
+                    {
+                        var plane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+                        var ray = new Ray(cPos, cFwd);
+                        if (plane.Raycast(ray, out float d) && d > 0f)
+                        {
+                            Vector3 wp = cPos + cFwd * d;
+                            PositionCursorRbAtWorldPoint(wp);
+                        }
+                    }
                 }
                 catch { }
             }
@@ -3753,11 +4037,49 @@ public class VRCamera : MonoBehaviour
                 {
                     if (_cbDirectDrag)
                     {
-                        // Direct drag end — just stop manipulating
-                        Log.LogInfo($"[VRCamera] CB direct drag end: '{_cbDragGO?.name}'");
+                        // Dead zone approach: if aim never crossed dead zone, it's a click.
+                        bool isClick = !_cbDirectDragPastDeadZone;
+
+                        if (isClick)
+                        {
+                            // Pin never moved (dead zone wasn't crossed) — no revert needed.
+
+                            // Direct call to PinnedItemController.OpenEvidence() — bypasses
+                            // ButtonController.OnPointerClick guard (mouseInputMode / selectedElement).
+                            // OpenEvidence() → EvidenceButtonController.OnLeftClick() → SpawnWindow().
+                            bool opened = false;
+                            if (_cbDirectDragRT != null)
+                            {
+                                try
+                                {
+                                    // Walk up from the pin RT to find PinnedItemController
+                                    Transform walk = _cbDirectDragRT.transform;
+                                    for (int wi = 0; wi < 6 && walk != null; wi++)
+                                    {
+                                        var pic = walk.GetComponent<PinnedItemController>();
+                                        if (pic != null)
+                                        {
+                                            pic.OpenEvidence();
+                                            opened = true;
+                                            Log.LogInfo($"[VRCamera] CB pin click → OpenEvidence on '{walk.gameObject.name}'");
+                                            break;
+                                        }
+                                        walk = walk.parent;
+                                    }
+                                }
+                                catch (Exception ex) { Log.LogWarning($"[VRCamera] CB pin OpenEvidence: {ex.Message}"); }
+                            }
+                            if (!opened)
+                                Log.LogInfo($"[VRCamera] CB direct drag → click (no PinnedItemController): '{_cbDragGO?.name}'");
+                        }
+                        else
+                        {
+                            Log.LogInfo($"[VRCamera] CB direct drag end: '{_cbDragGO?.name}'");
+                        }
                     }
-                    else if (_cbDragStarted && _cbDragGO != null && _cbDragPED != null)
+                    else if (_cbDragStarted && _cbDragIsNative && _cbDragGO != null && _cbDragPED != null)
                     {
+                        // CaseCanvas native drag (pin board items) — end the EventSystem drag
                         Vector2 endPos = GetCaseBoardScreenPos(rPos, rFwd, _cbDragCanvas, moveCursor: true);
                         _cbDragPED.delta = endPos - _cbDragPED.position;
                         _cbDragPED.position = endPos;
@@ -3768,23 +4090,23 @@ public class VRCamera : MonoBehaviour
                     }
                     else if (_cbDragGO != null && _cbDragPED != null)
                     {
-                        // Short press — fire persistent listeners (bypasses mouseInputMode guard)
+                        // Non-CaseCanvas items (PinButton on Note, etc.) or short press:
+                        // always treat as click — these items should be clicked, not dragged.
                         ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.pointerUpHandler);
                         FireCaseBoardClick(_cbDragGO);
                         Log.LogInfo($"[VRCamera] CB click: '{_cbDragGO.name}'");
                     }
                 }
                 catch (Exception ex) { Log.LogWarning($"[VRCamera] CB drag release: {ex.Message}"); }
-                if (_cbDragIsNative)
-                {
-                    try { mouse_event(0x0004 /*LEFTUP*/, 0, 0, 0, UIntPtr.Zero); } catch { }
-                }
                 _cbDragActive = false; _cbDragStarted = false; _cbDragGO = null; _cbDragCanvas = null; _cbDragPED = null; _cbDragIsNative = false;
                 _cbDirectDrag = false; _cbDirectDragRT = null; _cbDirectDragParentRT = null;
+                _cbMouseOnlyDrag = false;
             }
             else if (triggerNow)
             {
-                // Direct RectTransform drag for CaseCanvas pins
+                // Direct RectTransform drag for CaseCanvas pins — ray-plane intersection.
+                // Dead zone: pin stays put until aim moves ClickMaxCanvasUnits from grab point.
+                // This prevents VR hand tremor from turning a click into a drag.
                 if (_cbDirectDrag && _cbDirectDragRT != null && _cbDirectDragParentRT != null && _casePanelCanvas != null)
                 {
                     try
@@ -3794,19 +4116,43 @@ public class VRCamera : MonoBehaviour
                         if (plane.Raycast(ray, out float d) && d > 0f)
                         {
                             Vector3 wp = rPos + rFwd * d;
-                            // Convert world point to parent-local 2D coordinates
                             Vector3 local3 = _cbDirectDragParentRT.InverseTransformPoint(wp);
-                            Vector2 localNow = new Vector2(local3.x, local3.y);
-                            Vector2 delta = localNow - _cbDirectDragStartLocal;
-                            _cbDirectDragRT.anchoredPosition = _cbDirectDragStartAnchored + delta;
-                            if (!_cbDragStarted)
+                            Vector2 hitLocal = new Vector2(local3.x, local3.y);
+                            if (!_cbDirectDragPastDeadZone)
                             {
-                                _cbDragStarted = true;
-                                Log.LogInfo($"[VRCamera] CB direct drag start: '{_cbDragGO?.name}' startAnch={_cbDirectDragStartAnchored}");
+                                // Check if aim moved past dead zone threshold
+                                float aimDist = Vector2.Distance(hitLocal, _cbDirectDragStartHitLocal);
+                                if (aimDist >= ClickMaxCanvasUnits)
+                                {
+                                    _cbDirectDragPastDeadZone = true;
+                                    // Recompute grab offset from current aim to pin's START position
+                                    // so pin doesn't jump when dead zone is crossed
+                                    _cbDirectDragGrabOffset = _cbDirectDragStartAnchored - hitLocal;
+                                    Log.LogInfo($"[VRCamera] CB pin dead zone crossed: aimDist={aimDist:F0}");
+                                }
                             }
+                            if (_cbDirectDragPastDeadZone)
+                                _cbDirectDragRT.anchoredPosition = hitLocal + _cbDirectDragGrabOffset;
                         }
                     }
                     catch (Exception ex) { Log.LogWarning($"[VRCamera] CB direct drag update: {ex.Message}"); }
+                }
+                else if (_cbMouseOnlyDrag)
+                {
+                    // Mouse-only fallback: position CursorRigidbody + update OS cursor each frame
+                    try
+                    {
+                        if (_gameCamRef != null)
+                            GetCaseBoardScreenPos(rPos, rFwd, _casePanelCanvas, moveCursor: true);
+                        if (_cbCursorRbRT != null && _cbContentContainerRT != null && _casePanelCanvas != null)
+                        {
+                            var plane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+                            var ray = new Ray(rPos, rFwd);
+                            if (plane.Raycast(ray, out float d) && d > 0f)
+                                PositionCursorRbAtWorldPoint(rPos + rFwd * d);
+                        }
+                    }
+                    catch { }
                 }
                 else if (_cbDragGO != null && _cbDragPED != null)
                 {
@@ -3834,6 +4180,7 @@ public class VRCamera : MonoBehaviour
         {
             _cbDragGO = TryFindCaseBoardTarget(rPos, rFwd,
                 out _cbDragCanvas, out _cbDragPED, PointerEventData.InputButton.Left);
+            Log.LogInfo($"[VRCamera] CB trigger: TryFindCBTarget → {(_cbDragGO != null ? $"'{_cbDragGO.name}' on '{_cbDragCanvas?.gameObject.name}'" : "null")} cbOpen={cbOpen}");
             if (_cbDragGO != null)
             {
                 _cbDragActive = true;
@@ -3874,19 +4221,24 @@ public class VRCamera : MonoBehaviour
                             var parentRT = pinRT.parent.GetComponent<RectTransform>();
                             if (parentRT != null)
                             {
-                                // Compute initial ray hit in parent-local coordinates
+                                // Compute grab offset: difference from ray hit to pin center.
+                                // Each frame, pin tracks ray hit + this offset → matches aim dot 1:1.
                                 var plane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
                                 var ray = new Ray(rPos, rFwd);
                                 if (plane.Raycast(ray, out float d) && d > 0f)
                                 {
                                     Vector3 wp = rPos + rFwd * d;
                                     Vector3 local3 = parentRT.InverseTransformPoint(wp);
+                                    Vector2 hitLocal = new Vector2(local3.x, local3.y);
                                     _cbDirectDragRT = pinRT;
                                     _cbDirectDragParentRT = parentRT;
-                                    _cbDirectDragStartLocal = new Vector2(local3.x, local3.y);
+                                    _cbDirectDragGrabOffset = pinRT.anchoredPosition - hitLocal;
                                     _cbDirectDragStartAnchored = pinRT.anchoredPosition;
+                                    _cbDirectDragStartHitLocal = hitLocal;
+                                    _cbDirectDragPastDeadZone = false;
                                     _cbDirectDrag = true;
-                                    Log.LogInfo($"[VRCamera] CB direct drag setup: pin='{pinRT.gameObject.name}' parent='{parentRT.gameObject.name}' anchored={pinRT.anchoredPosition} localHit=({local3.x:F1},{local3.y:F1})");
+                                    _cbDragStarted = true;
+                                    Log.LogInfo($"[VRCamera] CB direct drag setup: pin='{pinRT.gameObject.name}' parent='{parentRT.gameObject.name}' anchored={pinRT.anchoredPosition} localHit=({local3.x:F1},{local3.y:F1}) grabOffset={_cbDirectDragGrabOffset}");
                                 }
                             }
                         }
@@ -3896,26 +4248,131 @@ public class VRCamera : MonoBehaviour
 
                 if (!_cbDirectDrag)
                 {
-                    // Fallback: EventSystem-based drag
-                    GetCaseBoardScreenPos(rPos, rFwd, _cbDragCanvas, moveCursor: true);
+                    // Fallback: EventSystem-based drag (no mouse_event — causes ScreenSpace warp)
+                    if (_cbDragCanvas != null && _gameCamRef != null)
+                        GetCaseBoardScreenPos(rPos, rFwd, _cbDragCanvas, moveCursor: true);
                     try
                     {
                         ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.pointerEnterHandler);
                         ExecuteEvents.ExecuteHierarchy(_cbDragGO, _cbDragPED, ExecuteEvents.pointerDownHandler);
                     }
                     catch { }
-                    if (_cbDragIsNative)
-                    {
-                        try { mouse_event(0x0002 /*LEFTDOWN*/, 0, 0, 0, UIntPtr.Zero); } catch { }
-                    }
                 }
             }
             else
             {
-                // Not on a CaseCanvas element — use regular instant-click for other canvases
-                _triggerNeedsRelease = true;
-                _triggerFireFrame = Time.frameCount;
-                TryClickCanvas(rPos, rFwd);
+                // TryFindCaseBoardTarget returned null — two possibilities:
+                // (a) Ray hits CaseCanvas but no GraphicRaycaster element (pins use 2D physics)
+                //     → use mouse-only drag (simulate mouse_event, position CursorRigidbody)
+                // (b) Ray hits other canvas (ActionPanelCanvas buttons, etc.)
+                //     → fall through to TryClickCanvas for normal button handling
+                // Only use mouse-only drag when CaseCanvas is the CLOSEST canvas hit.
+                // If ActionPanelCanvas or other interactive canvases are closer, TryClickCanvas handles them.
+                bool hitsCaseCanvas = false;
+                float caseDist = float.MaxValue;
+                if (_casePanelCanvas != null && _casePanelCanvas.gameObject.activeSelf)
+                {
+                    var casePlane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+                    if (casePlane.Raycast(new Ray(rPos, rFwd), out float cd) && cd > 0f && cd < 5f)
+                    {
+                        caseDist = cd;
+                        hitsCaseCanvas = true;
+                    }
+                }
+                // NOTE: no closer-canvas blocker check needed here.
+                // TryFindCBTarget already ran GraphicRaycaster on ALL canvases and found
+                // nothing clickable. ActionPanelCanvas/WindowCanvas planes always intersect
+                // (they're part of the case board UI) but have no clickable element at the
+                // aim point — safe to proceed with Pinned scan.
+
+                if (hitsCaseCanvas)
+                {
+                    // GraphicRaycaster found nothing on CaseCanvas — search Pinned container
+                    // directly for pin GOs and test proximity to VR aim ray.
+                    // DO NOT send mouse_event — the game's drag handler uses ScreenSpace
+                    // coordinates and warps pins to the wrong position.
+                    bool foundPin = false;
+                    try
+                    {
+                        // Re-scan Pinned container (children added lazily after board opens)
+                        var pinnedContainer = _cbContentContainerRT?.transform?.Find("Pinned");
+                        int pinnedCount = pinnedContainer?.childCount ?? 0;
+                        if (pinnedCount > 0 && _casePanelCanvas != null)
+                        {
+                            var plane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+                            var ray = new Ray(rPos, rFwd);
+                            if (plane.Raycast(ray, out float d) && d > 0f)
+                            {
+                                Vector3 wp = rPos + rFwd * d;
+                                // Convert hit point to Pinned container local coords (canvas units)
+                                // World-space distance is useless — canvas lossyScale ≈ 0.0003 makes
+                                // all pin world positions cluster at the container center.
+                                var pinnedRT = pinnedContainer.GetComponent<RectTransform>();
+                                if (pinnedRT == null) pinnedRT = _cbContentContainerRT;
+                                Vector3 hitLocal3 = pinnedRT.InverseTransformPoint(wp);
+                                Vector2 hitLocal = new Vector2(hitLocal3.x, hitLocal3.y);
+
+                                // Find closest pin in canvas-unit space
+                                float bestDist = float.MaxValue;
+                                RectTransform? bestPinRT = null;
+                                for (int pi = 0; pi < pinnedCount; pi++)
+                                {
+                                    var pinTr = pinnedContainer.GetChild(pi);
+                                    if (pinTr == null || !pinTr.gameObject.activeSelf) continue;
+                                    var pinRT = pinTr.GetComponent<RectTransform>();
+                                    if (pinRT == null) continue;
+                                    // Compare in canvas units (anchoredPosition space)
+                                    float dist = Vector2.Distance(pinRT.anchoredPosition, hitLocal);
+                                    if (dist < bestDist)
+                                    {
+                                        bestDist = dist;
+                                        bestPinRT = pinRT;
+                                    }
+                                }
+                                // Threshold in canvas units — pin visual size ~200 units,
+                                // use 400 for comfortable grab radius
+                                if (bestPinRT != null && bestDist < 400f)
+                                {
+                                    var parentRT = bestPinRT.parent?.GetComponent<RectTransform>() ?? _cbContentContainerRT;
+                                    _cbDragActive = true;
+                                    _cbDirectDrag = true;
+                                    _cbDragStarted = true;
+                                    _cbDragPressFrame = Time.frameCount;
+                                    _triggerFireFrame = Time.frameCount;
+                                    _cbDragIsNative = true;
+                                    _cbMouseOnlyDrag = false;
+                                    _cbDirectDragRT = bestPinRT;
+                                    _cbDirectDragParentRT = parentRT;
+                                    _cbDirectDragGrabOffset = bestPinRT.anchoredPosition - hitLocal;
+                                    _cbDirectDragStartAnchored = bestPinRT.anchoredPosition;
+                                    _cbDirectDragStartHitLocal = hitLocal;
+                                    _cbDirectDragPastDeadZone = false;
+                                    _cbDragGO = bestPinRT.gameObject;
+                                    foundPin = true;
+                                    Log.LogInfo($"[VRCamera] CB pin found via Pinned scan: '{bestPinRT.gameObject.name}' canvasDist={bestDist:F0} anchored={bestPinRT.anchoredPosition} hitLocal=({hitLocal.x:F0},{hitLocal.y:F0})");
+                                }
+                            }
+                        }
+                        if (!foundPin)
+                            Log.LogInfo($"[VRCamera] CB Pinned scan: {pinnedCount} children, no pin close enough");
+                    }
+                    catch (Exception ex) { Log.LogWarning($"[VRCamera] CB Pinned scan: {ex.Message}"); }
+
+                    if (!foundPin)
+                    {
+                        // No pin found — fall through to TryClickCanvas
+                        _triggerNeedsRelease = true;
+                        _triggerFireFrame = Time.frameCount;
+                        TryClickCanvas(rPos, rFwd);
+                    }
+                }
+                else
+                {
+                    // Not hitting CaseCanvas — use regular click for ActionPanelCanvas buttons etc.
+                    _triggerNeedsRelease = true;
+                    _triggerFireFrame = Time.frameCount;
+                    TryClickCanvas(rPos, rFwd);
+                }
             }
         }
         else if (!_cbDragActive)
@@ -3941,6 +4398,18 @@ public class VRCamera : MonoBehaviour
                 if (_cbANeedsRelease) { if (!aPressed) _cbANeedsRelease = false; }
                 else if (aPressed)
                 {
+                    // Position CursorRigidbody before right-click
+                    if (_cbCursorRbRT != null && _cbContentContainerRT != null && _casePanelCanvas != null)
+                    {
+                        try
+                        {
+                            var plane2 = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+                            var ray2 = new Ray(rPos, rFwd);
+                            if (plane2.Raycast(ray2, out float d2) && d2 > 0f)
+                                PositionCursorRbAtWorldPoint(rPos + rFwd * d2);
+                        }
+                        catch { }
+                    }
                     GetCaseBoardScreenPos(rPos, rFwd, _casePanelCanvas, moveCursor: true);
                     const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
                     const uint MOUSEEVENTF_RIGHTUP   = 0x0010;
@@ -4043,10 +4512,43 @@ public class VRCamera : MonoBehaviour
         bool gripReleased = !gripNow && _gripWasPressed;
         _gripWasPressed = gripNow;
 
-        // Start drag: grip pressed while controller ray hits a case board element.
-        // Only active when case board is open (ActionPanelCanvas visible).
+        // Start drag: grip pressed while controller ray hits a draggable canvas.
+        // Active when case board is open, a dialog popup is showing, or a context menu is open.
         bool caseBoardOpen = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf;
-        if (gripPressed && _gripDragCanvas == null && _rightControllerGO != null && caseBoardOpen)
+        bool dialogNowActive = (_popupMessageGO != null && _popupMessageGO.activeSelf)
+                            || (_tutorialMessageGO != null && _tutorialMessageGO.activeSelf);
+        // Detect context menu active state (child of TooltipCanvas "ContextMenus" has active child).
+        bool contextMenuNowActive = false;
+        foreach (var kvpCtx in _managedCanvases)
+        {
+            if (kvpCtx.Value == null) continue;
+            if (GetCanvasCategory(kvpCtx.Value.gameObject.name) != CanvasCategory.Tooltip) continue;
+            try
+            {
+                var cmTr = kvpCtx.Value.transform.Find("ContextMenus");
+                if (cmTr != null && cmTr.gameObject.activeSelf)
+                    for (int ci = 0; ci < cmTr.childCount; ci++)
+                        if (cmTr.GetChild(ci).gameObject.activeSelf) { contextMenuNowActive = true; break; }
+            }
+            catch { }
+            if (contextMenuNowActive) break;
+        }
+        // When context menu first becomes active, clear TooltipCanvas rescan cooldown so
+        // the HDR material boost is applied to menu items immediately rather than after
+        // up to 10 seconds (RescanCooldownFrames).
+        if (contextMenuNowActive && !_prevContextMenuActive)
+        {
+            foreach (var kvpCtx in _managedCanvases)
+            {
+                if (kvpCtx.Value == null) continue;
+                if (GetCanvasCategory(kvpCtx.Value.gameObject.name) == CanvasCategory.Tooltip)
+                    _lastRescanFrame.Remove(kvpCtx.Key);
+            }
+        }
+        if (!contextMenuNowActive) _contextMenuFreezeApplied = false; // reset for next open
+        _prevContextMenuActive = contextMenuNowActive;
+        bool gripDragAllowed = caseBoardOpen || dialogNowActive || contextMenuNowActive;
+        if (gripPressed && _gripDragCanvas == null && _rightControllerGO != null && gripDragAllowed)
         {
             Vector3 ctrlPos = _rightControllerGO.transform.position;
             Vector3 ctrlFwd = _rightControllerGO.transform.forward;
@@ -4061,13 +4563,15 @@ public class VRCamera : MonoBehaviour
                 var c = kvp.Value;
                 if (c == null || !IsCanvasVisible(c)) continue;
                 var dragCat = GetCanvasCategory(c.gameObject.name);
-                // Allow grip-drag on CaseBoard, Menu, and Panel canvases — but only those
-                // that appear during case board usage (notes, notepad, map, bio, location, minimap).
-                // Exclude CaseCanvas itself (the background board) and HUD/Tooltip/Ignored.
-                if (dragCat != CanvasCategory.CaseBoard && dragCat != CanvasCategory.Menu && dragCat != CanvasCategory.Panel) continue;
+                // Allow grip-drag on CaseBoard, Panel, and Menu canvases.
+                // Also allow Tooltip canvas when a popup dialog or context menu is active.
+                bool isGrabbableTooltip = dragCat == CanvasCategory.Tooltip && (dialogNowActive || contextMenuNowActive);
+                if (!isGrabbableTooltip && dragCat != CanvasCategory.CaseBoard && dragCat != CanvasCategory.Panel && dragCat != CanvasCategory.Menu) continue;
                 string cName = c.gameObject.name ?? "";
-                if (cName.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase)) continue;
-                if (cName.Equals("ActionPanelCanvas", StringComparison.OrdinalIgnoreCase)) continue;
+                if (cName.Equals("CaseCanvas",            StringComparison.OrdinalIgnoreCase)) continue;
+                if (cName.Equals("ActionPanelCanvas",      StringComparison.OrdinalIgnoreCase)) continue;
+                if (cName.Equals("MenuCanvas",             StringComparison.OrdinalIgnoreCase)) continue;  // ESC menu: not draggable
+                if (cName.Equals("LocationDetailsCanvas",  StringComparison.OrdinalIgnoreCase)) continue;  // current address: not draggable
 
                 var pl = new Plane(-c.transform.forward, c.transform.position);
                 if (!pl.Raycast(ray, out float dist) || dist <= 0f) continue;
@@ -4084,20 +4588,33 @@ public class VRCamera : MonoBehaviour
 
             if (bestGripCanvas != null)
             {
-                _gripDragCanvas    = bestGripCanvas;
-                _gripDragOffset    = bestGripCanvas.transform.position - ctrlPos;
-                _gripDragRotOffset = Quaternion.Inverse(_rightControllerGO.transform.rotation) * bestGripCanvas.transform.rotation;
+                Quaternion grabCtrlRot   = _rightControllerGO.transform.rotation;
+                Quaternion grabCanvasRot = bestGripCanvas.transform.rotation;
+                // The exact world point the controller ray intersects the canvas surface.
+                Vector3 hitPoint = ctrlPos + ctrlFwd * bestGripDist;
+
+                _gripDragCanvas = bestGripCanvas;
+                // Controller → hit-point in controller local space.
+                // During drag: newHitPoint = ctrlPos + ctrlRot * _gripDragOffset
+                _gripDragOffset = Quaternion.Inverse(grabCtrlRot) * (hitPoint - ctrlPos);
+                // Hit-point → canvas pivot in canvas local space (rotation only, no scale).
+                // During drag: canvasPivot = newHitPoint - newCanvasRot * _gripDragHitLocalOffset
+                _gripDragHitLocalOffset = Quaternion.Inverse(grabCanvasRot) * (hitPoint - bestGripCanvas.transform.position);
+                // Canvas rotation relative to controller (unchanged from before).
+                _gripDragRotOffset = Quaternion.Inverse(grabCtrlRot) * grabCanvasRot;
                 Log.LogInfo($"[VRCamera] GripDrag start: '{bestGripCanvas.gameObject.name}' dist={bestGripDist:F2}");
             }
         }
 
-        // While dragging: move canvas with controller
+        // While dragging: move canvas so the grabbed surface point stays under the controller ray.
         if (gripNow && _gripDragCanvas != null && _rightControllerGO != null)
         {
-            Vector3    ctrlPos = _rightControllerGO.transform.position;
-            Quaternion ctrlRot = _rightControllerGO.transform.rotation;
-            _gripDragCanvas.transform.position = ctrlPos + _gripDragOffset;
-            _gripDragCanvas.transform.rotation = ctrlRot * _gripDragRotOffset;
+            Vector3    ctrlPos      = _rightControllerGO.transform.position;
+            Quaternion ctrlRot      = _rightControllerGO.transform.rotation;
+            Quaternion newCanvasRot = ctrlRot * _gripDragRotOffset;
+            Vector3    newHitPoint  = ctrlPos + ctrlRot * _gripDragOffset;
+            _gripDragCanvas.transform.position = newHitPoint - newCanvasRot * _gripDragHitLocalOffset;
+            _gripDragCanvas.transform.rotation = newCanvasRot;
         }
 
         // Release: store relative offsets from primary CaseCanvas
@@ -4131,7 +4648,10 @@ public class VRCamera : MonoBehaviour
             // Store offset in ActionPanelCanvas's LOCAL coordinate space.
             // This means the offset rotates with the anchor — when the case board
             // reopens facing a different direction, the arrangement is preserved.
-            if (_actionPanelCanvas != null)
+            // Skip Tooltip canvas (dialog host) — its position is transient; no persistence needed.
+            var releasedCat = GetCanvasCategory(_gripDragCanvas.gameObject.name ?? "");
+            bool isReleasedTooltip = releasedCat == CanvasCategory.Tooltip;
+            if (!isReleasedTooltip && _actionPanelCanvas != null)
             {
                 int dragId = _gripDragCanvas.GetInstanceID();
                 Quaternion invAnchorRot = Quaternion.Inverse(_actionPanelCanvas.transform.rotation);
@@ -4902,6 +5422,40 @@ public class VRCamera : MonoBehaviour
     /// <summary>Called right before each VR eye camera renders — last chance to position items + arms.</summary>
     private void ForceItemPositionPreRender()
     {
+        // Context menu: enforce child zeroing right before render.
+        // The game may reset child transforms between our LateUpdate and render.
+        if (_contextMenuFreezeApplied)
+        {
+            foreach (var kvpPR in _managedCanvases)
+            {
+                if (kvpPR.Value == null) continue;
+                if (GetCanvasCategory(kvpPR.Value.gameObject.name) != CanvasCategory.Tooltip) continue;
+                kvpPR.Value.transform.position = _contextMenuFreezePos;
+                kvpPR.Value.transform.rotation  = _contextMenuFreezeRot;
+                try
+                {
+                    var cmTrPR = kvpPR.Value.transform.Find("ContextMenus");
+                    if (cmTrPR != null)
+                    {
+                        for (int pri = 0; pri < cmTrPR.childCount; pri++)
+                        {
+                            var prChild = cmTrPR.GetChild(pri);
+                            if (!prChild.gameObject.activeSelf) continue;
+                            prChild.localPosition = Vector3.zero;
+                            prChild.localRotation = Quaternion.identity;
+                            prChild.localScale    = Vector3.one;
+                            var prRT = prChild.GetComponent<RectTransform>();
+                            if (prRT != null) prRT.anchoredPosition = Vector2.zero;
+                            _contextMenuChildWorldPos = prChild.position;
+                            break;
+                        }
+                    }
+                }
+                catch { }
+                break;
+            }
+        }
+
         // Override carried world object position right before render
         if (_interactionController != null)
         {
@@ -4939,6 +5493,20 @@ public class VRCamera : MonoBehaviour
             PositionArmAtController(_rightArmTransform, _rightFistTransform, _rightControllerGO, ArmRotOffsetRight);
         }
         catch { }
+
+        // Snapshot all managed canvas poses RIGHT BEFORE rendering.
+        // These are re-enforced in Update (before aim-dot scan) to counteract
+        // the game overwriting canvas transforms between frames.
+        foreach (var kvpSnap in _managedCanvases)
+        {
+            if (kvpSnap.Value == null) continue;
+            if (_nestedCanvasIds.Contains(kvpSnap.Key)) continue;
+            try
+            {
+                _canvasVRPose[kvpSnap.Key] = (kvpSnap.Value.transform.position, kvpSnap.Value.transform.rotation);
+            }
+            catch { }
+        }
     }
 
     private void DiscoverMovementSystem()
@@ -5269,27 +5837,37 @@ public class VRCamera : MonoBehaviour
             }
         }
 
-        // Include all other visible managed canvases (WindowCanvas for notes/notepad, etc.)
+        // Include Panel/CaseBoard/Tooltip canvases as CB targets.
+        // Menu canvases (WindowCanvas, DialogCanvas, etc.) are intentionally excluded — they are
+        // handled by TryClickCanvas via the null-return fallback, which uses proper button-click
+        // logic.  Including them here routes clicks through the CB drag path, which causes
+        // inconsistent click registration on notes/notepad.
         foreach (var kvp in _managedCanvases)
         {
             var c = kvp.Value;
             if (c == null || !c.gameObject.activeSelf) continue;
             if (c == _casePanelCanvas) continue; // already added above
             if (c.renderMode != RenderMode.WorldSpace) continue;
+            var cCat = GetCanvasCategory(c.gameObject.name ?? "");
+            if (cCat == CanvasCategory.Menu)    continue; // WindowCanvas etc. handled by TryClickCanvas
+            if (cCat == CanvasCategory.Panel)   continue; // Panel buttons use TryClickCanvas
+            if (cCat == CanvasCategory.Tooltip) continue; // Tooltip must not intercept pin board raycasts
+            if (cCat == CanvasCategory.HUD)     continue; // HUD not interactive on case board
+            if (cCat == CanvasCategory.Ignored) continue;
+            // NOTE: Do NOT exclude canvases nested inside Menu-category canvases.
+            // 'Note' sub-canvases (category Default) inside WindowCanvas contain pin buttons
+            // (PinButton, etc.) that must be reachable for pin click/drag to work.
 
             var cPlane = new Plane(-c.transform.forward, c.transform.position);
             if (!cPlane.Raycast(ray, out float cDist) || cDist <= 0f) continue;
 
-            // Bounds check for non-CaseCanvas canvases
+            // Bounds check for non-CaseCanvas canvases (centered-pivot — reliable in IL2CPP)
             Vector3 wp = origin + direction * cDist;
             Vector3 local = c.transform.InverseTransformPoint(wp);
             var rect = c.GetComponent<RectTransform>();
             if (rect == null) continue;
-            Vector2 sz = rect.rect.size;
-            Vector2 pivot = rect.pivot;
-            float lx = local.x + sz.x * pivot.x;
-            float ly = local.y + sz.y * pivot.y;
-            if (lx < 0 || lx > sz.x || ly < 0 || ly > sz.y) continue;
+            Vector2 hs = rect.sizeDelta * 0.5f;
+            if (Mathf.Abs(local.x) > hs.x || Mathf.Abs(local.y) > hs.y) continue;
 
             Vector3 sp = _leftCam.WorldToScreenPoint(wp);
             candidates.Add((cDist, c, new Vector2(sp.x, sp.y), false));
@@ -5297,6 +5875,15 @@ public class VRCamera : MonoBehaviour
 
         // Sort nearest first
         candidates.Sort((a, b) => a.dist.CompareTo(b.dist));
+
+        if (candidates.Count > 0)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"[VRCamera] TryFindCBTarget: {candidates.Count} candidates:");
+            foreach (var (d, cc, sp, isCC) in candidates)
+                sb.Append($" '{cc.gameObject.name}'(d={d:F2},sp={sp},cc={isCC})");
+            Log.LogInfo(sb.ToString());
+        }
 
         // Try each candidate — first one with a valid UI hit wins
         foreach (var (dist, cCanvas, screenPos, isCaseCanvas) in candidates)
@@ -5312,11 +5899,11 @@ public class VRCamera : MonoBehaviour
                     else continue;
                 }
 
-                var gr = cCanvas.GetComponent<GraphicRaycaster>();
-                if (gr == null || !gr.enabled) continue;
-
                 var localPed = new PointerEventData(es);
                 localPed.position = screenPos;
+
+                var gr = cCanvas.GetComponent<GraphicRaycaster>();
+                if (gr == null || !gr.enabled) continue;
 
                 var results = new Il2CppSystem.Collections.Generic.List<RaycastResult>();
                 gr.Raycast(localPed, results);
@@ -5325,33 +5912,47 @@ public class VRCamera : MonoBehaviour
                 var go = results[0].gameObject;
                 if (go == null) continue;
 
-                // CaseCanvas: require a Button in hierarchy (skip background/container elements)
-                if (isCaseCanvas)
+                // All canvases: require a Button (or DragCasePanel for pins) in hierarchy.
+                // Decorative elements (LensFlare, borders, backgrounds) have neither — returning
+                // them causes FireCaseBoardClick to silently eat the click.
+                // CaseCanvas also gets verbose component diagnostics for debugging.
                 {
                     bool hasBtn = false;
                     var walker = go.transform;
-                    var compDiag = new System.Text.StringBuilder();
+                    var compDiag = isCaseCanvas ? new System.Text.StringBuilder() : null;
                     for (int wi = 0; wi < 8 && walker != null; wi++)
                     {
                         if (walker.GetComponent<Button>() != null) hasBtn = true;
-                        // Log all components on each ancestor for diagnostics
-                        try
+                        // DragCasePanel marks a draggable pin — Text/Overlay children of
+                        // pins don't have Button, but they are still interactive via drag/click.
+                        if (isCaseCanvas)
                         {
-                            var comps = walker.GetComponents<Component>();
-                            compDiag.Append($"  [{wi}] '{walker.gameObject.name}': ");
-                            foreach (var comp in comps)
+                            try
                             {
-                                if (comp != null)
-                                    compDiag.Append(comp.GetIl2CppType().Name).Append(", ");
+                                var comps2 = walker.GetComponents<Component>();
+                                foreach (var comp2 in comps2)
+                                    if (comp2 != null && comp2.GetIl2CppType().Name == "DragCasePanel")
+                                    { hasBtn = true; break; }
                             }
-                            compDiag.AppendLine();
+                            catch { }
                         }
-                        catch { }
+                        if (compDiag != null)
+                        {
+                            try
+                            {
+                                var comps = walker.GetComponents<Component>();
+                                compDiag.Append($"  [{wi}] '{walker.gameObject.name}': ");
+                                foreach (var comp in comps)
+                                    if (comp != null) compDiag.Append(comp.GetIl2CppType().Name).Append(", ");
+                                compDiag.AppendLine();
+                            }
+                            catch { }
+                        }
                         walker = walker.parent;
                     }
-                    if (compDiag.Length > 0)
+                    if (compDiag != null && compDiag.Length > 0)
                         Log.LogInfo($"[VRCamera] CBTarget hierarchy for '{go.name}':\n{compDiag}");
-                    if (!hasBtn) continue;
+                    if (!hasBtn) continue; // skip non-interactive element — fall through to next candidate
                 }
 
                 localPed.pointerEnter = go;
@@ -5410,6 +6011,37 @@ public class VRCamera : MonoBehaviour
                             if ((wkvp.Value.gameObject.name ?? "").Equals("WindowCanvas", StringComparison.OrdinalIgnoreCase))
                             { _positionedCanvases.Remove(wkvp.Key); break; }
                         }
+                        // Clear rescan cooldown for WindowCanvas + nested children so new
+                        // tab content (Detective's Notebook, Scroll View) gets HDR material
+                        // treatment immediately instead of waiting for the 600-frame cooldown.
+                        foreach (var rkvp in _managedCanvases)
+                        {
+                            if (rkvp.Value == null) continue;
+                            string rn = rkvp.Value.gameObject.name ?? "";
+                            if (rn.Equals("WindowCanvas", StringComparison.OrdinalIgnoreCase))
+                            {
+                                int wcId = rkvp.Key;
+                                _lastRescanFrame.Remove(wcId);
+                                // Also clear nested children
+                                foreach (var nkvp in _managedCanvases)
+                                {
+                                    if (nkvp.Value == null) continue;
+                                    try
+                                    {
+                                        var np = nkvp.Value.transform.parent;
+                                        while (np != null)
+                                        {
+                                            var npc = np.GetComponent<Canvas>();
+                                            if (npc != null && npc.GetInstanceID() == wcId)
+                                            { _lastRescanFrame.Remove(nkvp.Key); break; }
+                                            np = np.parent;
+                                        }
+                                    }
+                                    catch { }
+                                }
+                                break;
+                            }
+                        }
                         Log.LogInfo($"[VRCamera] CB persistent click: '{walker.gameObject.name}' persistent={pCount}");
                         return;
                     }
@@ -5434,6 +6066,23 @@ public class VRCamera : MonoBehaviour
             }
         }
         catch { }
+    }
+
+    /// <summary>
+    /// Positions CursorRigidbody at the world point where the VR controller ray hits the board.
+    /// Uses ScreenPointToLocalPointInRectangle with _leftCam for correct RectTransform-local coords.
+    /// </summary>
+    private void PositionCursorRbAtWorldPoint(Vector3 wp)
+    {
+        if (_cbCursorRbRT == null || _cbContentContainerRT == null || _leftCam == null) return;
+        Vector3 sp = _leftCam.WorldToScreenPoint(wp);
+        if (sp.z <= 0f) return; // behind camera
+        Vector2 localPt;
+        if (RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                _cbContentContainerRT, new Vector2(sp.x, sp.y), _leftCam, out localPt))
+        {
+            _cbCursorRbRT.anchoredPosition = localPt;
+        }
     }
 
     private Vector2 GetCaseBoardScreenPos(Vector3 origin, Vector3 direction, Canvas? targetCanvas = null,
@@ -5473,11 +6122,15 @@ public class VRCamera : MonoBehaviour
                         pt.Y = clientY;
                         ClientToScreen(hwnd, ref pt);
                         SetCursorPos(pt.X, pt.Y);
-                        // Diagnostic: log coordinates once per second during drag
-                        if (_cbDragActive && (int)Time.realtimeSinceStartup != (int)(Time.realtimeSinceStartup - Time.unscaledDeltaTime))
+                        // Diagnostic: log coordinates once per second when case board is open
+                        if ((int)Time.realtimeSinceStartup != (int)(Time.realtimeSinceStartup - Time.unscaledDeltaTime))
                         {
                             Vector3 mousePos = Input.mousePosition;
-                            Log.LogInfo($"[VRCamera] CursorDiag: wp=({wp.x:F2},{wp.y:F2},{wp.z:F2}) gameSp=({gameSp.x:F0},{gameSp.y:F0},{gameSp.z:F1}) client=({clientX},{clientY}) screen=({pt.X},{pt.Y}) Input.mouse=({mousePos.x:F0},{mousePos.y:F0}) Screen=({Screen.width}x{Screen.height}) camPx=({_gameCamRef.pixelWidth}x{_gameCamRef.pixelHeight})");
+                            var camMain = Camera.main;
+                            string camInfo = camMain != null
+                                ? $"pos=({camMain.transform.position.x:F1},{camMain.transform.position.y:F1},{camMain.transform.position.z:F1}) rot=({camMain.transform.eulerAngles.x:F0},{camMain.transform.eulerAngles.y:F0},{camMain.transform.eulerAngles.z:F0}) cull=0x{camMain.cullingMask:X}"
+                                : "NULL";
+                            Log.LogInfo($"[VRCamera] CursorDiag: wp=({wp.x:F2},{wp.y:F2},{wp.z:F2}) gameSp=({gameSp.x:F0},{gameSp.y:F0},{gameSp.z:F1}) client=({clientX},{clientY}) screen=({pt.X},{pt.Y}) Input.mouse=({mousePos.x:F0},{mousePos.y:F0}) Screen=({Screen.width}x{Screen.height}) camPx=({_gameCamRef.pixelWidth}x{_gameCamRef.pixelHeight}) CamMain=[{camInfo}] mouseOnly={_cbMouseOnlyDrag} lockState={UnityEngine.Cursor.lockState}");
                         }
                     }
                 }
@@ -5522,6 +6175,34 @@ public class VRCamera : MonoBehaviour
             Vector3 wp = origin + direction * dist;
             if (_leftCam.WorldToScreenPoint(wp).z < 0f) continue;
             hits.Add((dist, canvas, wp));
+        }
+
+        // Context menu mode: add ContextMenus canvas directly to hits.
+        // ContextMenus is a nested canvas (CanvasCategory.Ignored) inside TooltipCanvas — its own
+        // GraphicRaycaster handles its children, but TooltipCanvas's raycaster can't see them.
+        if (_prevContextMenuActive)
+        {
+            foreach (var kvpCm in _managedCanvases)
+            {
+                if (kvpCm.Value == null) continue;
+                if (GetCanvasCategory(kvpCm.Value.gameObject.name) != CanvasCategory.Tooltip) continue;
+                try
+                {
+                    var cmTr = kvpCm.Value.transform.Find("ContextMenus");
+                    if (cmTr == null || !cmTr.gameObject.activeSelf) continue;
+                    var cmCanvas = cmTr.GetComponent<Canvas>();
+                    if (cmCanvas == null) continue;
+                    if (cmCanvas.worldCamera == null) cmCanvas.worldCamera = _leftCam;
+                    var cmPlane = new Plane(-cmCanvas.transform.forward, cmCanvas.transform.position);
+                    if (!cmPlane.Raycast(ray, out float cmDist)) continue;
+                    if (cmDist <= 0f) continue;
+                    Vector3 cmWp = origin + direction * cmDist;
+                    if (_leftCam.WorldToScreenPoint(cmWp).z < 0f) continue;
+                    hits.Add((cmDist, cmCanvas, cmWp));
+                    Log.LogInfo($"[VRCamera] ContextMenus added to click hits: dist={cmDist:F2}");
+                }
+                catch { }
+            }
         }
 
         // Dialog mode: add PopupMessage/TutorialMessage canvases directly to hits.
@@ -5601,6 +6282,43 @@ public class VRCamera : MonoBehaviour
                         }
                         catch { }
                         if (!hasButton) continue; // skip non-interactive — fall through to next canvas
+                    }
+
+                    // Nested-canvas interaction filter: canvases parented inside another managed
+                    // canvas (e.g. 'Detective's Notebook', 'Scroll View' inside WindowCanvas) can
+                    // intercept the ray before the parent canvas gets a chance.  Only accept the
+                    // hit if the element has a Button in its hierarchy; otherwise fall through so
+                    // the parent canvas (WindowCanvas with its tab buttons) can handle the click.
+                    {
+                        bool isNestedInManaged = false;
+                        try
+                        {
+                            var np = hitCanvas.transform.parent;
+                            while (np != null)
+                            {
+                                var npc = np.GetComponent<Canvas>();
+                                if (npc != null && _managedCanvases.ContainsKey(npc.GetInstanceID()))
+                                { isNestedInManaged = true; break; }
+                                np = np.parent;
+                            }
+                        }
+                        catch { }
+                        if (isNestedInManaged)
+                        {
+                            bool hasButton = false;
+                            try
+                            {
+                                var walker = go?.transform;
+                                for (int wi = 0; wi < 8 && walker != null; wi++)
+                                {
+                                    if (walker.GetComponent<Button>()         != null) { hasButton = true; break; }
+                                    if (walker.GetComponent<TMP_InputField>() != null) { hasButton = true; break; }
+                                    walker = walker.parent;
+                                }
+                            }
+                            catch { }
+                            if (!hasButton) continue; // no interactive element — fall through to parent canvas
+                        }
                     }
 
                     Log.LogInfo($"[VRCamera] Trigger click: '{go?.name}' on '{hitCanvasName}'");
@@ -5784,6 +6502,28 @@ public class VRCamera : MonoBehaviour
                                         break;
                                     }
                                 }
+                                // Clear rescan cooldown for the clicked canvas + any canvases nested
+                                // inside it (e.g. 'Detective's Notebook', 'Scroll View').  This lets
+                                // newly loaded tab content get HDR material treatment immediately
+                                // instead of waiting up to 10 s for the 600-frame cooldown to expire.
+                                int clickedId = hitCanvas.GetInstanceID();
+                                _lastRescanFrame.Remove(clickedId);
+                                foreach (var rkvp in _managedCanvases)
+                                {
+                                    if (rkvp.Value == null) continue;
+                                    try
+                                    {
+                                        var rp = rkvp.Value.transform.parent;
+                                        while (rp != null)
+                                        {
+                                            var rpc = rp.GetComponent<Canvas>();
+                                            if (rpc != null && rpc.GetInstanceID() == clickedId)
+                                            { _lastRescanFrame.Remove(rkvp.Key); break; }
+                                            rp = rp.parent;
+                                        }
+                                    }
+                                    catch { }
+                                }
 
                                 Log.LogInfo($"[VRCamera] Button invoked (persistent only): '{btr.gameObject.name}' persistent={persistentCount}");
                                 break;
@@ -5870,6 +6610,7 @@ public class VRCamera : MonoBehaviour
         _managedCanvases.Clear();
         _positionedCanvases.Clear();
         _canvasWasActive.Clear();
+        _canvasVRPose.Clear();
         _nestedCanvasIds.Clear();
         _caseContentIds.Clear();
         _casePanelCanvas = null; _casePanelId = -1;
