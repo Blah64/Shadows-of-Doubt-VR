@@ -1,7 +1,44 @@
 # SoDVR — Technical Handover
 
-**Date**: 2026-03-30 (updated end of Phase 13)
-**Phase**: 13 complete — next priority: Phase 14 comfort/polish
+**Date**: 2026-04-01 (updated end of Phase 14 partial)
+**Phase**: 14 in progress — case board interaction parked, HUD settings plan ready
+
+---
+
+## Phase 14 (Partial — 2026-04-01)
+
+### Done in Phase 14 so far
+
+**A button → right-click on any aimed canvas**
+- Previously: A button only right-clicked on the case board
+- Now: if `_cursorHasTarget` is true (aim dot on any canvas), right-click targets `_cursorTargetCanvas`; falls back to case board if case board open and no specific aim target
+- Field: `private Canvas? _cursorTargetCanvas` — set in the aim dot scan to the nearest hit canvas
+
+**B button → middle-click drag on any aimed canvas**
+- Same pattern as A button fix — uses `_cursorTargetCanvas` when aiming at a canvas
+
+**Jump/notebook suppressed when aiming at canvas**
+- When `_cursorHasTarget` is true, right-A no longer jumps (it right-clicks instead)
+- When `_cursorHasTarget` is true, right-B no longer opens notebook (it middle-clicks instead)
+
+### Case board interaction issues — PARKED
+
+Three problems investigated but NOT fixed. See `NotesWork.md` for full analysis, theories, and suggested next approaches.
+
+**Problem 1: Context menu aim dot / visual misalignment**
+Root cause identified: the game writes `ContextMenu(Clone).localPosition` to screen coords, `localRotation.y ≈ 284°`, and `localScale.z = 0` every frame. Our zeroing competes with the game's updates. Z-scale=0 may also prevent correct bounds testing. Aim dot now correctly targets TooltipCanvas (which is frozen in place when context menu is active), but the VISUAL content (ContextMenu(Clone)) may still be offset if our zeroing loses the race.
+
+**Problem 2: Opened pinned notes (WindowCanvas) misalignment**
+Not yet diagnosed. WindowCanvas is a managed canvas — it should go through normal aim dot scan. Something makes the aim dot not match the visual location. Needs diagnostic logging.
+
+**Problem 3: Pin proximity "stealing"**
+Fixed coordinate space (anchoredPosition → localPosition), but "2 children, no pin close enough" errors appeared consistently after context menu was used. InverseTransformPoint results may drift when the case board state changes. Needs per-pin distance logging to diagnose.
+
+### HUD settings — NOT YET IMPLEMENTED
+
+Plan file: `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`
+
+The plan adds 5 HUD settings to VR Settings General tab (distance, size, height, H.offset, laggy-follow toggle) plus auto-hide when ESC/case board is open. NOT IMPLEMENTED — ready to execute when returning to this work.
 
 ---
 
@@ -9,43 +46,32 @@
 
 ### Save/load warp — root cause chain
 
-The warp-on-load took multiple attempts to diagnose. Full root cause:
+1. **Button detection miss**: `TryClickCanvas` hit `'Border'` (child element), not `'Continue'` (the button). Fixed: walk up 6 hierarchy levels to find the button name.
 
-1. **Button detection miss**: `TryClickCanvas` hit `'Border'` (child element), not `'Continue'` (the button). Save/load trigger check was comparing `go.name == "continue"` against `"Border"` — always false. Fixed: walk up 6 hierarchy levels to find the button name.
+2. **Premature movement rediscovery**: Grace period (180 frames ≈ 3s) expired long before load (~24s). Fixed: defer rediscovery until menu is fully hidden.
 
-2. **Premature movement rediscovery**: Grace period (180 frames ≈ 3s) expired long before the game finished loading (~24s). `DiscoverMovementSystem()` ran while player CC was still at origin `(0,1,0)`, setting `_pauseOriginPos = (0,1,0)`. Fixed: defer rediscovery until menu is fully hidden (= load complete, player at save position).
+3. **Gravity during load**: `_hasBeenGrounded` still true from before load. Fixed: reset on save/load trigger.
 
-3. **Gravity during load**: `_hasBeenGrounded` was still `true` from before the load. After grace expired and CC was at origin, gravity pulled the CC down. Fixed: reset `_hasBeenGrounded = false` and `_jumpVerticalVelocity = 0` at the save/load trigger.
-
-4. **Same-scene cullingMask gate**: After same-scene reload, game camera cullingMask stays `0` (we suppressed it). Normal per-frame discovery gate (`cullingMask != 0`) would block rediscovery forever. Fixed: bypass cullingMask check when `_playerCC == null` AND menu is gone.
+4. **Same-scene cullingMask gate**: After same-scene reload, game camera cullingMask stays `0`. Fixed: bypass cullingMask check when `_playerCC == null` AND menu is gone.
 
 ### ActionPanelCanvas grip-drag deadlock
 
-When the user grip-dragged `ActionPanelCanvas` (the case board anchor), it stored a self-referential zero offset in `_gripDragAnchorOffsets`. On reopen:
-- Restore code waited for `_positionedCanvases.Contains(_actionPanelId)`
-- ActionPanelCanvas was just removed from `_positionedCanvases` for recentre
-- Infinite deferral — ActionPanelCanvas never moved from its old world position
-
-Fixed:
-1. Excluded `ActionPanelCanvas` from grip-draggable canvas candidates
-2. Skip anchor-offset restore when `id == _actionPanelId` (let it fall through to normal head+forward placement)
+When ActionPanelCanvas was grip-dragged, it stored a self-referential zero offset. On reopen, restore code waited for `_positionedCanvases.Contains(_actionPanelId)` but ActionPanelCanvas was removed — infinite deferral. Fixed: excluded from grip-drag candidates; skip anchor-offset restore when `id == _actionPanelId`.
 
 ---
 
 ## Phase 12: Case Board Polish — COMPLETE ✓
 
-- **Pin drag**: case board pins/notes/evidence now draggable via direct `RectTransform` manipulation (EventSystem couldn't route native drag events to CaseCanvas)
-- **Context menu world-lock**: skip `RepositionEveryFrame` when `ContextMenus` has active children — prevents context menus from chasing the player mid-interaction
+- **Pin drag**: direct `RectTransform` manipulation (EventSystem can't route native drag events to CaseCanvas)
+- **Context menu world-lock**: skip `RepositionEveryFrame` when `ContextMenus` has active `ContextMenu*` children
 
 ---
 
 ## Phase 11: Movement & Controls — COMPLETE ✓
 
-**Full controller button map:**
-
 | Button | Action | Method |
 |--------|--------|--------|
-| Left stick | Locomotion (4 m/s) | `UpdateLocomotion()` — `CharacterController.Move()` |
+| Left stick | Locomotion (4 m/s) | `UpdateLocomotion()` |
 | Left stick click | Sprint toggle | `UpdateSprint()` |
 | Right stick X | Snap turn ±30° | `UpdateSnapTurn()` |
 | Right stick click | Flashlight | middle mouse button |
@@ -54,8 +80,8 @@ Fixed:
 | Left trigger | World interact | LMB + camera redirected to left controller aim |
 | Left grip | Inventory (X key) | `UpdateInventory()` |
 | Right trigger | UI click | `TryClickCanvas()` |
-| Right A | Jump | `UpdateJump()` — CharacterController vertical + gravity |
-| Right B | Notebook/map (Tab) | `UpdateNotebook()` |
+| Right A | Jump / right-click on canvas | `UpdateJump()` / `UpdateUIInput()` |
+| Right B | Notebook/Tab / middle-click drag on canvas | `UpdateNotebook()` / `UpdateUIInput()` |
 
 **Held item tracking** — two systems:
 1. Carried world objects (`InteractionController.carryingObject`) — transform overridden to VR controller + 0.3m forward every frame
@@ -68,15 +94,15 @@ Fixed:
 | Canvas | Size | Status |
 |--------|------|--------|
 | `MenuCanvas` | 1.20m | Working ✓ |
-| `WindowCanvas` (notes/notebook) | 1.20m | Working ✓ |
+| `WindowCanvas` (notes/notebook) | 1.20m | Working ✓ (aim dot misalignment when opened from pin board — parked) |
 | `ActionPanelCanvas` | 1.60m | Working ✓ (case board anchor, not grip-draggable) |
 | `DialogCanvas` | 1.20m | Working ✓ |
 | `BioDisplayCanvas` | 1.80m | Working ✓ |
 | `GameCanvas`/HUD | 1.50m | Working ✓ |
-| `TooltipCanvas` | 0.80m | Working ✓ |
+| `TooltipCanvas` | 0.80m | Working ✓ (context menu aim alignment partial — parked) |
 | `PopupMessage` | 1.20m | Working ✓ (scale enforced each cycle) |
 | `VRSettingsPanelInternal` | 1.60m | Working ✓ |
-| `CaseCanvas` | 1.80m | Working ✓ (BG suppressed, pin board interactive) |
+| `CaseCanvas` | 1.80m | Working ✓ (BG suppressed, pin board interactive; pin steal issue parked) |
 | `LocationDetailsCanvas` | 1.80m | Working ✓ (grip-draggable) |
 | `MinimapCanvas` | 1.50m | Partially working |
 
@@ -84,13 +110,20 @@ Fixed:
 
 ## Known Issues / Polish Opportunities (Phase 14+)
 
-- **MinimapCanvas** — partially working, needs review
-- **Some additive items** — show as semi-transparent white overlays, not original colours
-- **PopupMessage** — game resets scale frequently (fixed each cycle, slight visual lag)
-- **Comfort options** not yet: vignette, configurable snap-turn degrees, IPD adjustment
-- **VR arm rotation** may need per-item tuning (different held items may have different orientations)
-- **Jump while stationary** — reported not working in some states (not yet diagnosed)
-- **Notebook B-press** — reportedly opens and instantly closes (not yet diagnosed)
+**Parked (detailed in NotesWork.md):**
+- Context menu aim dot misalignment (game writes screen coords + Z-scale=0 every frame)
+- Opened pinned notes (WindowCanvas) aim dot misalignment
+- Pin proximity stealing with 2+ pins on board
+
+**Other:**
+- MinimapCanvas — partially working, needs review
+- Some additive items — semi-transparent white overlays, not original colours
+- PopupMessage — game resets scale frequently (fixed each cycle, slight visual lag)
+- Comfort options not yet: vignette, configurable snap-turn degrees, IPD adjustment
+- VR arm rotation may need per-item tuning
+- Jump while stationary — may not work in some states (not diagnosed)
+- Notebook B-press — reportedly opens and instantly closes (not diagnosed)
+- **HUD settings plan** — 5 settings (distance, size, height, H.offset, laggy-follow) + auto-hide — plan written, not implemented
 
 ---
 
@@ -118,17 +151,37 @@ Every frame — PositionCanvases():
   → ActionPanelCanvas activate: resets _caseBoardPrimaryId, removes ALL CaseBoard canvases
   → HUD canvases: parented to HUDAnchor (fixed at dist/angle)
   → CaseCanvas: follows ActionPanelCanvas via EnforceCaseCanvasPosition() (0.15m behind)
+  → Tooltip w/ ContextMenu(Clone) active: freeze position (_contextMenuFreezePos), zero ContextMenus/child localPosition each frame
   → Grip-dragged canvases: restore ActionPanel-relative offset (NOT ActionPanelCanvas itself)
   → Menu/Panel/CaseBoard/Default: placed at headPos + forward ONCE on first visibility
-  → Tooltip: repositioned every frame
+  → Tooltip (no CM): repositioned every frame
 ```
+
+---
+
+## ContextMenus Canvas Hierarchy
+
+```
+TooltipCanvas (CanvasCategory.Tooltip, RepositionEveryFrame=true)
+  └── ContextMenus (nested, CanvasCategory.Ignored, no Canvas component of its own)
+      ├── ContextMenu(Clone)     ← actual right-click menu; game sets pos to screen coords,
+      │   └── Border → items…     localRot Y≈284°, localScale.z=0 EVERY frame
+      └── PinnedQuickMenu(Clone) ← hover tooltip; do NOT treat as context menu
+```
+
+Key points:
+- `ContextMenus` has NO Canvas component — `GetComponent<Canvas>()` returns null
+- When `ContextMenu(Clone)` is active, we freeze TooltipCanvas world position
+- We zero `ContextMenus` and first active child `localPosition/Rotation/Scale` in 3 places per frame to fight game's screen-coord reset
+- `_prevContextMenuActive` filters only children whose name starts with `"ContextMenu"` (not `"PinnedQuickMenu"`)
+- TooltipCanvas is NOT skipped in aim dot scan when `_prevContextMenuActive` is true (it's frozen, plane is valid)
 
 ---
 
 ## Save/Load Rediscovery Flow (same-scene reload)
 
 ```
-User clicks "Continue" (or any name containing "continue"/"new game"/"new city")
+User clicks "Continue" (or name containing "continue"/"new game"/"new city")
   → TryClickCanvas walks hierarchy to find button name (raycaster hits child GOs)
   → Sets: _sceneLoadGrace=180, _playerCC=null, _playerRb=null,
           _pauseMovementActive=false, _hasBeenGrounded=false, _jumpVerticalVelocity=0
@@ -186,8 +239,10 @@ Use `HDAdditionalCameraData.flipYMode = ForceFlipY` — never combine `GL.invert
 | `CanvasScaler` + WorldSpace | Disable CanvasScaler BEFORE switching to WorldSpace |
 | `Mobile/Particles/Additive` in HDRP WorldSpace | Does not render — replace shader with UI/Default |
 | **GraphicRaycaster hits child GOs** | Click detection: raycaster returns innermost child hit — always walk hierarchy to find button/feature name |
-| **Same-scene reload: cullingMask=0** | After same-scene save load, game camera cullingMask stays 0 (we suppressed it) — per-frame discovery gate must bypass cullingMask check when menu is gone |
+| **Same-scene reload: cullingMask=0** | After same-scene save load, game camera cullingMask stays 0 — per-frame discovery gate must bypass cullingMask check when menu is gone |
 | **ActionPanelCanvas is grip anchor** | Do not add to grip-drag candidates — self-referential offset causes infinite deferral deadlock on reopen |
+| **anchoredPosition vs localPosition** | `InverseTransformPoint` returns pivot-relative = **localPosition** space. Do NOT compare against `anchoredPosition` (anchor-relative, different coordinate system) |
+| **ContextMenus has no Canvas component** | `ContextMenus` child of TooltipCanvas does NOT have its own Canvas component — `GetComponent<Canvas>()` returns null. Can only interact via TooltipCanvas. |
 
 ---
 
@@ -212,6 +267,8 @@ FMODUnity.RuntimeManager.GetVCA("vca:/Soundtrack").setVolume(vol);   // per-chan
 | `VRMod/SoDVR/Plugin.cs` | BepInEx entry point — do not change |
 | `BepInEx/plugins/SoDVR.dll` | Deployed plugin (flat layout — never subdirectory) |
 | `BepInEx/LogOutput.log` | Runtime log |
+| `VRMod/NotesWork.md` | Parked investigation notes — context menu, pin, WindowCanvas issues |
+| `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md` | HUD settings plan (ready to implement) |
 
 ---
 
@@ -225,5 +282,6 @@ FMODUnity.RuntimeManager.GetVCA("vca:/Soundtrack").setVolume(vol);   // per-chan
 - [x] Phase 10: World graphics — walls/floors visible, lighting correct (`546a4b5`)
 - [x] Phase 11: Movement — all controls bound, held items + arm display (`255dafc`)
 - [x] Phase 12: Case board pin drag, context menu world-lock (`1ee8e9d`)
-- [x] **Phase 13**: Save-load warp eliminated, ActionPanelCanvas grip-drag deadlock fixed (`d0bd328`)
-- [ ] **Phase 14 (next)**: Comfort options (vignette, snap-turn config, IPD) + remaining polish
+- [x] Phase 13: Save-load warp eliminated, ActionPanelCanvas grip-drag deadlock fixed (`d0bd328`)
+- [ ] **Phase 14 (in progress)**: A/B button canvas mapping done; HUD settings + auto-hide plan ready; case board interaction issues parked
+- [ ] **Phase 15 (next)**: Comfort options (vignette, snap-turn config, IPD) + remaining polish

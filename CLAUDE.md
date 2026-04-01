@@ -290,6 +290,35 @@ When the player loads a save from the main menu (same Unity scene reused):
 - ActionPanelCanvas excluded from grip-draggable canvas set ✓
 - Save-load warp eliminated ✓
 
+## Phase 14 status (IN PROGRESS — 2026-04-01)
+Partial work done:
+- A button → right-click on any aimed canvas (not just case board) ✓
+- B button → middle-click drag on any aimed canvas ✓
+- Jump/notebook suppressed when aiming at canvas ✓
+- `_cursorTargetCanvas` field tracks nearest aimed-at canvas ✓
+- HUD settings plan written (plan file at `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`) — NOT YET IMPLEMENTED
+
+### PARKED issues (see NotesWork.md for full analysis)
+Three case board interaction issues were investigated but not resolved:
+1. **Context menu aim dot / visual misalignment** — game sets `ContextMenu(Clone).localPosition` to screen coords AND `localScale.z=0` AND non-identity localRotation every frame. Our zeroing may not win the race, and z=0 scale may break rendering. See NotesWork.md § Problem 1.
+2. **Opened pinned notes (WindowCanvas) misalignment** — aim dot doesn't match visual. Not yet diagnosed. See NotesWork.md § Problem 2.
+3. **Pin proximity stealing** — when 2+ pins present, wrong pin targeted. Fixed coordinate space (anchoredPosition → localPosition), but issue persists — hitLocal from InverseTransformPoint may drift after context menu freeze/unfreeze. See NotesWork.md § Problem 3.
+
+## CRITICAL: ContextMenus child transform — game writes every frame (discovered 2026-04-01)
+```
+CM diag: child 'ContextMenu(Clone)'
+  localPos=(-960.00, 540.00, 0.00)   ← screen coords (1920×1080 / 2)
+  localRot=(0.00, 284.11, 0.00)      ← non-zero Y rotation set by game
+  localScale=(1.00, 1.00, 0.00)      ← Z scale = ZERO set by game
+```
+The game overwrites ContextMenu(Clone) position/rotation/scale every frame. Our zeroing is in 3 locations (Update enforce, PositionCanvases LateUpdate, ForceItemPositionPreRender). The timing race and Z-scale=0 may be causing residual misalignment. Future fix: reparent ContextMenu(Clone) away from game control, or intercept the game's positioning MonoBehaviour.
+
+## CRITICAL: PinnedQuickMenu vs ContextMenu(Clone) in ContextMenus
+The `ContextMenus` container under `TooltipCanvas` has two types of children:
+- `ContextMenu(Clone)` — actual right-click context menu (should trigger freeze/aim lock)
+- `PinnedQuickMenu(Clone)` — hover tooltip (should NOT trigger freeze)
+Filter by `childName.StartsWith("ContextMenu")` to distinguish them (implemented 2026-04-01).
+
 ## History
 - git `1be2b0e` — full VDXR-internal patching approach (archived checkpoint, do not rebase)
 - git `346a6df` — **Phase 5 complete**: standard loader working, stereo image in headset
@@ -301,3 +330,4 @@ When the player loads a save from the main menu (same Unity scene reused):
 - **Phase 11 complete** (2026-03-30): Movement — all controls bound, held item + arm tracking, VR arm display (`255dafc`)
 - **Phase 12 complete** (2026-03-30): Case board pin drag, context menu world-lock (`1ee8e9d`)
 - **Phase 13 complete** (2026-03-30): Save-load warp fix, ActionPanelCanvas grip-drag deadlock fix (`d0bd328`)
+- **Phase 14 in progress** (2026-04-01): A/B button canvas clicks, HUD settings plan written, case board interaction issues parked in NotesWork.md (`79fc4dd` + uncommitted VRCamera.cs changes)

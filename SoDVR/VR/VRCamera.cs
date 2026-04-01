@@ -330,6 +330,7 @@ public class VRCamera : MonoBehaviour
     private Vector2        _cursorCanvasHalfSize; // half-size in canvas pixels; cached lazily
     private float          _cursorAimDepth = UIDistance - 0.01f; // head-fwd depth of nearest aimed-at canvas (for tooltips)
     private bool           _cursorHasTarget;      // true when depth scan found a canvas rect hit this frame
+    private Canvas?        _cursorTargetCanvas;   // the nearest aimed-at canvas (for button mapping: A=RMB, B=MMB)
     private Vector3        _cursorTargetPos;      // world pos of nearest aimed-at canvas
     private Quaternion     _cursorTargetRot;      // world rot of nearest aimed-at canvas
     private Canvas?        _menuCanvasRef;       // MenuCanvas — hidden while VR settings panel is open
@@ -3264,7 +3265,13 @@ public class VRCamera : MonoBehaviour
                     var cmTr = canvas.transform.Find("ContextMenus");
                     if (cmTr != null && cmTr.gameObject.activeSelf)
                         for (int ci = 0; ci < cmTr.childCount; ci++)
-                            if (cmTr.GetChild(ci).gameObject.activeSelf) { contextMenuFrozen = true; break; }
+                        {
+                            var cmChild = cmTr.GetChild(ci);
+                            if (!cmChild.gameObject.activeSelf) continue;
+                            // Only freeze for actual context menus, NOT PinnedQuickMenu hover tooltips
+                            string childName = cmChild.gameObject.name ?? "";
+                            if (childName.StartsWith("ContextMenu")) { contextMenuFrozen = true; break; }
+                        }
                 }
                 catch { }
                 if (contextMenuFrozen)
@@ -3305,14 +3312,20 @@ public class VRCamera : MonoBehaviour
                         Log.LogInfo($"[VRCamera] Context menu freeze: dist={cmDist:F2} freezePos={_contextMenuFreezePos} freezeRot={_contextMenuFreezeRot.eulerAngles}");
                     }
 
-                    // The game repositions context menu children at SCREEN COORDINATES every
-                    // frame.  In WorldSpace, this offset is 0.5-0.6m from canvas center.
-                    // Fix: zero the child's localPosition EVERY frame (not just the first).
+                    // The game repositions ContextMenus AND its children at SCREEN COORDINATES
+                    // every frame.  In WorldSpace, this offset is 0.5-0.6m from canvas center.
+                    // Fix: zero localPosition ONLY (not anchoredPosition — setting anchoredPosition
+                    // after localPosition overrides it based on anchor config, causing position drift).
+                    // localPosition = zero puts the child's pivot at the parent's pivot regardless of anchors.
                     try
                     {
                         var cmTr2 = canvas.transform.Find("ContextMenus");
                         if (cmTr2 != null)
                         {
+                            cmTr2.localPosition = Vector3.zero;
+                            cmTr2.localRotation = Quaternion.identity;
+                            cmTr2.localScale    = Vector3.one;
+
                             for (int cci = 0; cci < cmTr2.childCount; cci++)
                             {
                                 var child = cmTr2.GetChild(cci);
@@ -3320,9 +3333,7 @@ public class VRCamera : MonoBehaviour
                                 child.localPosition = Vector3.zero;
                                 child.localRotation = Quaternion.identity;
                                 child.localScale = Vector3.one;
-                                var childRT = child.GetComponent<RectTransform>();
-                                if (childRT != null) childRT.anchoredPosition = Vector2.zero;
-                                break; // only recentre the first active child
+                                break;
                             }
                         }
                     }
@@ -3707,7 +3718,8 @@ public class VRCamera : MonoBehaviour
                 kvpFz.Value.transform.position = vrPose.pos;
                 kvpFz.Value.transform.rotation = vrPose.rot;
             }
-            // Also zero context-menu children (game resets to screen coords every frame)
+            // Also zero ContextMenus + children (game resets to screen coords every frame).
+            // Only set localPosition — anchoredPosition would override based on anchor config.
             if (_contextMenuFreezeApplied)
             {
                 foreach (var kvpFz in _managedCanvases)
@@ -3719,6 +3731,9 @@ public class VRCamera : MonoBehaviour
                         var cmTrFz = kvpFz.Value.transform.Find("ContextMenus");
                         if (cmTrFz != null)
                         {
+                            cmTrFz.localPosition = Vector3.zero;
+                            cmTrFz.localRotation = Quaternion.identity;
+                            cmTrFz.localScale    = Vector3.one;
                             for (int fzi = 0; fzi < cmTrFz.childCount; fzi++)
                             {
                                 var fzChild = cmTrFz.GetChild(fzi);
@@ -3726,8 +3741,6 @@ public class VRCamera : MonoBehaviour
                                 fzChild.localPosition = Vector3.zero;
                                 fzChild.localRotation = Quaternion.identity;
                                 fzChild.localScale    = Vector3.one;
-                                var fzRT = fzChild.GetComponent<RectTransform>();
-                                if (fzRT != null) fzRT.anchoredPosition = Vector2.zero;
                                 break;
                             }
                         }
@@ -3763,11 +3776,15 @@ public class VRCamera : MonoBehaviour
                 if (c.gameObject.name?.IndexOf("VRCursor", StringComparison.OrdinalIgnoreCase) >= 0) continue;
                 if (GetCategoryDefaults(GetCanvasCategory(c.gameObject.name)).RepositionEveryFrame)
                 {
-                    bool dialogUp = (_popupMessageGO != null && _popupMessageGO.activeSelf)
-                                 || (_tutorialMessageGO != null && _tutorialMessageGO.activeSelf);
-                    // Also include Tooltip canvas in aim dot when a context menu is showing
-                    // so the player can aim at and click context menu items.
-                    if (!dialogUp && !_prevContextMenuActive) continue;
+                    // RepositionEveryFrame canvases (TooltipCanvas) are normally skip —
+                    // EXCEPT when context menu is active (frozen in place, plane is valid)
+                    // or when a dialog popup is showing.
+                    if (!_prevContextMenuActive)
+                    {
+                        bool dialogUp = (_popupMessageGO != null && _popupMessageGO.activeSelf)
+                                     || (_tutorialMessageGO != null && _tutorialMessageGO.activeSelf);
+                        if (!dialogUp) continue;
+                    }
                 }
                 if (GetCanvasCategory(c.gameObject.name) == CanvasCategory.HUD) continue;
                 if (_nestedCanvasIds.Contains(kvp.Key)) continue;
@@ -3784,41 +3801,10 @@ public class VRCamera : MonoBehaviour
                 var rt = c.GetComponent<RectTransform>();
                 if (rt != null)
                 {
-                    bool boundsPass = false;
-
-                    // When context menu is active on TooltipCanvas, the parent canvas is huge
-                    // (1280×720) but the visible child is small (~230×712). Use child bounds.
-                    if (_contextMenuFreezeApplied && GetCanvasCategory(c.gameObject.name) == CanvasCategory.Tooltip)
-                    {
-                        try
-                        {
-                            var cmTrB = c.transform.Find("ContextMenus");
-                            if (cmTrB != null)
-                            {
-                                for (int cbi = 0; cbi < cmTrB.childCount; cbi++)
-                                {
-                                    var cbChild = cmTrB.GetChild(cbi);
-                                    if (!cbChild.gameObject.activeSelf) continue;
-                                    var cbRT = cbChild.GetComponent<RectTransform>();
-                                    if (cbRT != null)
-                                    {
-                                        Vector3 childLocal = cbChild.InverseTransformPoint(worldHitPt);
-                                        Vector2 chs = cbRT.sizeDelta * 0.5f;
-                                        boundsPass = Mathf.Abs(childLocal.x) <= chs.x && Mathf.Abs(childLocal.y) <= chs.y;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        catch { }
-                    }
-                    else
-                    {
-                        // Standard centered-pivot bounds check (works reliably in IL2CPP)
-                        Vector2 hs = rt.sizeDelta * 0.5f;
-                        boundsPass = Mathf.Abs(lp.x) <= hs.x && Mathf.Abs(lp.y) <= hs.y;
-                    }
-
+                    // Standard centered-pivot bounds check (works reliably in IL2CPP).
+                    // Context menu bounds are handled by ContextMenus canvas directly (post-loop).
+                    Vector2 hs = rt.sizeDelta * 0.5f;
+                    bool boundsPass = Mathf.Abs(lp.x) <= hs.x && Mathf.Abs(lp.y) <= hs.y;
                     if (!boundsPass) continue;
                 }
 
@@ -3828,11 +3814,17 @@ public class VRCamera : MonoBehaviour
                 if (!foundHit || depth < bestDepth) { bestDepth = depth; bestCanvas = c; foundHit = true; }
             }
 
+            // NOTE: Context menu aim dot is now handled by the main loop above —
+            // TooltipCanvas is no longer skipped when _prevContextMenuActive is true.
+            // Since ContextMenus localPosition is zeroed (content at canvas center),
+            // the TooltipCanvas plane correctly matches the visual position.
+
             if (foundHit && bestCanvas != null)
             {
                 if (Time.frameCount % 120 == 0)
                     Log.LogInfo($"[VRCamera] AimDot primary → '{bestCanvas.gameObject.name}' depth={bestDepth:F2} totalHits={_aimDotHits.Count}");
                 _cursorHasTarget   = true;
+                _cursorTargetCanvas = bestCanvas;
                 _cursorTargetPos   = bestCanvas.transform.position;
                 _cursorTargetRot   = bestCanvas.transform.rotation;
                 _cursorAimDepth    = bestDepth - 0.01f;
@@ -3840,6 +3832,7 @@ public class VRCamera : MonoBehaviour
             else
             {
                 _cursorHasTarget = false;
+                _cursorTargetCanvas = null;
                 if (nearestPlane < float.MaxValue) _cursorAimDepth = nearestPlane - 0.01f;
             }
         }
@@ -4132,7 +4125,10 @@ public class VRCamera : MonoBehaviour
                                 }
                             }
                             if (_cbDirectDragPastDeadZone)
-                                _cbDirectDragRT.anchoredPosition = hitLocal + _cbDirectDragGrabOffset;
+                            {
+                                Vector2 newLocal = hitLocal + _cbDirectDragGrabOffset;
+                                _cbDirectDragRT.localPosition = new Vector3(newLocal.x, newLocal.y, _cbDirectDragRT.localPosition.z);
+                            }
                         }
                     }
                     catch (Exception ex) { Log.LogWarning($"[VRCamera] CB direct drag update: {ex.Message}"); }
@@ -4321,8 +4317,10 @@ public class VRCamera : MonoBehaviour
                                     if (pinTr == null || !pinTr.gameObject.activeSelf) continue;
                                     var pinRT = pinTr.GetComponent<RectTransform>();
                                     if (pinRT == null) continue;
-                                    // Compare in canvas units (anchoredPosition space)
-                                    float dist = Vector2.Distance(pinRT.anchoredPosition, hitLocal);
+                                    // Compare in local-space units (InverseTransformPoint returns
+                                    // pivot-relative coords; localPosition is in the same space)
+                                    Vector2 pinLocal = new Vector2(pinRT.localPosition.x, pinRT.localPosition.y);
+                                    float dist = Vector2.Distance(pinLocal, hitLocal);
                                     if (dist < bestDist)
                                     {
                                         bestDist = dist;
@@ -4343,13 +4341,14 @@ public class VRCamera : MonoBehaviour
                                     _cbMouseOnlyDrag = false;
                                     _cbDirectDragRT = bestPinRT;
                                     _cbDirectDragParentRT = parentRT;
-                                    _cbDirectDragGrabOffset = bestPinRT.anchoredPosition - hitLocal;
-                                    _cbDirectDragStartAnchored = bestPinRT.anchoredPosition;
+                                    Vector2 bestPinLocal = new Vector2(bestPinRT.localPosition.x, bestPinRT.localPosition.y);
+                                    _cbDirectDragGrabOffset = bestPinLocal - hitLocal;
+                                    _cbDirectDragStartAnchored = bestPinLocal;
                                     _cbDirectDragStartHitLocal = hitLocal;
                                     _cbDirectDragPastDeadZone = false;
                                     _cbDragGO = bestPinRT.gameObject;
                                     foundPin = true;
-                                    Log.LogInfo($"[VRCamera] CB pin found via Pinned scan: '{bestPinRT.gameObject.name}' canvasDist={bestDist:F0} anchored={bestPinRT.anchoredPosition} hitLocal=({hitLocal.x:F0},{hitLocal.y:F0})");
+                                    Log.LogInfo($"[VRCamera] CB pin found via Pinned scan: '{bestPinRT.gameObject.name}' canvasDist={bestDist:F0} localPos=({bestPinRT.localPosition.x:F0},{bestPinRT.localPosition.y:F0}) hitLocal=({hitLocal.x:F0},{hitLocal.y:F0})");
                                 }
                             }
                         }
@@ -4389,8 +4388,11 @@ public class VRCamera : MonoBehaviour
             }
         }
 
-        // ── Case board right-click: Right A → context menu (3-phase debounce) ──
-        if (cbOpen)
+        // ── Right A → right-click on any aimed canvas (case board, notes, etc.) ──
+        // When case board open: targets case board for CursorRigidbody positioning.
+        // When aiming at any other canvas: targets that canvas.
+        // When neither: A falls through to UpdateJump().
+        if (cbOpen || _cursorHasTarget)
         {
             if (Time.realtimeSinceStartup >= _cbACooldownUntil)
             {
@@ -4398,37 +4400,49 @@ public class VRCamera : MonoBehaviour
                 if (_cbANeedsRelease) { if (!aPressed) _cbANeedsRelease = false; }
                 else if (aPressed)
                 {
-                    // Position CursorRigidbody before right-click
-                    if (_cbCursorRbRT != null && _cbContentContainerRT != null && _casePanelCanvas != null)
+                    // Prefer aimed canvas; fall back to case board when aiming at nothing
+                    Canvas? rmbTarget = _cursorHasTarget ? _cursorTargetCanvas
+                                      : (cbOpen ? _casePanelCanvas : null);
+                    if (rmbTarget != null)
                     {
-                        try
+                        // Position CursorRigidbody when targeting case board
+                        bool targetIsCaseBoard = (rmbTarget == _casePanelCanvas);
+                        if (targetIsCaseBoard && _cbCursorRbRT != null && _cbContentContainerRT != null && _casePanelCanvas != null)
                         {
-                            var plane2 = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
-                            var ray2 = new Ray(rPos, rFwd);
-                            if (plane2.Raycast(ray2, out float d2) && d2 > 0f)
-                                PositionCursorRbAtWorldPoint(rPos + rFwd * d2);
+                            try
+                            {
+                                var plane2 = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+                                var ray2 = new Ray(rPos, rFwd);
+                                if (plane2.Raycast(ray2, out float d2) && d2 > 0f)
+                                    PositionCursorRbAtWorldPoint(rPos + rFwd * d2);
+                            }
+                            catch { }
                         }
-                        catch { }
+                        GetCaseBoardScreenPos(rPos, rFwd, rmbTarget, moveCursor: true);
+                        const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+                        const uint MOUSEEVENTF_RIGHTUP   = 0x0010;
+                        mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, UIntPtr.Zero);
+                        mouse_event(MOUSEEVENTF_RIGHTUP,   0, 0, 0, UIntPtr.Zero);
+                        _cbANeedsRelease = true;
+                        _cbACooldownUntil = Time.realtimeSinceStartup + 1.0f;
+                        if (targetIsCaseBoard) _cbCursorPauseUntil = Time.realtimeSinceStartup + 3.0f;
+                        Log.LogInfo($"[VRCamera] Right-click on '{rmbTarget.gameObject.name}' (mouse_event)");
                     }
-                    GetCaseBoardScreenPos(rPos, rFwd, _casePanelCanvas, moveCursor: true);
-                    const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
-                    const uint MOUSEEVENTF_RIGHTUP   = 0x0010;
-                    mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, UIntPtr.Zero);
-                    mouse_event(MOUSEEVENTF_RIGHTUP,   0, 0, 0, UIntPtr.Zero);
-                    _cbANeedsRelease = true;
-                    _cbACooldownUntil = Time.realtimeSinceStartup + 1.0f;
-                    // Pause continuous cursor tracking so the context menu stays visible
-                    _cbCursorPauseUntil = Time.realtimeSinceStartup + 3.0f;
-                    Log.LogInfo("[VRCamera] CB right-click (mouse_event)");
                 }
             }
         }
 
-        // ── Case board middle-click: Right B → create string (3-phase debounce + drag) ──
-        if (cbOpen)
+        // ── Right B → middle-click drag on any aimed canvas (case board strings, notes, etc.) ──
+        // Mid-drag stays active until B is released, even if aim target changes.
+        // When neither case board open nor aiming at canvas: B falls through to UpdateNotebook().
+        if (cbOpen || _cursorHasTarget || _cbMidDragActive)
         {
             const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
             const uint MOUSEEVENTF_MIDDLEUP   = 0x0040;
+
+            // Prefer aimed canvas; fall back to case board when aiming at nothing
+            Canvas? mmbTarget = _cursorHasTarget ? _cursorTargetCanvas
+                              : (cbOpen ? _casePanelCanvas : null);
 
             if (_cbMidDragActive)
             {
@@ -4436,20 +4450,22 @@ public class VRCamera : MonoBehaviour
                 OpenXRManager.GetButtonBState(out bool bNow);
                 if (!bNow)
                 {
-                    GetCaseBoardScreenPos(rPos, rFwd, _casePanelCanvas, moveCursor: true);
+                    if (mmbTarget != null)
+                        GetCaseBoardScreenPos(rPos, rFwd, mmbTarget, moveCursor: true);
                     mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
-                    Log.LogInfo("[VRCamera] CB mid-drag end (mouse_event)");
+                    Log.LogInfo($"[VRCamera] Mid-drag end on '{mmbTarget?.gameObject.name}' (mouse_event)");
                     _cbMidDragActive = false; _cbMidDragStarted = false;
                     _cbBNeedsRelease = true;
                     _cbBCooldownUntil = Time.realtimeSinceStartup + 0.3f;
                 }
                 else
                 {
-                    GetCaseBoardScreenPos(rPos, rFwd, _casePanelCanvas, moveCursor: true);
+                    if (mmbTarget != null)
+                        GetCaseBoardScreenPos(rPos, rFwd, mmbTarget, moveCursor: true);
                     if (!_cbMidDragStarted)
                     {
                         _cbMidDragStarted = true;
-                        Log.LogInfo("[VRCamera] CB mid-drag start (mouse_event)");
+                        Log.LogInfo($"[VRCamera] Mid-drag start on '{mmbTarget?.gameObject.name}' (mouse_event)");
                     }
                 }
             }
@@ -4457,22 +4473,21 @@ public class VRCamera : MonoBehaviour
             {
                 OpenXRManager.GetButtonBState(out bool bPressed);
                 if (_cbBNeedsRelease) { if (!bPressed) _cbBNeedsRelease = false; }
-                else if (bPressed)
+                else if (bPressed && mmbTarget != null)
                 {
-                    GetCaseBoardScreenPos(rPos, rFwd, _casePanelCanvas, moveCursor: true);
+                    GetCaseBoardScreenPos(rPos, rFwd, mmbTarget, moveCursor: true);
                     mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, UIntPtr.Zero);
                     _cbMidDragActive = true;
                     _cbMidDragStarted = false;
-                    Log.LogInfo("[VRCamera] CB mid-press (mouse_event)");
+                    Log.LogInfo($"[VRCamera] Mid-press on '{mmbTarget?.gameObject.name}' (mouse_event)");
                 }
             }
         }
         else
         {
-            // Case board closed — clean up any stale drag state
+            // No target — clean up any stale drag state
             if (_cbMidDragActive)
             {
-                // Release middle button if held
                 const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
                 mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
                 _cbMidDragActive = false; _cbMidDragStarted = false;
@@ -4528,7 +4543,13 @@ public class VRCamera : MonoBehaviour
                 var cmTr = kvpCtx.Value.transform.Find("ContextMenus");
                 if (cmTr != null && cmTr.gameObject.activeSelf)
                     for (int ci = 0; ci < cmTr.childCount; ci++)
-                        if (cmTr.GetChild(ci).gameObject.activeSelf) { contextMenuNowActive = true; break; }
+                    {
+                        var cmChild = cmTr.GetChild(ci);
+                        if (!cmChild.gameObject.activeSelf) continue;
+                        // Only treat actual context menus as active, NOT PinnedQuickMenu hover tooltips
+                        string childName = cmChild.gameObject.name ?? "";
+                        if (childName.StartsWith("ContextMenu")) { contextMenuNowActive = true; break; }
+                    }
             }
             catch { }
             if (contextMenuNowActive) break;
@@ -4942,8 +4963,8 @@ public class VRCamera : MonoBehaviour
             Log.LogInfo($"[VRCamera] JumpDiag: A={aStateNow} grounded={_playerCC.isGrounded} cbOpen={cbOpenJ} vrSettings={vrSettingsOpen} needsRelease={_jumpBtnNeedsRelease} cooldown={_jumpCooldownUntil:F1} now={now:F1}");
         }
 
-        if (vrSettingsOpen || cbOpenJ)
-            return; // gravity applied above; suppress jump input
+        if (vrSettingsOpen || cbOpenJ || _cursorHasTarget)
+            return; // gravity applied above; suppress jump/right-click handled by UpdateUIInput
 
         // Phase 1: time lockout — don't read button at all (prevents bounce corruption)
         if (now < _jumpCooldownUntil) return;
@@ -5106,8 +5127,9 @@ public class VRCamera : MonoBehaviour
 
         // Phase 3: fire on press.
         if (!pressed) return;
-        // When case board is open, Right B = middle-click (create string) — suppress Tab
+        // When case board is open or aiming at a canvas, Right B = middle-click — suppress Tab
         if (_actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf) return;
+        if (_cursorHasTarget) return; // B = middle-click on canvas; handled by UpdateUIInput
 
         _notebookBtnNeedsRelease = true;
         _notebookCooldownUntil = Time.realtimeSinceStartup + 1.0f;
@@ -5422,8 +5444,9 @@ public class VRCamera : MonoBehaviour
     /// <summary>Called right before each VR eye camera renders — last chance to position items + arms.</summary>
     private void ForceItemPositionPreRender()
     {
-        // Context menu: enforce child zeroing right before render.
-        // The game may reset child transforms between our LateUpdate and render.
+        // Context menu: enforce ContextMenus + child zeroing right before render.
+        // The game may reset transforms between our LateUpdate and render.
+        // Only set localPosition — anchoredPosition would override based on anchor config.
         if (_contextMenuFreezeApplied)
         {
             foreach (var kvpPR in _managedCanvases)
@@ -5437,6 +5460,9 @@ public class VRCamera : MonoBehaviour
                     var cmTrPR = kvpPR.Value.transform.Find("ContextMenus");
                     if (cmTrPR != null)
                     {
+                        cmTrPR.localPosition = Vector3.zero;
+                        cmTrPR.localRotation = Quaternion.identity;
+                        cmTrPR.localScale    = Vector3.one;
                         for (int pri = 0; pri < cmTrPR.childCount; pri++)
                         {
                             var prChild = cmTrPR.GetChild(pri);
@@ -5444,8 +5470,6 @@ public class VRCamera : MonoBehaviour
                             prChild.localPosition = Vector3.zero;
                             prChild.localRotation = Quaternion.identity;
                             prChild.localScale    = Vector3.one;
-                            var prRT = prChild.GetComponent<RectTransform>();
-                            if (prRT != null) prRT.anchoredPosition = Vector2.zero;
                             _contextMenuChildWorldPos = prChild.position;
                             break;
                         }
