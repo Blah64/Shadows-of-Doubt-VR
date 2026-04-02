@@ -94,6 +94,11 @@ public static class VRSettingsPanel
     public static float HudHorizOffset => _hudHorizValues[_hudHorizIdx];
     public static bool  HudLaggyFollow = false;
 
+    // Menu/window distance — 31 values: 0.5..3.5 m in 0.1 m increments. Default 1.8 m (index 13).
+    private static int _menuDistIdx = 13;
+    // Re-use the same value/label arrays as HUD distance (same range, same increments).
+    public static float MenuDistance => _hudDistValues[_menuDistIdx];
+
     // Turn mode: false = snap, true = smooth
     public static bool SmoothTurnEnabled = false;
 
@@ -148,8 +153,10 @@ public static class VRSettingsPanel
         _smoothSpeedIdx   = PlayerPrefs.GetInt("SoDVR.SmoothSpeedIdx",1);
         _moveSpeedIdx     = PlayerPrefs.GetInt("SoDVR.MoveSpeedIdx",  1);
         _sprintMultIdx    = PlayerPrefs.GetInt("SoDVR.SprintMultIdx", 1);
+        _menuDistIdx      = PlayerPrefs.GetInt("SoDVR.MenuDistIdx",   13);
         // Clamp indices in case the option count changes between versions
         _hudDistIdx     = Math.Max(0, Math.Min(_hudDistIdx,     _hudDistValues.Length - 1));
+        _menuDistIdx    = Math.Max(0, Math.Min(_menuDistIdx,    _hudDistValues.Length - 1));
         _hudSizeIdx     = Math.Max(0, Math.Min(_hudSizeIdx,     _hudSizeValues.Length - 1));
         _hudHeightIdx   = Math.Max(0, Math.Min(_hudHeightIdx,   _hudHeightValues.Length - 1));
         _hudHorizIdx    = Math.Max(0, Math.Min(_hudHorizIdx,    _hudHorizValues.Length - 1));
@@ -174,6 +181,7 @@ public static class VRSettingsPanel
         PlayerPrefs.SetInt("SoDVR.SmoothSpeedIdx", _smoothSpeedIdx);
         PlayerPrefs.SetInt("SoDVR.MoveSpeedIdx",   _moveSpeedIdx);
         PlayerPrefs.SetInt("SoDVR.SprintMultIdx",  _sprintMultIdx);
+        PlayerPrefs.SetInt("SoDVR.MenuDistIdx",    _menuDistIdx);
         PlayerPrefs.Save();
     }
 
@@ -668,6 +676,14 @@ public static class VRSettingsPanel
             AddToggleRow(vrContent, ref vy, "HUD Follow",
                 () => HudLaggyFollow,
                 v => { HudLaggyFollow = v; SaveVRSettings(); });
+
+            // ── Windows section header ────────────────────────────────────────
+            AddSectionHeader(vrContent, ref vy, "─── WINDOWS ───");
+
+            AddPrevNextRow(vrContent, ref vy, "Menu Distance",
+                _hudDistLabels,
+                () => _menuDistIdx,
+                v => { _menuDistIdx = v; SaveVRSettings(); });
 
             FinalizeContent(vrContent, vy);
 

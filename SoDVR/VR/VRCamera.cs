@@ -3557,7 +3557,7 @@ public class VRCamera : MonoBehaviour
                     if (!_dialogCanvasPlaced)
                     {
                         // First frame the dialog is active — snap to head position.
-                        float dialogDist = GetCategoryDefaults(CanvasCategory.Menu).Distance - 0.2f;
+                        float dialogDist = VRSettingsPanel.MenuDistance - 0.2f;
                         canvas.transform.position = headPos + forward * dialogDist + Vector3.up * catDefs.VerticalOffset;
                         canvas.transform.rotation = yawOnly;
                         _dialogCanvasPlaced = true;
@@ -3741,6 +3741,7 @@ public class VRCamera : MonoBehaviour
             if (!IsCanvasVisible(canvas) && cat != CanvasCategory.CaseBoard) continue;
 
             float dist = catDefs.Distance;
+            if (cat == CanvasCategory.Menu) dist = VRSettingsPanel.MenuDistance;
             float vOff = catDefs.VerticalOffset;
 
             // PopupMessage/TutorialMessage: now nested under TooltipCanvas, handled in dialog mode above.
