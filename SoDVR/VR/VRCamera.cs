@@ -298,7 +298,6 @@ public class VRCamera : MonoBehaviour
     private int     _gameCamDisableDelay;  // frames remaining before disable
 
     // ── Snap turn ─────────────────────────────────────────────────────────────
-    private const float SnapTurnAngle    = 30f;   // degrees per snap
     private const float SnapTurnDeadZone = 0.6f;  // stick threshold to trigger
     private const float SnapTurnRearm    = 0.3f;  // stick must drop below this to re-arm
     private const float SnapTurnCooldown = 0.25f; // seconds between snaps
@@ -317,8 +316,6 @@ public class VRCamera : MonoBehaviour
     private Transform? _lagPivotOrigParent;                 // original parent (3DUI) for restore
     private InteractionController? _interactionController;  // cached for carried-object tracking
     private const float MoveDeadZone = 0.15f;
-    private const float MoveSpeed       = 4.0f;   // m/s at full deflection
-    private const float SprintMultiplier = 1.8f;  // sprint speed = MoveSpeed * this
     // Cursor: ScreenSpaceOverlay canvas "VRCursorCanvasInternal" created at rig-build time.
     // ScanAndConvertCanvases converts it to WorldSpace via the normal pipeline — giving it proper
     // HDRP registration and the ZTest Always material patch from RescanCanvasAlpha.
@@ -4688,18 +4685,30 @@ public class VRCamera : MonoBehaviour
     }
 
     /// <summary>
-    /// Rotates VROrigin around Y by ±SnapTurnAngle when right stick X crosses the dead-zone.
+    /// Rotates VROrigin around Y via snap or smooth turning (configurable in VR Settings).
     /// Skipped while the VR settings panel is open (right stick Y is used for scrolling there).
     /// </summary>
     private void UpdateSnapTurn()
     {
         _snapCooldown -= Time.deltaTime;
 
-        // Don't snap while settings panel is open (right stick scrolls it instead)
+        // Don't turn while settings panel is open (right stick scrolls it instead)
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
 
         if (!OpenXRManager.GetThumbstickState(true, out float tx, out float _)) return;
 
+        if (VRSettingsPanel.SmoothTurnEnabled)
+        {
+            // Smooth turn: rotate proportionally to stick deflection
+            if (Mathf.Abs(tx) > MoveDeadZone)
+            {
+                float speed = VRSettingsPanel.SmoothTurnSpeed * Time.deltaTime;
+                transform.Rotate(Vector3.up, tx * speed, Space.World);
+            }
+            return;
+        }
+
+        // Snap turn
         float absTx = Mathf.Abs(tx);
 
         // Re-arm when stick returns to centre
@@ -4711,7 +4720,7 @@ public class VRCamera : MonoBehaviour
 
         if (_snapArmed && absTx > SnapTurnDeadZone && _snapCooldown <= 0f)
         {
-            float angle = Mathf.Sign(tx) * SnapTurnAngle;
+            float angle = Mathf.Sign(tx) * VRSettingsPanel.SnapTurnAngle;
             transform.Rotate(Vector3.up, angle, Space.World);
             _snapCooldown = SnapTurnCooldown;
             _snapArmed    = false;
@@ -4773,8 +4782,10 @@ public class VRCamera : MonoBehaviour
         Vector3 fwd   = Quaternion.Euler(0f, headYaw, 0f) * Vector3.forward;
         Vector3 right = Quaternion.Euler(0f, headYaw, 0f) * Vector3.right;
         bool alwaysRun = PlayerPrefs.GetInt("alwaysRun", 0) != 0;
-        float baseSpeed  = alwaysRun ? MoveSpeed * SprintMultiplier : MoveSpeed;
-        float altSpeed   = alwaysRun ? MoveSpeed : MoveSpeed * SprintMultiplier;
+        float ms = VRSettingsPanel.MoveSpeed;
+        float sm = VRSettingsPanel.SprintMultiplier;
+        float baseSpeed  = alwaysRun ? ms * sm : ms;
+        float altSpeed   = alwaysRun ? ms : ms * sm;
         float speed = _sprintActive ? altSpeed : baseSpeed;
         Vector3 hMove = (fwd * dy + right * dx) * speed;
 

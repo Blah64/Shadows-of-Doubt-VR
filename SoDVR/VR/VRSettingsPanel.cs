@@ -40,15 +40,19 @@ public static class VRSettingsPanel
     private static RectTransform?  _audioContentRT;
     private static RectTransform?  _controlsContentRT;
     private static RectTransform?  _generalContentRT;
-    private static int             _activeTab = 0;  // 0=Graphics, 1=Audio, 2=Controls, 3=General
+    private static int             _activeTab = 0;  // 0=Graphics, 1=Audio, 2=Controls, 3=General, 4=VR
     private static CanvasGroup?    _graphicsGroup;
     private static CanvasGroup?    _audioGroup;
     private static CanvasGroup?    _controlsGroup;
     private static CanvasGroup?    _generalGroup;
+    private static RectTransform?  _vrPaneRT;
+    private static RectTransform?  _vrContentRT;
+    private static CanvasGroup?    _vrGroup;
     private static Image?          _graphicsTabImg;
     private static Image?          _audioTabImg;
     private static Image?          _controlsTabImg;
     private static Image?          _generalTabImg;
+    private static Image?          _vrTabImg;
 
     // Image colour refresh — called in Show() to re-apply toggle states and static colors.
     private static readonly List<(Image img, TextMeshProUGUI txt, Func<bool> getter)> _toggleRefs    = new();
@@ -90,6 +94,33 @@ public static class VRSettingsPanel
     public static float HudHorizOffset => _hudHorizValues[_hudHorizIdx];
     public static bool  HudLaggyFollow = false;
 
+    // Turn mode: false = snap, true = smooth
+    public static bool SmoothTurnEnabled = false;
+
+    // Snap turn angle
+    private static int _snapAngleIdx = 2; // default 30°
+    private static readonly float[]  _snapAngleValues = { 15f, 22.5f, 30f, 45f, 60f, 90f };
+    private static readonly string[] _snapAngleLabels = { "15°", "22.5°", "30°", "45°", "60°", "90°" };
+    public static float SnapTurnAngle => _snapAngleValues[_snapAngleIdx];
+
+    // Smooth turn speed (degrees/sec at full stick deflection)
+    private static int _smoothSpeedIdx = 1; // default 120°/s
+    private static readonly float[]  _smoothSpeedValues = { 60f, 120f, 180f, 240f };
+    private static readonly string[] _smoothSpeedLabels = { "Slow (60°/s)", "Normal (120°/s)", "Fast (180°/s)", "Very Fast (240°/s)" };
+    public static float SmoothTurnSpeed => _smoothSpeedValues[_smoothSpeedIdx];
+
+    // Movement speed
+    private static int _moveSpeedIdx = 1; // default 4.0 m/s
+    private static readonly float[]  _moveSpeedValues = { 2.0f, 4.0f, 6.0f, 8.0f };
+    private static readonly string[] _moveSpeedLabels = { "Slow (2 m/s)", "Normal (4 m/s)", "Fast (6 m/s)", "Very Fast (8 m/s)" };
+    public static float MoveSpeed => _moveSpeedValues[_moveSpeedIdx];
+
+    // Sprint multiplier
+    private static int _sprintMultIdx = 1; // default 1.8×
+    private static readonly float[]  _sprintMultValues = { 1.4f, 1.8f, 2.5f, 3.0f };
+    private static readonly string[] _sprintMultLabels = { "1.4×", "1.8×", "2.5×", "3.0×" };
+    public static float SprintMultiplier => _sprintMultValues[_sprintMultIdx];
+
     // GO instance-ID → action map — avoids IL2CPP AddListener 3× fire bug.
     // Populated in Init(); cleared at Init() start.  TryClickCanvas calls HandleClick().
     private static readonly Dictionary<int, Action> _clickMap = new();
@@ -101,30 +132,48 @@ public static class VRSettingsPanel
         return true;
     }
 
-    // ── HUD settings persistence ──────────────────────────────────────────────
+    // ── VR settings persistence ──────────────────────────────────────────────
 
-    private static void LoadHudSettings()
+    private static void LoadVRSettings()
     {
+        // HUD
         _hudDistIdx   = PlayerPrefs.GetInt("SoDVR.HudDistIdx",       20);
         _hudSizeIdx   = PlayerPrefs.GetInt("SoDVR.HudSizeIdx",        1);
         _hudHeightIdx = PlayerPrefs.GetInt("SoDVR.HudHeightIdx",      1);
         _hudHorizIdx  = PlayerPrefs.GetInt("SoDVR.HudHorizIdx",       2);
         HudLaggyFollow = PlayerPrefs.GetInt("SoDVR.HudLaggyFollow",   0) != 0;
+        // Turn / movement
+        SmoothTurnEnabled = PlayerPrefs.GetInt("SoDVR.SmoothTurn",    0) != 0;
+        _snapAngleIdx     = PlayerPrefs.GetInt("SoDVR.SnapAngleIdx",  2);
+        _smoothSpeedIdx   = PlayerPrefs.GetInt("SoDVR.SmoothSpeedIdx",1);
+        _moveSpeedIdx     = PlayerPrefs.GetInt("SoDVR.MoveSpeedIdx",  1);
+        _sprintMultIdx    = PlayerPrefs.GetInt("SoDVR.SprintMultIdx", 1);
         // Clamp indices in case the option count changes between versions
-        _hudDistIdx   = Math.Max(0, Math.Min(_hudDistIdx,   _hudDistValues.Length - 1));
-        _hudSizeIdx   = Math.Max(0, Math.Min(_hudSizeIdx,   _hudSizeValues.Length - 1));
-        _hudHeightIdx = Math.Max(0, Math.Min(_hudHeightIdx, _hudHeightValues.Length - 1));
-        _hudHorizIdx  = Math.Max(0, Math.Min(_hudHorizIdx,  _hudHorizValues.Length - 1));
-        Plugin.Log.LogInfo($"[VRSettings] HUD settings loaded: dist={HudDistance:F1}m size={HudSize:F2} vert={HudVertOffset:F2} horiz={HudHorizOffset:F2} follow={HudLaggyFollow}");
+        _hudDistIdx     = Math.Max(0, Math.Min(_hudDistIdx,     _hudDistValues.Length - 1));
+        _hudSizeIdx     = Math.Max(0, Math.Min(_hudSizeIdx,     _hudSizeValues.Length - 1));
+        _hudHeightIdx   = Math.Max(0, Math.Min(_hudHeightIdx,   _hudHeightValues.Length - 1));
+        _hudHorizIdx    = Math.Max(0, Math.Min(_hudHorizIdx,    _hudHorizValues.Length - 1));
+        _snapAngleIdx   = Math.Max(0, Math.Min(_snapAngleIdx,   _snapAngleValues.Length - 1));
+        _smoothSpeedIdx = Math.Max(0, Math.Min(_smoothSpeedIdx, _smoothSpeedValues.Length - 1));
+        _moveSpeedIdx   = Math.Max(0, Math.Min(_moveSpeedIdx,   _moveSpeedValues.Length - 1));
+        _sprintMultIdx  = Math.Max(0, Math.Min(_sprintMultIdx,  _sprintMultValues.Length - 1));
+        Plugin.Log.LogInfo($"[VRSettings] VR settings loaded: dist={HudDistance:F1}m size={HudSize:F2} turn={( SmoothTurnEnabled ? "smooth" : "snap" )} snapAngle={SnapTurnAngle}° moveSpeed={MoveSpeed:F1}");
     }
 
-    private static void SaveHudSettings()
+    private static void SaveVRSettings()
     {
+        // HUD
         PlayerPrefs.SetInt("SoDVR.HudDistIdx",     _hudDistIdx);
         PlayerPrefs.SetInt("SoDVR.HudSizeIdx",     _hudSizeIdx);
         PlayerPrefs.SetInt("SoDVR.HudHeightIdx",   _hudHeightIdx);
         PlayerPrefs.SetInt("SoDVR.HudHorizIdx",    _hudHorizIdx);
         PlayerPrefs.SetInt("SoDVR.HudLaggyFollow", HudLaggyFollow ? 1 : 0);
+        // Turn / movement
+        PlayerPrefs.SetInt("SoDVR.SmoothTurn",     SmoothTurnEnabled ? 1 : 0);
+        PlayerPrefs.SetInt("SoDVR.SnapAngleIdx",   _snapAngleIdx);
+        PlayerPrefs.SetInt("SoDVR.SmoothSpeedIdx", _smoothSpeedIdx);
+        PlayerPrefs.SetInt("SoDVR.MoveSpeedIdx",   _moveSpeedIdx);
+        PlayerPrefs.SetInt("SoDVR.SprintMultIdx",  _sprintMultIdx);
         PlayerPrefs.Save();
     }
 
@@ -136,7 +185,7 @@ public static class VRSettingsPanel
         _toggleRefs.Clear();
         _staticImgRefs.Clear();
         _clickMap.Clear();
-        LoadHudSettings();
+        LoadVRSettings();
         try
         {
             // ── Canvas ────────────────────────────────────────────────────────
@@ -196,19 +245,22 @@ public static class VRSettingsPanel
             tabRowRT.pivot = new Vector2(0.5f, 1f); tabRowRT.sizeDelta = new Vector2(0f, 56f);
             tabRowRT.anchoredPosition = new Vector2(0f, -70f);
 
-            // 4 tabs × 130px wide, ~10px gap → positions -210 / -70 / +70 / +210
-            MakeTabButton("GraphicsTab",  "Graphics",  tabRowGO.transform, new Vector2(-210f, 0f), true,
-                          out _graphicsTabImg,  out var graphicsBtn);
-            MakeTabButton("AudioTab",     "Audio",     tabRowGO.transform, new Vector2( -70f, 0f), false,
-                          out _audioTabImg,     out var audioBtn);
-            MakeTabButton("ControlsTab",  "Controls",  tabRowGO.transform, new Vector2(  70f, 0f), false,
-                          out _controlsTabImg,  out var controlsBtn);
-            MakeTabButton("GeneralTab",   "General",   tabRowGO.transform, new Vector2( 210f, 0f), false,
-                          out _generalTabImg,   out var generalBtn);
+            // 5 tabs × 105px wide, ~11px gap → positions -232 / -116 / 0 / +116 / +232
+            MakeTabButton("GraphicsTab",  "Graphics",  tabRowGO.transform, new Vector2(-232f, 0f), true,
+                          out _graphicsTabImg,  out var graphicsBtn, 105f);
+            MakeTabButton("AudioTab",     "Audio",     tabRowGO.transform, new Vector2(-116f, 0f), false,
+                          out _audioTabImg,     out var audioBtn, 105f);
+            MakeTabButton("ControlsTab",  "Controls",  tabRowGO.transform, new Vector2(   0f, 0f), false,
+                          out _controlsTabImg,  out var controlsBtn, 105f);
+            MakeTabButton("GeneralTab",   "General",   tabRowGO.transform, new Vector2( 116f, 0f), false,
+                          out _generalTabImg,   out var generalBtn, 105f);
+            MakeTabButton("VRTab",        "VR",        tabRowGO.transform, new Vector2( 232f, 0f), false,
+                          out _vrTabImg,        out var vrBtn, 105f);
             _clickMap[graphicsBtn.gameObject.GetInstanceID()] = ActivateGraphicsTab;
             _clickMap[audioBtn.gameObject.GetInstanceID()]    = ActivateAudioTab;
             _clickMap[controlsBtn.gameObject.GetInstanceID()] = ActivateControlsTab;
             _clickMap[generalBtn.gameObject.GetInstanceID()]  = ActivateGeneralTab;
+            _clickMap[vrBtn.gameObject.GetInstanceID()]       = ActivateVRTab;
 
             // ── Scrollable content panes (topOffset = -126 = below 70px title + 56px tabs) ──
             // No ScrollRect / RectMask2D — those corrupt HDRP stencil in WorldSpace canvas.
@@ -217,22 +269,27 @@ public static class VRSettingsPanel
             var (audioPaneGO,    audioContent)    = MakeScrollablePane("AudioPane",    root.transform, -126f);
             var (controlsPaneGO, controlsContent) = MakeScrollablePane("ControlsPane", root.transform, -126f);
             var (generalPaneGO,  generalContent)  = MakeScrollablePane("GeneralPane",  root.transform, -126f);
+            var (vrPaneGO,       vrContent)       = MakeScrollablePane("VRPane",       root.transform, -126f);
             _graphicsPaneRT    = graphicsPaneGO.GetComponent<RectTransform>();
             _audioPaneRT       = audioPaneGO.GetComponent<RectTransform>();
             _controlsPaneRT    = controlsPaneGO.GetComponent<RectTransform>();
             _generalPaneRT     = generalPaneGO.GetComponent<RectTransform>();
+            _vrPaneRT          = vrPaneGO.GetComponent<RectTransform>();
             _graphicsContentRT = graphicsContent;
             _audioContentRT    = audioContent;
             _controlsContentRT = controlsContent;
             _generalContentRT  = generalContent;
+            _vrContentRT       = vrContent;
             _graphicsGroup  = graphicsPaneGO.AddComponent<CanvasGroup>();
             _audioGroup     = audioPaneGO.AddComponent<CanvasGroup>();
             _controlsGroup  = controlsPaneGO.AddComponent<CanvasGroup>();
             _generalGroup   = generalPaneGO.AddComponent<CanvasGroup>();
+            _vrGroup        = vrPaneGO.AddComponent<CanvasGroup>();
             // Start with non-Graphics panes hidden — shift off-canvas via localPosition.
             SetPaneVisible(_audioPaneRT,    _audioGroup,    false);
             SetPaneVisible(_controlsPaneRT, _controlsGroup, false);
             SetPaneVisible(_generalPaneRT,  _generalGroup,  false);
+            SetPaneVisible(_vrPaneRT,       _vrGroup,       false);
 
             // ── Graphics tab rows ─────────────────────────────────────────────
             float gy = TOP_PAD;
@@ -460,14 +517,6 @@ public static class VRSettingsPanel
                 () => FloatToIdx(ReadFloat("virtualCursorSensitivity", 1f), vcVals),
                 v => SetPrefsFloat("virtualCursorSensitivity", vcVals[v]));
 
-            // ── VR-specific controls ──
-            AddToggleRow(controlsContent, ref cy, "Left Laser",
-                () => LeftLaserEnabled,
-                v => LeftLaserEnabled = v);
-            AddToggleRow(controlsContent, ref cy, "Item Hand: Right",
-                () => ItemHandRight,
-                v => ItemHandRight = v);
-
             FinalizeContent(controlsContent, cy);
 
             // ── General tab ───────────────────────────────────────────────────
@@ -548,48 +597,79 @@ public static class VRSettingsPanel
                 () => StrToIdx(PlayerPrefs.GetString("gameLength", "Normal"), lenLabels),
                 v => SetPrefsStr("gameLength", lenLabels[v]));
 
-            // ── HUD section header ────────────────────────────────────────────
-            try
-            {
-                var hdrGO = MakeGO("Row_HUDHeader", generalContent.transform);
-                var hdrRT = hdrGO.GetComponent<RectTransform>() ?? hdrGO.AddComponent<RectTransform>();
-                hdrRT.anchorMin = new Vector2(0f, 1f); hdrRT.anchorMax = new Vector2(1f, 1f);
-                hdrRT.pivot = new Vector2(0.5f, 1f);
-                hdrRT.sizeDelta = new Vector2(0f, ROW_H);
-                hdrRT.anchoredPosition = new Vector2(0f, -gy2);
-                var hdrLbl = hdrGO.AddComponent<TextMeshProUGUI>();
-                hdrLbl.text = "─── HUD ───";
-                hdrLbl.fontSize = 28; hdrLbl.color = new Color(0.6f, 0.9f, 1f, 1f);
-                hdrLbl.alignment = TextAlignmentOptions.Midline; hdrLbl.raycastTarget = false;
-                gy2 += ROW_STEP;
-            }
-            catch (Exception ex) { Log.LogWarning($"[VRSettings] HUD header row: {ex.Message}"); }
+            FinalizeContent(generalContent, gy2);
 
-            AddPrevNextRow(generalContent, ref gy2, "HUD Distance",
+            // ── VR tab ───────────────────────────────────────────────────────
+            float vy = TOP_PAD;
+
+            // ── Turning section header ────────────────────────────────────────
+            AddSectionHeader(vrContent, ref vy, "─── TURNING ───");
+
+            AddToggleRow(vrContent, ref vy, "Smooth Turn",
+                () => SmoothTurnEnabled,
+                v => { SmoothTurnEnabled = v; SaveVRSettings(); });
+
+            AddPrevNextRow(vrContent, ref vy, "Snap Angle",
+                _snapAngleLabels,
+                () => _snapAngleIdx,
+                v => { _snapAngleIdx = v; SaveVRSettings(); });
+
+            AddPrevNextRow(vrContent, ref vy, "Smooth Speed",
+                _smoothSpeedLabels,
+                () => _smoothSpeedIdx,
+                v => { _smoothSpeedIdx = v; SaveVRSettings(); });
+
+            // ── Movement section header ───────────────────────────────────────
+            AddSectionHeader(vrContent, ref vy, "─── MOVEMENT ───");
+
+            AddPrevNextRow(vrContent, ref vy, "Move Speed",
+                _moveSpeedLabels,
+                () => _moveSpeedIdx,
+                v => { _moveSpeedIdx = v; SaveVRSettings(); });
+
+            AddPrevNextRow(vrContent, ref vy, "Sprint Multi",
+                _sprintMultLabels,
+                () => _sprintMultIdx,
+                v => { _sprintMultIdx = v; SaveVRSettings(); });
+
+            // ── Controls section header ───────────────────────────────────────
+            AddSectionHeader(vrContent, ref vy, "─── CONTROLS ───");
+
+            AddToggleRow(vrContent, ref vy, "Left Laser",
+                () => LeftLaserEnabled,
+                v => LeftLaserEnabled = v);
+            AddToggleRow(vrContent, ref vy, "Item Hand: Right",
+                () => ItemHandRight,
+                v => ItemHandRight = v);
+
+            // ── HUD section header ────────────────────────────────────────────
+            AddSectionHeader(vrContent, ref vy, "─── HUD ───");
+
+            AddPrevNextRow(vrContent, ref vy, "HUD Distance",
                 _hudDistLabels,
                 () => _hudDistIdx,
-                v => { _hudDistIdx = v; SaveHudSettings(); });
+                v => { _hudDistIdx = v; SaveVRSettings(); });
 
-            AddPrevNextRow(generalContent, ref gy2, "HUD Size",
+            AddPrevNextRow(vrContent, ref vy, "HUD Size",
                 new[] { "Small", "Normal", "Large" },
                 () => _hudSizeIdx,
-                v => { _hudSizeIdx = v; SaveHudSettings(); });
+                v => { _hudSizeIdx = v; SaveVRSettings(); });
 
-            AddPrevNextRow(generalContent, ref gy2, "HUD Height",
+            AddPrevNextRow(vrContent, ref vy, "HUD Height",
                 new[] { "-0.3 m", "-0.15 m", "0.0 m", "+0.15 m", "+0.3 m" },
                 () => _hudHeightIdx,
-                v => { _hudHeightIdx = v; SaveHudSettings(); });
+                v => { _hudHeightIdx = v; SaveVRSettings(); });
 
-            AddPrevNextRow(generalContent, ref gy2, "HUD H.Offset",
+            AddPrevNextRow(vrContent, ref vy, "HUD H.Offset",
                 new[] { "-0.3 m", "-0.15 m", "Center", "+0.15 m", "+0.3 m" },
                 () => _hudHorizIdx,
-                v => { _hudHorizIdx = v; SaveHudSettings(); });
+                v => { _hudHorizIdx = v; SaveVRSettings(); });
 
-            AddToggleRow(generalContent, ref gy2, "HUD Follow",
+            AddToggleRow(vrContent, ref vy, "HUD Follow",
                 () => HudLaggyFollow,
-                v => { HudLaggyFollow = v; SaveHudSettings(); });
+                v => { HudLaggyFollow = v; SaveVRSettings(); });
 
-            FinalizeContent(generalContent, gy2);
+            FinalizeContent(vrContent, vy);
 
             // Start with Graphics tab active
             SetTabVisual(0);
@@ -660,14 +740,17 @@ public static class VRSettingsPanel
         _audioPaneRT     = null;
         _controlsPaneRT  = null;
         _generalPaneRT   = null;
+        _vrPaneRT        = null;
         _graphicsGroup   = null;
         _audioGroup      = null;
         _controlsGroup   = null;
         _generalGroup    = null;
+        _vrGroup         = null;
         _graphicsContentRT  = null;
         _audioContentRT     = null;
         _controlsContentRT  = null;
         _generalContentRT   = null;
+        _vrContentRT        = null;
         _activeTab = 0;
         _toggleRefs.Clear();
         _staticImgRefs.Clear();
@@ -682,6 +765,7 @@ public static class VRSettingsPanel
         SetPaneVisible(_audioPaneRT,     _audioGroup,     false);
         SetPaneVisible(_controlsPaneRT,  _controlsGroup,  false);
         SetPaneVisible(_generalPaneRT,   _generalGroup,   false);
+        SetPaneVisible(_vrPaneRT,        _vrGroup,        false);
         Log.LogInfo("[VRSettingsPanel] Graphics tab active.");
     }
 
@@ -692,6 +776,7 @@ public static class VRSettingsPanel
         SetPaneVisible(_audioPaneRT,     _audioGroup,     true);
         SetPaneVisible(_controlsPaneRT,  _controlsGroup,  false);
         SetPaneVisible(_generalPaneRT,   _generalGroup,   false);
+        SetPaneVisible(_vrPaneRT,        _vrGroup,        false);
         Log.LogInfo("[VRSettingsPanel] Audio tab active.");
     }
 
@@ -702,6 +787,7 @@ public static class VRSettingsPanel
         SetPaneVisible(_audioPaneRT,     _audioGroup,     false);
         SetPaneVisible(_controlsPaneRT,  _controlsGroup,  true);
         SetPaneVisible(_generalPaneRT,   _generalGroup,   false);
+        SetPaneVisible(_vrPaneRT,        _vrGroup,        false);
         Log.LogInfo("[VRSettingsPanel] Controls tab active.");
     }
 
@@ -712,7 +798,19 @@ public static class VRSettingsPanel
         SetPaneVisible(_audioPaneRT,     _audioGroup,     false);
         SetPaneVisible(_controlsPaneRT,  _controlsGroup,  false);
         SetPaneVisible(_generalPaneRT,   _generalGroup,   true);
+        SetPaneVisible(_vrPaneRT,        _vrGroup,        false);
         Log.LogInfo("[VRSettingsPanel] General tab active.");
+    }
+
+    private static void ActivateVRTab()
+    {
+        _activeTab = 4; SetTabVisual(4);
+        SetPaneVisible(_graphicsPaneRT,  _graphicsGroup,  false);
+        SetPaneVisible(_audioPaneRT,     _audioGroup,     false);
+        SetPaneVisible(_controlsPaneRT,  _controlsGroup,  false);
+        SetPaneVisible(_generalPaneRT,   _generalGroup,   false);
+        SetPaneVisible(_vrPaneRT,        _vrGroup,        true);
+        Log.LogInfo("[VRSettingsPanel] VR tab active.");
     }
 
     // Hides/shows a pane by shifting it off-canvas (localPosition.x = 9999 when hidden).
@@ -735,6 +833,7 @@ public static class VRSettingsPanel
         if (_audioTabImg     != null) _audioTabImg.color     = activeTab == 1 ? ColTabActive : ColTabInactive;
         if (_controlsTabImg  != null) _controlsTabImg.color  = activeTab == 2 ? ColTabActive : ColTabInactive;
         if (_generalTabImg   != null) _generalTabImg.color   = activeTab == 3 ? ColTabActive : ColTabInactive;
+        if (_vrTabImg        != null) _vrTabImg.color        = activeTab == 4 ? ColTabActive : ColTabInactive;
     }
 
     /// <summary>
@@ -747,7 +846,8 @@ public static class VRSettingsPanel
         var content = _activeTab == 0 ? _graphicsContentRT
                     : _activeTab == 1 ? _audioContentRT
                     : _activeTab == 2 ? _controlsContentRT
-                    :                   _generalContentRT;
+                    : _activeTab == 3 ? _generalContentRT
+                    :                   _vrContentRT;
         if (content == null) return;
         // Viewport height = pane height (content rect minus its top-offset).
         // We approximate viewport as 400px (matches pane sizeDelta.y set in MakeScrollablePane).
@@ -835,6 +935,21 @@ public static class VRSettingsPanel
     }
 
     // ── Row builders ──────────────────────────────────────────────────────────
+
+    private static void AddSectionHeader(RectTransform content, ref float yTop, string text)
+    {
+        var hdrGO = MakeGO("Row_Hdr_" + text, content.transform);
+        var hdrRT = hdrGO.GetComponent<RectTransform>() ?? hdrGO.AddComponent<RectTransform>();
+        hdrRT.anchorMin = new Vector2(0f, 1f); hdrRT.anchorMax = new Vector2(1f, 1f);
+        hdrRT.pivot = new Vector2(0.5f, 1f);
+        hdrRT.sizeDelta = new Vector2(0f, ROW_H);
+        hdrRT.anchoredPosition = new Vector2(0f, -yTop);
+        var hdrLbl = hdrGO.AddComponent<TextMeshProUGUI>();
+        hdrLbl.text = text;
+        hdrLbl.fontSize = 28; hdrLbl.color = new Color(0.6f, 0.9f, 1f, 1f);
+        hdrLbl.alignment = TextAlignmentOptions.Midline; hdrLbl.raycastTarget = false;
+        yTop += ROW_STEP;
+    }
 
     private static void AddToggleRow(
         RectTransform content, ref float yTop,
@@ -1015,13 +1130,13 @@ public static class VRSettingsPanel
     private static void MakeTabButton(
         string name, string label, Transform parent,
         Vector2 pos, bool startActive,
-        out Image bgImg, out Button button)
+        out Image bgImg, out Button button, float width = 130f)
     {
         var go  = MakeGO(name, parent);
         var img = go.AddComponent<Image>();
         var rt  = go.GetComponent<RectTransform>();
         rt.anchorMin = new Vector2(0.5f, 0.5f); rt.anchorMax = new Vector2(0.5f, 0.5f);
-        rt.sizeDelta = new Vector2(130f, 50f); rt.anchoredPosition = pos;
+        rt.sizeDelta = new Vector2(width, 50f); rt.anchoredPosition = pos;
         img.color = startActive ? ColTabActive : ColTabInactive;
         button = go.AddComponent<Button>();
         bgImg  = img;
@@ -1029,7 +1144,7 @@ public static class VRSettingsPanel
         var lblRT   = lblGO.AddComponent<RectTransform>();
         lblRT.anchorMin = Vector2.zero; lblRT.anchorMax = Vector2.one; lblRT.sizeDelta = Vector2.zero;
         var txt = lblGO.AddComponent<TextMeshProUGUI>();
-        txt.text = label; txt.fontSize = 30; txt.color = Color.white;
+        txt.text = label; txt.fontSize = 26; txt.color = Color.white;
         txt.alignment = TextAlignmentOptions.Center; txt.raycastTarget = false;
     }
 
