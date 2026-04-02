@@ -919,8 +919,18 @@ public class VRCamera : MonoBehaviour
         if (_displayTime == 0) _displayTime = 1;
 
         int beginRc = OpenXRManager.FrameBeginPublic();
+        if (beginRc < 0)
+        {
+            // Error from xrBeginFrame — do NOT proceed to render or CopyResource.
+            // Pushing a CopyResource call after a failed xrBeginFrame can cause
+            // nvwgf2umx.dll ACCESS_VIOLATION (swapchain in undefined state).
+            Log.LogWarning($"[VRCamera] xrBeginFrame rc={beginRc} — skipping frame");
+            _frameOpen  = false;
+            _posesValid = false;
+            return;
+        }
         if (beginRc != 0 && (_frameCount < 5 || (_frameCount % 300) == 0))
-            Log.LogWarning($"[VRCamera] xrBeginFrame rc={beginRc}");
+            Log.LogWarning($"[VRCamera] xrBeginFrame rc={beginRc} (non-fatal)");
         _frameOpen = true;
 
         if (OpenXRManager.LocateViews(_displayTime, out _leftEye, out _rightEye))
@@ -1676,12 +1686,31 @@ public class VRCamera : MonoBehaviour
 
         if (imageIndex < (uint)images.Length)
         {
-            IntPtr src = rt.GetNativeTexturePtr();
-            IntPtr dst = images[imageIndex];
-            if (_frameCount <= 3)
-                Log.LogInfo($"[VRCamera] {eye} copy: src=0x{src:X} dst=0x{dst:X} rtCreated={rt.IsCreated()}");
-            if (src != IntPtr.Zero && dst != IntPtr.Zero)
-                OpenXRManager.D3D11CopyTexture(src, dst);
+            // Guard: GetNativeTexturePtr() on a destroyed/uncreated RT returns a
+            // stale pointer. Passing it to D3D11 CopyResource crashes nvwgf2umx.dll
+            // with ACCESS_VIOLATION. Recreate if needed before touching the pointer.
+            if (!rt.IsCreated())
+            {
+                Log.LogWarning($"[VRCamera] {eye} RT not created — attempting recreate");
+                try { rt.Create(); }
+                catch (Exception ex) { Log.LogWarning($"[VRCamera] {eye} RT recreate failed: {ex.Message}"); }
+            }
+
+            if (!rt.IsCreated())
+            {
+                Log.LogWarning($"[VRCamera] {eye} RT still not created — skipping CopyResource");
+            }
+            else
+            {
+                IntPtr src = rt.GetNativeTexturePtr();
+                IntPtr dst = images[imageIndex];
+                if (_frameCount <= 3)
+                    Log.LogInfo($"[VRCamera] {eye} copy: src=0x{src:X} dst=0x{dst:X}");
+                if (src != IntPtr.Zero && dst != IntPtr.Zero)
+                    OpenXRManager.D3D11CopyTexture(src, dst);
+                else
+                    Log.LogWarning($"[VRCamera] {eye} copy skipped — null ptr src=0x{src:X} dst=0x{dst:X}");
+            }
         }
 
         OpenXRManager.ReleaseSwapchainImage(sc);
