@@ -5296,10 +5296,18 @@ public class VRCamera : MonoBehaviour
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
         OpenXRManager.GetTriggerState(false, out bool pressed);
 
-        // Camera.main rotation is now always redirected to the controller in
-        // UpdateLeftInteractMarker — no per-trigger override needed here.
-        if (pressed) _interactAiming = true;
-        else if (_interactAiming && !pressed) _interactAiming = false;
+        // While trigger is held, point game camera at left controller aim direction.
+        // The game's InteractionController raycasts from Camera.main each frame.
+        // NOTE: Only override ROTATION, not position (position yanks FPSController hierarchy).
+        if (pressed && _gameCamRef != null && _leftControllerGO != null)
+        {
+            _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation;
+            _interactAiming = true;
+        }
+        else if (_interactAiming && !pressed)
+        {
+            _interactAiming = false;
+        }
 
         bool edge = pressed && !_interactBtnPrev;
         _interactBtnPrev = pressed;
@@ -5335,14 +5343,6 @@ public class VRCamera : MonoBehaviour
 
         try
         {
-            // Always redirect Camera.main rotation to the left controller direction.
-            // The game's InteractionRaycastCheck reads Camera.main.rotation — by keeping
-            // it pointed at the controller aim every frame, currentInteractions reflects
-            // what the HAND is pointing at (with up to 1-frame lag due to Update ordering).
-            // Position is NOT overridden — that would yank the FPSController hierarchy.
-            if (_gameCamRef != null)
-                _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation;
-
             // Ray origin: use Camera.main position (head/eye level) because the game's
             // InteractionController fires from cam.transform.position. We only override
             // Camera.main's ROTATION to match the controller (not position — that yanks
@@ -5644,21 +5644,6 @@ public class VRCamera : MonoBehaviour
                 catch { }
             }
 
-            // Also force all child Image alphas to 1
-            try
-            {
-                var imgs = child.GetComponentsInChildren<Image>();
-                if (imgs != null)
-                {
-                    foreach (var img in imgs)
-                    {
-                        if (img == null) continue;
-                        var c = img.color;
-                        if (c.a < 0.9f) { c.a = 1f; img.color = c; }
-                    }
-                }
-            }
-            catch { }
 
             if ((_poseFrameCount % 180) == 0)
                 Log.LogInfo($"[UIPtr] override vp=({vp.x:F2},{vp.y:F2}) onScreen={onScreen} -> local=({localX:F1},{localY:F1}) upc.alpha={upc.alpha:F2} cg={(cg != null ? $"found alpha_before={cgAlphaBefore:F2}" : "null")}");
