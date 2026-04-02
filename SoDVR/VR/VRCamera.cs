@@ -297,6 +297,14 @@ public class VRCamera : MonoBehaviour
     private InterfaceController? _interfaceCtrl;
     private RectTransform?       _firstPersonUI;  // = GameWorldDisplay, sd=100x100
 
+    // ── Awareness compass VR override ────────────────────────────────
+    private Transform? _compassContainer;          // InterfaceController.compassContainer
+    private bool       _compassDiagDone;
+    // Compass placement in front of VR head (tuned after diagnostic run).
+    // Forward = metres in front of head; YOffset = metres below eye level.
+    private const float CompassDist    = 1.2f;
+    private const float CompassYOffset = -0.55f;
+
     // ── HUD diagnostics ──────────────────────────────────────────────
     private bool _hudDiagDone;
 
@@ -1639,6 +1647,9 @@ public class VRCamera : MonoBehaviour
                 // UIPointerController positions run in Update; we override AFTER all Updates
                 // complete (LateUpdate) so our write wins over the game's garbage projection.
                 UpdateUIPointers();
+
+                // Awareness compass: reposition and reorient for VR head view.
+                UpdateCompass();
 
                 // No GL.invertCulling — HDRP flipYMode handles both Y-flip and culling.
                 _rightCam.Render();
@@ -5676,6 +5687,99 @@ public class VRCamera : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Repositions and reorients the awareness compass (ring + arrows) for VR viewing.
+    ///
+    /// In flat-screen mode the <c>compassContainer</c> is a child of the game camera and
+    /// appears at centre-bottom of the screen.  In VR the game camera is suppressed
+    /// (cullingMask=0) and rotated to the left controller — so the compass ends up at a
+    /// random world position relative to the VR eye cameras.
+    ///
+    /// Fix: each LateUpdate (after InterfaceController.Update has written its orientations),
+    /// we move compassContainer to a fixed local-to-VR-head position and fix all rotations
+    /// so the ring and icons face the VR eye camera.
+    /// </summary>
+    private void UpdateCompass()
+    {
+        if (_compassContainer == null || _interfaceCtrl == null || _leftCam == null) return;
+
+        // ── Diagnostic: log compass hierarchy on first call ──────────────────
+        if (!_compassDiagDone)
+        {
+            _compassDiagDone = true;
+            try
+            {
+                Transform? bg = _interfaceCtrl.backgroundTransform;
+                var p = _compassContainer.parent;
+                var gp = p?.parent;
+                Log.LogInfo($"[Compass] compassContainer worldPos={_compassContainer.position} " +
+                            $"localPos={_compassContainer.localPosition} " +
+                            $"parent='{(p  != null ? p.gameObject.name   : "null")}' " +
+                            $"grandparent='{(gp != null ? gp.gameObject.name : "null")}' " +
+                            $"lossyScale={_compassContainer.lossyScale}");
+                if (bg != null)
+                    Log.LogInfo($"[Compass] backgroundTransform worldPos={bg.position} " +
+                                $"localPos={bg.localPosition} localScale={bg.localScale} lossyScale={bg.lossyScale}");
+                int iconCount = 0;
+                try { iconCount = _interfaceCtrl.awarenessIcons?.Count ?? 0; } catch { }
+                Log.LogInfo($"[Compass] meshRend active={_interfaceCtrl.compassMeshRend?.gameObject.activeSelf} " +
+                            $"containerActive={_compassContainer.gameObject.activeSelf} " +
+                            $"awarenessIcons={iconCount}");
+            }
+            catch (Exception ex) { Log.LogWarning($"[Compass] diag: {ex.Message}"); }
+        }
+
+        // ── Reposition compass in front of VR head ────────────────────────────
+        try
+        {
+            Vector3 headPos = _leftCam.transform.position;
+            Vector3 headFwd = _leftCam.transform.forward;
+            Vector3 headUp  = _leftCam.transform.up;
+
+            // Place at centre-bottom of VR view.
+            _compassContainer.position =
+                headPos + headFwd * CompassDist + headUp * CompassYOffset;
+        }
+        catch { }
+
+        // ── Fix background (ring) rotation to face VR camera ─────────────────
+        // The game sets this to Quaternion.LookRotation(Vector3.forward, Vector3.up) each
+        // Update() which keeps it facing world-forward.  For VR we need it to face the
+        // VR camera regardless of where the player is looking.
+        try
+        {
+            Transform? bg = _interfaceCtrl.backgroundTransform;
+            if (bg != null)
+                bg.rotation = Quaternion.LookRotation(
+                    _leftCam.transform.forward,
+                    _leftCam.transform.up);
+        }
+        catch { }
+
+        // ── Fix each awareness icon's imageTransform to face VR camera ────────
+        // The game sets imageTransform.rotation = CameraController.Instance.cam.transform.rotation
+        // (game camera rotation = controller direction in VR).  We override with VR head rotation.
+        try
+        {
+            var icons = _interfaceCtrl.awarenessIcons;
+            if (icons != null)
+            {
+                Quaternion camRot = _leftCam.transform.rotation;
+                for (int i = 0; i < icons.Count; i++)
+                {
+                    try
+                    {
+                        var icon = icons[i];
+                        if (icon?.imageTransform != null)
+                            icon.imageTransform.rotation = camRot;
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch { }
+    }
+
     /// <summary>Left X → C (crouch toggle).</summary>
     private float _crouchCooldownUntil;
     private bool  _crouchNeedsRelease;
@@ -6512,6 +6616,25 @@ public class VRCamera : MonoBehaviour
             }
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] InterfaceController cache: {ex.Message}"); }
+
+        // 5h. Cache awareness compass container for VR positioning.
+        _compassDiagDone = false;
+        _compassContainer = null;
+        try
+        {
+            if (_interfaceCtrl != null && _interfaceCtrl.compassContainer != null)
+            {
+                _compassContainer = _interfaceCtrl.compassContainer.transform;
+                var p = _compassContainer.parent;
+                Log.LogInfo($"[Movement] compassContainer found: '{_compassContainer.gameObject.name}' " +
+                            $"parent='{(p != null ? p.gameObject.name : "null")}' " +
+                            $"worldPos={_compassContainer.position} localPos={_compassContainer.localPosition} " +
+                            $"lossyScale={_compassContainer.lossyScale}");
+            }
+            else
+                Log.LogInfo("[Movement] compassContainer not found or null");
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] compassContainer cache: {ex.Message}"); }
 
         // 5d. Cache Player for vent-state detection.
         try
