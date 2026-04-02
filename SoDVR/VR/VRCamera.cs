@@ -1646,6 +1646,19 @@ public class VRCamera : MonoBehaviour
 
             OpenXRManager.FrameEndStereo(_displayTime, _leftEye, _rightEye, leftIdx, rightIdx);
 
+            // Set Camera.main rotation to controller AFTER all HDRP rendering is done.
+            // HDRP reads Camera.main.rotation during Update/Render to compute shadows,
+            // volumetrics, and reflections. Setting it in Update() (every frame) was causing
+            // GPU TDR (nvlddmkm.sys Blackwell) by driving expensive HDRP recalculations.
+            // Setting it here (post-FrameEndStereo) means HDRP always uses head rotation
+            // for rendering; Camera.main only sees controller rotation on the NEXT frame's
+            // game Update() — which is when InteractionRaycastCheck reads it for action text.
+            if (_gameCamRef != null && _leftControllerGO != null)
+            {
+                try { _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation; }
+                catch { }
+            }
+
             _frameCount++;
             if (_frameCount <= 10)
                 Log.LogInfo($"[VRCamera] Stereo frame #{_frameCount}");
@@ -5363,11 +5376,6 @@ public class VRCamera : MonoBehaviour
 
         try
         {
-            // Always redirect Camera.main rotation to the left controller direction so
-            // the game's InteractionRaycastCheck (which reads Camera.main) uses hand aim.
-            // Position is NOT overridden — that yanks the FPSController hierarchy.
-            if (_gameCamRef != null)
-                _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation;
 
             // Ray origin: Camera.main position (head/eye level) — same as the game's
             // InteractionController. Controller rotation only (not position).
@@ -5619,7 +5627,31 @@ public class VRCamera : MonoBehaviour
             catch { }
 
             if ((_poseFrameCount % 180) == 0)
-                Log.LogInfo($"[UIPtr] override vp=({vp.x:F2},{vp.y:F2}) onScreen={onScreen} -> local=({localX:F1},{localY:F1}) img={(upc.img != null ? upc.img.enabled.ToString() : "null")} rend={(upc.rend != null ? "ok" : "null")}");
+            {
+                // Also dump Image color alpha and UIPointers container sizeDelta
+                // to diagnose why the arrow isn't rendering despite img=true/rend=ok.
+                string imgColor = "n/a";
+                try { if (upc.img != null) imgColor = $"({upc.img.color.r:F2},{upc.img.color.g:F2},{upc.img.color.b:F2},{upc.img.color.a:F2})"; }
+                catch { imgColor = "err"; }
+                string containerSz = "n/a";
+                try
+                {
+                    var crt = container.GetComponent<RectTransform>();
+                    if (crt != null) containerSz = $"sd={crt.sizeDelta} anch={crt.anchorMin}→{crt.anchorMax}";
+                }
+                catch { }
+                string rectParentSz = "n/a";
+                try
+                {
+                    if (upc.rect?.parent != null)
+                    {
+                        var prt = upc.rect.parent.GetComponent<RectTransform>();
+                        if (prt != null) rectParentSz = $"sd={prt.sizeDelta}";
+                    }
+                }
+                catch { }
+                Log.LogInfo($"[UIPtr] override vp=({vp.x:F2},{vp.y:F2}) onScreen={onScreen} -> local=({localX:F1},{localY:F1}) img={(upc.img != null ? upc.img.enabled.ToString() : "null")} rend={(upc.rend != null ? "ok" : "null")} imgColor={imgColor} container={containerSz} rectParent={rectParentSz}");
+            }
 
             // Rotation: point arrow toward target direction when off-screen
             if (!onScreen)
