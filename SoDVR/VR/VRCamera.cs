@@ -5616,6 +5616,8 @@ public class VRCamera : MonoBehaviour
             catch { }
 
             // Override position and visibility
+            bool imgWas = false;
+            try { imgWas = upc.img?.enabled ?? false; } catch { }
             try
             {
                 if (projected && upc.rect != null)
@@ -5627,7 +5629,19 @@ public class VRCamera : MonoBehaviour
             catch { }
 
             if ((_poseFrameCount % 180) == 0)
-                Log.LogInfo($"[UIPtr] vp=({vpx:F2},{vpy:F2}) onScreen={onScreen} projected={projected} local=({localPt.x:F1},{localPt.y:F1})");
+            {
+                bool rootActive = false;
+                bool imgNow    = false;
+                bool goActive  = false;
+                Vector3 worldPt = Vector3.zero;
+                try { rootActive = container.root?.gameObject.activeInHierarchy ?? false; } catch { }
+                try { imgNow    = upc.img?.enabled ?? false; } catch { }
+                try { goActive  = upc.rect?.gameObject.activeInHierarchy ?? false; } catch { }
+                try { worldPt   = upc.rect?.TransformPoint(Vector3.zero) ?? Vector3.zero; } catch { }
+                Log.LogInfo($"[UIPtr] vp=({vpx:F2},{vpy:F2}) onScreen={onScreen} proj={projected} " +
+                            $"local=({localPt.x:F1},{localPt.y:F1}) world=({worldPt.x:F2},{worldPt.y:F2},{worldPt.z:F2}) " +
+                            $"rootActive={rootActive} goActive={goActive} imgWas={imgWas} imgNow={imgNow}");
+            }
 
             // Rotation: point arrow toward target when off-screen
             float rotAngle = Mathf.Atan2(vpy - 0.5f, vpx - 0.5f) * Mathf.Rad2Deg;
@@ -5803,23 +5817,17 @@ public class VRCamera : MonoBehaviour
     }
 
     /// <summary>Left grip → X (inventory).</summary>
-    private bool _gripAiming;  // true while left grip is held and camera is redirected for RMB
+    private bool _gripAiming;  // unused — kept for compile compat
     private void UpdateInventory()
     {
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
         OpenXRManager.GetGripState(false, out bool pressed);
 
-        // While grip is held, point game camera at left controller aim direction
-        // (same pattern as left trigger for LMB — game raycasts from Camera.main).
-        if (pressed && _gameCamRef != null && _leftControllerGO != null)
-        {
-            _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation;
-            _gripAiming = true;
-        }
-        else if (_gripAiming && !pressed)
-        {
-            _gripAiming = false;
-        }
+        // NOTE: camera-to-controller redirect was removed from here — it ran in Update() every
+        // frame while grip was held, driving expensive HDRP shadow/volumetric recalculations
+        // and causing GPU TDR (nvlddmkm.sys Blackwell).  Camera.main is already redirected to
+        // controller direction in post-FrameEndStereo (LateUpdate), so raycasts from grip-RMB
+        // will use that value on the following frame's game Update().
 
         bool edge = pressed && !_inventoryBtnPrev;
         _inventoryBtnPrev = pressed;
