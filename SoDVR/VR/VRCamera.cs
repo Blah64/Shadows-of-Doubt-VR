@@ -279,6 +279,27 @@ public class VRCamera : MonoBehaviour
     private LineRenderer? _laserLine;         // laser pointer beam from right controller
     private LineRenderer? _leftLaserLine;     // laser pointer beam from left controller (interact)
 
+    // ── Left hand interaction marker ─────────────────────────────────
+    private Canvas?    _leftDotCanvas;    // tiny WorldSpace canvas for aim dot
+    private Image?     _leftDotImage;     // dot image (for color changes)
+    private bool       _leftDotVisible;
+
+    // ── Left hand interactable label ─────────────────────────────────
+    private Canvas?          _leftLabelCanvas;     // small WorldSpace canvas for text
+    private TextMeshProUGUI? _leftLabelText;       // TMP text component
+    private bool             _leftLabelVisible;
+
+    // ── Left hand raycast params (cached from game) ──────────────────
+    private int   _interactionLayerMask = ~0;     // Toolbox.Instance.interactionRayLayerMask
+    private float _baseInteractionRange = 1.85f;  // GameplayControls.Instance.interactionRange
+
+    // ── HUD objective arrow override ─────────────────────────────────
+    private InterfaceController? _interfaceCtrl;
+    private RectTransform?       _firstPersonUI;  // = GameWorldDisplay, sd=100x100
+
+    // ── HUD diagnostics ──────────────────────────────────────────────
+    private bool _hudDiagDone;
+
     // ── Scene-change guard ────────────────────────────────────────────────────
     // When Unity loads a new scene (save load, new game) we stop calling
     // ScanAndConvertCanvases for 120 frames.  This gives SaveStateController
@@ -911,6 +932,12 @@ public class VRCamera : MonoBehaviour
             SetProjection(_leftCam,  _leftEye);
             SetProjection(_rightCam, _rightEye);
 
+            // NOTE: Do NOT copy VR projectionMatrix to Camera.main — it breaks interaction.
+            // VR projection is asymmetric for 2554x2756, while Camera.main is 1920x1080.
+            // The resolution mismatch corrupts Camera.main.ScreenPointToRay and
+            // any game system using WorldToScreenPoint+ScreenPointToLocalPointInRectangle.
+            // HUD indicators need a different approach (see TODO below).
+
             // Sync game camera hierarchy to VR head direction so game systems
             // (interaction raycast, world HUD positioning) match where the player looks in VR.
             // Set rotations on the FPSController hierarchy, not just the camera:
@@ -1142,6 +1169,95 @@ public class VRCamera : MonoBehaviour
             Log.LogInfo("[VRCamera] VRLeftLaserBeam created");
         }
         catch (Exception ex) { Log.LogWarning($"[VRCamera] Left laser creation failed: {ex.Message}"); }
+
+        // Left hand interaction dot — tiny WorldSpace canvas with Image.
+        // 3D sphere primitives don't render in HDRP VR eye cameras; WorldSpace Canvas does.
+        try
+        {
+            var dotCanvasGO = new GameObject("VRLeftDotCanvas");
+            dotCanvasGO.layer = UILayer;
+            UnityEngine.Object.DontDestroyOnLoad(dotCanvasGO);
+            var dotCanvas = dotCanvasGO.AddComponent<Canvas>();
+            dotCanvas.renderMode = RenderMode.WorldSpace;
+            dotCanvas.sortingOrder = 201;
+            var dotCanvasRT = dotCanvasGO.GetComponent<RectTransform>();
+            dotCanvasRT.sizeDelta = new Vector2(20f, 20f);
+            dotCanvasGO.transform.localScale = Vector3.one * 0.001f; // 20px * 0.001 = 0.02m = 2cm
+
+            var dotImgGO = new GameObject("DotImg");
+            dotImgGO.layer = UILayer;
+            dotImgGO.transform.SetParent(dotCanvasGO.transform, false);
+            var dotImg = dotImgGO.AddComponent<Image>();
+            dotImg.raycastTarget = false;
+            dotImg.color = new Color(0f, 64f, 64f, 1f); // HDR cyan
+            var dotImgRT = dotImgGO.GetComponent<RectTransform>();
+            dotImgRT.anchorMin = Vector2.zero; dotImgRT.anchorMax = Vector2.one;
+            dotImgRT.sizeDelta = Vector2.zero;
+
+            _leftDotCanvas = dotCanvas;
+            _leftDotImage = dotImg;
+            dotCanvasGO.SetActive(false);
+            _leftDotVisible = false;
+            Log.LogInfo("[VRCamera] VRLeftDotCanvas created (WorldSpace canvas dot)");
+        }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] Left dot creation failed: {ex.Message}"); }
+
+        // Floating label for interactable name — small WorldSpace canvas with TMP text.
+        // IL2CPP pitfall: AddComponent<TextMeshProUGUI>() on a GO that already has Image
+        // returns null. Use SEPARATE child GOs for background and text.
+        try
+        {
+            var labelGO = new GameObject("VRLeftInteractLabel");
+            labelGO.layer = UILayer;
+            UnityEngine.Object.DontDestroyOnLoad(labelGO);
+            _leftLabelCanvas = labelGO.AddComponent<Canvas>();
+            _leftLabelCanvas.renderMode = RenderMode.WorldSpace;
+            _leftLabelCanvas.sortingOrder = 200;
+            var labelRT = labelGO.GetComponent<RectTransform>();
+            if (labelRT != null) labelRT.sizeDelta = new Vector2(400f, 60f);
+            // Scale: 400px at 0.001 = 0.4m wide — readable at arm's length
+            labelGO.transform.localScale = Vector3.one * 0.001f;
+
+            // Background: child with Image (creates RectTransform via Image)
+            var bgGO = new GameObject("LabelBG");
+            bgGO.layer = UILayer;
+            bgGO.transform.SetParent(labelGO.transform, false);
+            var bgImg = bgGO.AddComponent<Image>();
+            bgImg.raycastTarget = false;
+            bgImg.color = new Color(0f, 0f, 0f, 0.6f); // semi-transparent dark bg
+            var bgRT = bgGO.GetComponent<RectTransform>();
+            if (bgRT != null)
+            {
+                bgRT.anchorMin = Vector2.zero; bgRT.anchorMax = Vector2.one;
+                bgRT.sizeDelta = Vector2.zero;
+            }
+
+            // Text: SEPARATE child (TMP needs its own GO without Image)
+            var txtGO = new GameObject("LabelTMP");
+            txtGO.layer = UILayer;
+            txtGO.transform.SetParent(labelGO.transform, false);
+            _leftLabelText = txtGO.AddComponent<TextMeshProUGUI>();
+            Log.LogInfo($"[VRCamera] Label TMP AddComponent result: {(_leftLabelText != null ? "OK" : "NULL")}");
+            if (_leftLabelText != null)
+            {
+                _leftLabelText.fontSize = 32;
+                _leftLabelText.color = new Color(32f, 32f, 32f, 1f); // HDR white (HDRP text boost)
+                _leftLabelText.alignment = TextAlignmentOptions.Center;
+                _leftLabelText.raycastTarget = false;
+                _leftLabelText.text = "";
+                var txtRT = txtGO.GetComponent<RectTransform>();
+                if (txtRT != null)
+                {
+                    txtRT.anchorMin = Vector2.zero; txtRT.anchorMax = Vector2.one;
+                    txtRT.sizeDelta = Vector2.zero;
+                }
+            }
+
+            labelGO.SetActive(false);
+            _leftLabelVisible = false;
+            Log.LogInfo("[VRCamera] VRLeftInteractLabel created");
+        }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] Left label creation failed: {ex.Message}"); }
 
         // Cursor dot: ScreenSpaceOverlay canvas created here, converted to WorldSpace by
         // ScanAndConvertCanvases — same pipeline as all game canvases, giving HDRP registration.
@@ -1498,6 +1614,10 @@ public class VRCamera : MonoBehaviour
                 // so we must override it every frame to keep it near the VR player.
                 EnforceCaseCanvasPosition();
                 EnforceWindowNestedZSeparation();
+
+                // UIPointerController positions run in Update; we override AFTER all Updates
+                // complete (LateUpdate) so our write wins over the game's garbage projection.
+                UpdateUIPointers();
 
                 // No GL.invertCulling — HDRP flipYMode handles both Y-flip and culling.
                 _rightCam.Render();
@@ -3426,6 +3546,113 @@ public class VRCamera : MonoBehaviour
                         canvas.transform.localRotation = Quaternion.identity;
                         _positionedCanvases.Add(id);
                         Log.LogInfo($"[VRCamera] HUD parented '{canvas.gameObject.name}' to HUDAnchor");
+
+                        // One-time diagnostic: dump overlay/world-marker canvases + camera info
+                        if (!_hudDiagDone)
+                        {
+                            _hudDiagDone = true;
+                            try
+                            {
+                                // Camera dimensions — key for WorldToScreenPoint
+                                if (_gameCamRef != null)
+                                    Log.LogInfo($"[HUDDiag] Camera.main: pixel={_gameCamRef.pixelWidth}x{_gameCamRef.pixelHeight} fov={_gameCamRef.fieldOfView:F1} culling={_gameCamRef.cullingMask}");
+                                if (_leftCam != null)
+                                    Log.LogInfo($"[HUDDiag] LeftEye: pixel={_leftCam.pixelWidth}x{_leftCam.pixelHeight} fov={_leftCam.fieldOfView:F1}");
+                                Log.LogInfo($"[HUDDiag] Screen: {Screen.width}x{Screen.height}");
+
+                                var allCanvases = Resources.FindObjectsOfTypeAll<Canvas>();
+                                foreach (var dc in allCanvases)
+                                {
+                                    if (dc == null) continue;
+                                    string dn = dc.gameObject.name ?? "";
+                                    if (dn.Contains("GameWorld") || dn.Contains("gameWorld") ||
+                                        dn.Contains("Awareness") || dn.Contains("Pointer") ||
+                                        dn.Contains("firstPerson") || dn.Contains("speechBubble") ||
+                                        dn.Contains("Overlay") || dn.Contains("Selection") ||
+                                        dn.Contains("GameCanvas"))
+                                    {
+                                        string wcn = dc.worldCamera != null ? dc.worldCamera.name : "null";
+                                        string pn  = dc.transform.parent != null ? dc.transform.parent.name : "root";
+                                        var drt = dc.GetComponent<RectTransform>();
+                                        string sz = drt != null ? $"sd=({drt.sizeDelta.x:F0},{drt.sizeDelta.y:F0})" : "noRT";
+                                        Log.LogInfo($"[HUDDiag] Canvas '{dn}': mode={dc.renderMode} active={dc.gameObject.activeSelf} wCam={wcn} parent={pn} {sz} scale={dc.transform.localScale}");
+                                    }
+                                }
+
+                                // Look for InterfaceController.firstPersonUI
+                                try
+                                {
+                                    var ic = UnityEngine.Object.FindObjectOfType<InterfaceController>();
+                                    if (ic != null)
+                                    {
+                                        Log.LogInfo($"[HUDDiag] InterfaceController found. firstPersonUI={(ic.firstPersonUI != null ? ic.firstPersonUI.gameObject.name : "null")} gameWorldCanvas={(ic.gameWorldCanvas != null ? ic.gameWorldCanvas.gameObject.name : "null")}");
+                                        if (ic.firstPersonUI != null)
+                                        {
+                                            var fpRT = ic.firstPersonUI;
+                                            Log.LogInfo($"[HUDDiag] firstPersonUI: sd=({fpRT.sizeDelta.x:F0},{fpRT.sizeDelta.y:F0}) pos={fpRT.localPosition} childCount={fpRT.childCount}");
+                                            for (int ci = 0; ci < fpRT.childCount && ci < 10; ci++)
+                                            {
+                                                var ch = fpRT.GetChild(ci);
+                                                if (ch != null)
+                                                    Log.LogInfo($"[HUDDiag]   child[{ci}]: '{ch.gameObject.name}' active={ch.gameObject.activeSelf} pos={ch.localPosition}");
+                                            }
+                                        }
+                                    }
+                                    else
+                                    {
+                                        Log.LogInfo("[HUDDiag] InterfaceController not found");
+                                    }
+                                }
+                                catch (Exception icex) { Log.LogInfo($"[HUDDiag] IC exception: {icex.Message}"); }
+
+                                // Dump uiPointerContainer and OverlayCanvas to understand
+                                // objective arrow + through-wall overlay positioning
+                                try
+                                {
+                                    var ic3 = UnityEngine.Object.FindObjectOfType<InterfaceController>();
+                                    if (ic3 != null)
+                                    {
+                                        var upc = ic3.uiPointerContainer;
+                                        Log.LogInfo($"[HUDDiag] uiPointerContainer={(upc != null ? upc.gameObject.name : "null")} childCount={upc?.childCount ?? 0}");
+                                        if (upc != null)
+                                        {
+                                            var upcParent = upc.parent;
+                                            string upcPath = "";
+                                            var tr2 = (Transform)upc;
+                                            for (int depth = 0; depth < 6 && tr2 != null; depth++)
+                                            { upcPath = tr2.gameObject.name + (upcPath.Length > 0 ? "→" + upcPath : ""); tr2 = tr2.parent; }
+                                            Log.LogInfo($"[HUDDiag] uiPointerContainer path: {upcPath}");
+                                        }
+                                    }
+                                }
+                                catch (Exception ex2) { Log.LogInfo($"[HUDDiag] upcDiag: {ex2.Message}"); }
+
+                                // Dump OverlayCanvas children (top 10) to identify overlay types
+                                try
+                                {
+                                    var allC = Resources.FindObjectsOfTypeAll<Canvas>();
+                                    foreach (var oc in allC)
+                                    {
+                                        if (oc == null) continue;
+                                        string ocn = oc.gameObject.name ?? "";
+                                        if (!ocn.Equals("OverlayCanvas", StringComparison.OrdinalIgnoreCase)) continue;
+                                        Log.LogInfo($"[HUDDiag] OverlayCanvas active={oc.gameObject.activeSelf} childCount={oc.transform.childCount}");
+                                        for (int ci = 0; ci < oc.transform.childCount && ci < 10; ci++)
+                                        {
+                                            var ch = oc.transform.GetChild(ci);
+                                            if (ch == null) continue;
+                                            string compList = "";
+                                            var comps = ch.gameObject.GetComponents<Component>();
+                                            if (comps != null)
+                                                foreach (var c in comps) { if (c != null) compList += c.GetType().Name + " "; }
+                                            Log.LogInfo($"[HUDDiag]   OC child[{ci}]: '{ch.gameObject.name}' active={ch.gameObject.activeSelf} pos={ch.localPosition} comps=[{compList.Trim()}]");
+                                        }
+                                    }
+                                }
+                                catch (Exception ex3) { Log.LogInfo($"[HUDDiag] overlayCDiag: {ex3.Message}"); }
+                            }
+                            catch (Exception dex) { Log.LogInfo($"[HUDDiag] Exception: {dex.Message}"); }
+                        }
                     }
                     catch (Exception ex) { Log.LogWarning($"[VRCamera] HUD parent: {ex.Message}"); }
                 }
@@ -3723,6 +3950,9 @@ public class VRCamera : MonoBehaviour
                 _leftLaserLine.enabled = false;
             }
         }
+
+        // Left hand interaction marker: dot at hit point + floating label for interactables.
+        UpdateLeftInteractMarker();
 
         // Pre-scan: re-enforce ALL canvas VR poses that were snapshotted in the last pre-render.
         // The game overwrites canvas transforms between our LateUpdate/pre-render and this Update.
@@ -5066,19 +5296,10 @@ public class VRCamera : MonoBehaviour
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
         OpenXRManager.GetTriggerState(false, out bool pressed);
 
-        // While trigger is held, point game camera at left controller aim direction.
-        // The game's InteractionController raycasts from Camera.main each frame —
-        // this makes it follow the left hand instead of VR head.
-        if (pressed && _gameCamRef != null && _leftControllerGO != null)
-        {
-            _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation;
-            _interactAiming = true;
-        }
-        else if (_interactAiming && !pressed)
-        {
-            // Restore camera rotation to VR head when trigger released
-            _interactAiming = false;
-        }
+        // Camera.main rotation is now always redirected to the controller in
+        // UpdateLeftInteractMarker — no per-trigger override needed here.
+        if (pressed) _interactAiming = true;
+        else if (_interactAiming && !pressed) _interactAiming = false;
 
         bool edge = pressed && !_interactBtnPrev;
         _interactBtnPrev = pressed;
@@ -5093,6 +5314,368 @@ public class VRCamera : MonoBehaviour
             Log.LogInfo("[VRCamera] Interact (LMB via left controller aim)");
         }
         catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateInteract: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Left controller interaction marker: dot at hit point + floating label for interactables.
+    /// Runs every frame — independent of laser visibility (LineRenderers don't render in VR).
+    /// </summary>
+    private void UpdateLeftInteractMarker()
+    {
+        if (_leftControllerGO == null) return;
+        // Skip when VR Settings panel or pause menu is open
+        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+        bool menuOpen = _menuCanvasRef != null && _menuCanvasRef.isActiveAndEnabled;
+        if (menuOpen)
+        {
+            if (_leftDotVisible  && _leftDotCanvas != null) { _leftDotCanvas.gameObject.SetActive(false); _leftDotVisible = false; }
+            if (_leftLabelVisible && _leftLabelCanvas != null) { _leftLabelCanvas.gameObject.SetActive(false); _leftLabelVisible = false; }
+            return;
+        }
+
+        try
+        {
+            // Always redirect Camera.main rotation to the left controller direction.
+            // The game's InteractionRaycastCheck reads Camera.main.rotation — by keeping
+            // it pointed at the controller aim every frame, currentInteractions reflects
+            // what the HAND is pointing at (with up to 1-frame lag due to Update ordering).
+            // Position is NOT overridden — that would yank the FPSController hierarchy.
+            if (_gameCamRef != null)
+                _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation;
+
+            // Ray origin: use Camera.main position (head/eye level) because the game's
+            // InteractionController fires from cam.transform.position. We only override
+            // Camera.main's ROTATION to match the controller (not position — that yanks
+            // the FPSController hierarchy). Using the same origin makes the dot show
+            // exactly what the game would hit when you pull the trigger.
+            Vector3 lStart = _gameCamRef != null ? _gameCamRef.transform.position
+                                                 : _leftControllerGO.transform.position;
+            Vector3 lDir   = _leftControllerGO.transform.forward;
+            float   lRange = 12.0f;  // same as game's raycast distance
+            bool    didHit = false;
+            bool    isInteractable = false;
+            InteractableController? hitIC = null;
+            RaycastHit lHit = default;
+
+            if (Physics.Raycast(new Ray(lStart, lDir), out lHit, lRange, _interactionLayerMask))
+            {
+                didHit = true;
+                // Walk up hierarchy (max 6 levels) for InteractableController
+                try
+                {
+                    var tr = lHit.collider.transform;
+                    for (int i = 0; i < 6 && tr != null; i++)
+                    {
+                        var ic = tr.gameObject.GetComponent<InteractableController>();
+                        if (ic != null)
+                        {
+                            hitIC = ic;
+                            // Check if within interaction range (game's GetReachDistance)
+                            float reachDist = _baseInteractionRange;
+                            try
+                            {
+                                if (ic.interactable != null)
+                                    reachDist = ic.interactable.GetReachDistance();
+                            }
+                            catch { }
+                            if (lHit.distance <= reachDist)
+                                isInteractable = true;
+                            break;
+                        }
+                        tr = tr.parent;
+                    }
+                }
+                catch { }
+            }
+
+            // Periodic diagnostic (first 5 frames, then every 300)
+            if (_poseFrameCount <= 5 || (_poseFrameCount % 300) == 0)
+                Log.LogInfo($"[LeftMarker] hit={didHit} interactable={isInteractable} hitDist={lHit.distance:F2} dot={_leftDotCanvas != null} label={_leftLabelCanvas != null}");
+
+            // ── Dot: WorldSpace canvas at hit point ──────────────────────
+            if (_leftDotCanvas != null)
+            {
+                if (didHit)
+                {
+                    _leftDotCanvas.transform.position = lHit.point + lHit.normal * 0.005f; // slight offset from surface
+                    // Billboard toward VR head
+                    if (_leftCam != null)
+                        _leftDotCanvas.transform.rotation = _leftCam.transform.rotation;
+                    // Color: green when interactable, cyan otherwise
+                    if (_leftDotImage != null)
+                    {
+                        _leftDotImage.color = isInteractable
+                            ? new Color(0f, 64f, 0f, 1f)   // HDR green
+                            : new Color(0f, 64f, 64f, 1f);  // HDR cyan
+                    }
+                    if (!_leftDotVisible) { _leftDotCanvas.gameObject.SetActive(true); _leftDotVisible = true; }
+                }
+                else if (_leftDotVisible)
+                {
+                    _leftDotCanvas.gameObject.SetActive(false);
+                    _leftDotVisible = false;
+                }
+            }
+
+            // ── Label: only when pointing at an interactable within range ─
+            if (_leftLabelCanvas != null)
+            {
+                if (isInteractable && hitIC != null)
+                {
+                    // Build label: object name + available actions
+                    string objName = "";
+                    try
+                    {
+                        if (hitIC.interactable != null)
+                            objName = hitIC.interactable.GetName();
+                        if (string.IsNullOrEmpty(objName))
+                            objName = hitIC.gameObject.name ?? "?";
+                    }
+                    catch { objName = hitIC.gameObject.name ?? "?"; }
+
+                    // Get action text from game's current interaction state.
+                    // We read currentInteractions regardless of which direction the head camera
+                    // is aimed — the label shows actions for what the HAND is pointing at.
+                    string actionText = "";
+                    try
+                    {
+                        var ic2 = InteractionController.Instance;
+                        if (ic2?.currentInteractions != null)
+                        {
+                            foreach (var kvp in ic2.currentInteractions)
+                            {
+                                if (kvp.Value?.currentSetting == null) continue;
+                                if (!kvp.Value.currentSetting.enabled || !kvp.Value.currentSetting.display) continue;
+                                string aText = kvp.Value.actionText ?? "";
+                                if (!string.IsNullOrEmpty(aText))
+                                {
+                                    if (actionText.Length > 0) actionText += " | ";
+                                    actionText += aText;
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+
+                    string fullLabel = string.IsNullOrEmpty(actionText) ? objName : $"{objName}\n{actionText}";
+                    if (_leftLabelText != null)
+                        _leftLabelText.text = fullLabel;
+
+                    // Position: at hit point, offset 0.08m above, billboard toward VR head
+                    Vector3 labelPos = lHit.point + Vector3.up * 0.08f;
+                    _leftLabelCanvas.transform.position = labelPos;
+                    if (_leftCam != null)
+                    {
+                        // Billboard: face toward VR camera, Y-axis only (no tilt)
+                        Vector3 toCam = _leftCam.transform.position - labelPos;
+                        toCam.y = 0f;
+                        if (toCam.sqrMagnitude > 0.001f)
+                            _leftLabelCanvas.transform.rotation = Quaternion.LookRotation(-toCam, Vector3.up);
+                    }
+                    if (!_leftLabelVisible)
+                    {
+                        _leftLabelCanvas.gameObject.SetActive(true);
+                        _leftLabelVisible = true;
+                    }
+                }
+                else if (_leftLabelVisible)
+                {
+                    _leftLabelCanvas.gameObject.SetActive(false);
+                    _leftLabelVisible = false;
+                }
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Override UIPointerController (objective arrow) positions each frame.
+    /// The game's positioning uses ScreenPointToLocalPointInRectangle with null camera,
+    /// which produces garbage for WorldSpace canvases. We re-project using the VR camera.
+    /// </summary>
+    private int _uiPointerDiagFrame = -1; // frame of last UIPointer diagnostic
+    private void UpdateUIPointers()
+    {
+        if (_interfaceCtrl == null || _firstPersonUI == null || _leftCam == null) return;
+
+        Transform? container = null;
+        try { container = _interfaceCtrl.uiPointerContainer; }
+        catch { return; }
+        if (container == null) return;
+
+        // Periodic diagnostic: log container state every 180 frames
+        if (_poseFrameCount - _uiPointerDiagFrame >= 180)
+        {
+            _uiPointerDiagFrame = _poseFrameCount;
+            Log.LogInfo($"[UIPtr] container='{container.gameObject.name}' childCount={container.childCount} fpUI={(_firstPersonUI != null ? _firstPersonUI.sizeDelta.ToString() : "null")}");
+            for (int di = 0; di < container.childCount && di < 5; di++)
+            {
+                var dc = container.GetChild(di);
+                if (dc == null) continue;
+                var dupc = dc.GetComponent<UIPointerController>();
+                string objInfo = "";
+                try
+                {
+                    if (dupc?.objective?.queueElement != null)
+                        objInfo = $" usePointer={dupc.objective.queueElement.usePointer} worldPos={dupc.objective.queueElement.pointerPosition}";
+                }
+                catch { }
+                // Also dump rect info
+                string rectInfo = "";
+                try
+                {
+                    if (dupc?.rect != null)
+                    {
+                        var rp = dupc.rect.parent;
+                        rectInfo = $" rect.parent='{(rp != null ? rp.gameObject.name : "null")}'" +
+                                   $" rect.anchoredPos={dupc.rect.anchoredPosition}" +
+                                   $" rect.localPos={dupc.rect.localPosition}" +
+                                   $" rect.sd={dupc.rect.sizeDelta}" +
+                                   $" rect.active={dupc.rect.gameObject.activeSelf}";
+                    }
+                }
+                catch { }
+                Log.LogInfo($"[UIPtr]   child[{di}]: '{dc.gameObject.name}' active={dc.gameObject.activeSelf} upc={dupc != null}{objInfo}{rectInfo}");
+            }
+        }
+
+        Vector2 fpSize = _firstPersonUI.sizeDelta; // typically (100, 100)
+
+        for (int i = 0; i < container.childCount; i++)
+        {
+            Transform? child = null;
+            try { child = container.GetChild(i); }
+            catch { continue; }
+            if (child == null || !child.gameObject.activeSelf) continue;
+
+            UIPointerController? upc = null;
+            try { upc = child.GetComponent<UIPointerController>(); }
+            catch { continue; }
+            if (upc == null) continue;
+
+            // Get target world position
+            Vector3 worldPos = Vector3.zero;
+            bool hasTarget = false;
+            try
+            {
+                var obj = upc.objective;
+                if (obj?.queueElement != null && obj.queueElement.usePointer)
+                {
+                    worldPos = obj.queueElement.pointerPosition;
+                    hasTarget = true;
+                }
+            }
+            catch { continue; }
+            if (!hasTarget) continue;
+
+            // Project world position to VR camera viewport (0-1)
+            Vector3 vp = _leftCam.WorldToViewportPoint(worldPos);
+
+            // Behind camera: flip to opposite edge
+            if (vp.z < 0f)
+            {
+                vp.x = 1f - vp.x;
+                vp.y = 1f - vp.y;
+                vp.z = 0f;
+            }
+
+            // Check if on-screen (within viewport with small margin)
+            bool onScreen = vp.x > 0.05f && vp.x < 0.95f && vp.y > 0.05f && vp.y < 0.95f && vp.z > 0f;
+
+            // Clamp to edge when off-screen (arrow sits at border)
+            if (!onScreen)
+            {
+                float cx = vp.x - 0.5f;
+                float cy = vp.y - 0.5f;
+                float maxAbs = Mathf.Max(Mathf.Abs(cx), Mathf.Abs(cy));
+                if (maxAbs > 0.001f)
+                {
+                    float scale = 0.45f / maxAbs; // clamp to 0.45 from center
+                    cx *= scale;
+                    cy *= scale;
+                }
+                vp.x = cx + 0.5f;
+                vp.y = cy + 0.5f;
+            }
+
+            // Map viewport to firstPersonUI local coords (pivot at center)
+            float localX = (vp.x - 0.5f) * fpSize.x;
+            float localY = (vp.y - 0.5f) * fpSize.y;
+
+            // Override the arrow's position
+            try
+            {
+                if (upc.rect != null)
+                {
+                    upc.rect.anchoredPosition = new Vector2(localX, localY);
+                    upc.rect.localPosition = new Vector3(localX, localY, 0f);
+                }
+            }
+            catch { }
+
+            // Force alpha visible — the game's Update() fades CanvasGroup.alpha to 0
+            // because its broken WorldSpace projection thinks arrows are off-screen.
+            // Setting upc.alpha = 1 influences the *target* for the game's lerp, but
+            // the actual CanvasGroup alpha may still be near 0. Override it directly.
+            try
+            {
+                upc.alpha  = 1f;
+                upc.fadeIn = 1f;
+                if (upc.rend != null) upc.rend.SetAlpha(1f);
+            }
+            catch { }
+
+            // Direct CanvasGroup override — search the UIPointer(Clone) and its rect
+            CanvasGroup? cg = null;
+            try
+            {
+                cg = child.GetComponent<CanvasGroup>();
+                if (cg == null && upc.rect != null)
+                    cg = upc.rect.GetComponent<CanvasGroup>();
+                if (cg == null)
+                    cg = child.GetComponentInChildren<CanvasGroup>();
+            }
+            catch { }
+
+            float cgAlphaBefore = cg != null ? cg.alpha : -1f;
+            if (cg != null)
+            {
+                try { cg.alpha = 1f; }
+                catch { }
+            }
+
+            // Also force all child Image alphas to 1
+            try
+            {
+                var imgs = child.GetComponentsInChildren<Image>();
+                if (imgs != null)
+                {
+                    foreach (var img in imgs)
+                    {
+                        if (img == null) continue;
+                        var c = img.color;
+                        if (c.a < 0.9f) { c.a = 1f; img.color = c; }
+                    }
+                }
+            }
+            catch { }
+
+            if ((_poseFrameCount % 180) == 0)
+                Log.LogInfo($"[UIPtr] override vp=({vp.x:F2},{vp.y:F2}) onScreen={onScreen} -> local=({localX:F1},{localY:F1}) upc.alpha={upc.alpha:F2} cg={(cg != null ? $"found alpha_before={cgAlphaBefore:F2}" : "null")}");
+
+            // Rotation: point arrow toward target direction when off-screen
+            if (!onScreen)
+            {
+                float angle = Mathf.Atan2(vp.y - 0.5f, vp.x - 0.5f) * Mathf.Rad2Deg;
+                try { upc.rect.localRotation = Quaternion.Euler(0f, 0f, angle - 90f); }
+                catch { }
+            }
+            else
+            {
+                try { upc.rect.localRotation = Quaternion.identity; }
+                catch { }
+            }
+        }
     }
 
     /// <summary>Left X → C (crouch toggle).</summary>
@@ -5905,6 +6488,38 @@ public class VRCamera : MonoBehaviour
             }
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] InteractionController cache: {ex.Message}"); }
+
+        // 5e. Cache interaction ray layer mask for left-hand marker raycast.
+        try
+        {
+            _interactionLayerMask = Toolbox.Instance.interactionRayLayerMask;
+            Log.LogInfo($"[Movement] Interaction layer mask: {_interactionLayerMask}");
+        }
+        catch { _interactionLayerMask = ~0; } // fallback: hit everything
+
+        // 5f. Cache base interaction range.
+        try
+        {
+            _baseInteractionRange = GameplayControls.Instance.interactionRange;
+            Log.LogInfo($"[Movement] Base interaction range: {_baseInteractionRange}");
+        }
+        catch { }
+
+        // 5g. Cache InterfaceController for HUD arrow override.
+        try
+        {
+            _interfaceCtrl = UnityEngine.Object.FindObjectOfType<InterfaceController>();
+            if (_interfaceCtrl != null)
+            {
+                _firstPersonUI = _interfaceCtrl.firstPersonUI;
+                Log.LogInfo($"[Movement] InterfaceController found, firstPersonUI={(_firstPersonUI != null ? _firstPersonUI.gameObject.name : "null")}");
+            }
+            else
+            {
+                Log.LogInfo("[Movement] InterfaceController not found");
+            }
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] InterfaceController cache: {ex.Message}"); }
 
         // 5d. Cache Player for vent-state detection.
         try
