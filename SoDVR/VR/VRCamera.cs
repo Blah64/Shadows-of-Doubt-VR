@@ -316,6 +316,13 @@ public class VRCamera : MonoBehaviour
     private Transform? _lagPivotOrigParent;                 // original parent (3DUI) for restore
     private InteractionController? _interactionController;  // cached for carried-object tracking
     private const float MoveDeadZone = 0.15f;
+
+    // ── Air vent / duct traversal ────────────────────────────────────
+    private Player?  _playerRef;          // cached Player component (for inAirVent flag)
+    private bool     _inAirVent;          // mirrors Player.inAirVent each frame
+    private bool     _wasInAirVent;       // previous frame — edge detection
+    private const float DuctSpeedFraction = 0.3f; // matches game's 0.3× walk speed in ducts
+
     // Cursor: ScreenSpaceOverlay canvas "VRCursorCanvasInternal" created at rig-build time.
     // ScanAndConvertCanvases converts it to WorldSpace via the normal pipeline — giving it proper
     // HDRP registration and the ZTest Always material patch from RescanCanvasAlpha.
@@ -548,6 +555,9 @@ public class VRCamera : MonoBehaviour
                 }
                 _fpsItemController      = null;
                 _interactionController  = null;
+                _playerRef              = null;
+                _inAirVent              = false;
+                _wasInAirVent           = false;
                 _lagPivotTransform      = null;
                 _lagPivotOrigParent     = null;
                 _armsActivated          = false;
@@ -948,6 +958,16 @@ public class VRCamera : MonoBehaviour
             {
                 OpenXRManager.SyncActions();
                 UpdateControllerPose(_displayTime);
+
+                // ── Vent state ───────────────────────────────────────────
+                _wasInAirVent = _inAirVent;
+                try { _inAirVent = _playerRef != null && _playerRef.inAirVent; }
+                catch { _inAirVent = false; }
+                if (_inAirVent && !_wasInAirVent)
+                    Log.LogInfo("[VRCamera] Player entered air vent — switching to 3D duct movement");
+                if (!_inAirVent && _wasInAirVent)
+                    Log.LogInfo("[VRCamera] Player exited air vent — restoring normal movement");
+
                 UpdateSnapTurn();
                 UpdateLocomotion();
                 UpdateMenuButton();
@@ -4778,6 +4798,37 @@ public class VRCamera : MonoBehaviour
         float dx = Mathf.Abs(lx) > MoveDeadZone ? lx : 0f;
         float dy = Mathf.Abs(ly) > MoveDeadZone ? ly : 0f;
 
+        // ── Air duct 3D movement ─────────────────────────────────────
+        // In ghost mode: camera-relative 3D (look up + push forward = move upward).
+        // Matches game's FirstPersonController ghost mode which uses m_Camera.forward.
+        if (_inAirVent)
+        {
+            Vector3 camFwd   = _leftCam != null ? _leftCam.transform.forward : transform.forward;
+            Vector3 camRight = _leftCam != null ? _leftCam.transform.right   : transform.right;
+            Vector3 moveDir  = (camFwd * dy + camRight * dx);
+
+            bool alwaysRunV = PlayerPrefs.GetInt("alwaysRun", 0) != 0;
+            float msV = VRSettingsPanel.MoveSpeed * DuctSpeedFraction;
+            float smV = VRSettingsPanel.SprintMultiplier;
+            float baseSpeedV = alwaysRunV ? msV * smV : msV;
+            float altSpeedV  = alwaysRunV ? msV : msV * smV;
+            float speedV     = _sprintActive ? altSpeedV : baseSpeedV;
+
+            try
+            {
+                if (_playerCC.gameObject == null || !_playerCC.gameObject.activeInHierarchy)
+                { _playerCC = null; return; }
+                // No gravity component — duct movement is fully input-driven (3 axes).
+                _playerCC.Move(moveDir * speedV * Time.deltaTime);
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[Movement] CC.Move (duct) failed: {ex.Message}");
+                _playerCC = null;
+            }
+            return; // skip normal horizontal-only movement below
+        }
+
         // Head-relative direction: use HMD yaw (left eye camera world yaw)
         float headYaw = _leftCam != null ? _leftCam.transform.eulerAngles.y : transform.eulerAngles.y;
         Vector3 fwd   = Quaternion.Euler(0f, headYaw, 0f) * Vector3.forward;
@@ -4908,6 +4959,9 @@ public class VRCamera : MonoBehaviour
         if (_playerCC == null) return;
         // Only apply gravity/jump when movement discovery is done (= we're in-game, not main menu)
         if (!_movementDiscoveryDone) { _jumpVerticalVelocity = 0f; return; }
+
+        // In air vents: no gravity, no jump (player uses 3D camera-relative movement).
+        if (_inAirVent) { _jumpVerticalVelocity = 0f; return; }
 
         // Use unscaledDeltaTime so gravity works even when game is paused (timeScale=0).
         // Without this, the player floats in the air while ESC menu is open and doesn't
@@ -5048,6 +5102,7 @@ public class VRCamera : MonoBehaviour
     private bool  _yBtnNeedsRelease;
     private void UpdateCrouch()
     {
+        if (_inAirVent) return; // already crawling — crouch is meaningless in ducts
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
         // 3-phase debounce (same as menu button)
         if (Time.realtimeSinceStartup < _crouchCooldownUntil) return;
@@ -5851,6 +5906,22 @@ public class VRCamera : MonoBehaviour
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] InteractionController cache: {ex.Message}"); }
 
+        // 5d. Cache Player for vent-state detection.
+        try
+        {
+            var player = _playerCC.GetComponent<Player>();
+            if (player != null)
+            {
+                _playerRef = player;
+                Log.LogInfo($"[Movement] Player component found. inAirVent={player.inAirVent}");
+            }
+            else
+            {
+                Log.LogInfo("[Movement] Player component not found on FPSController.");
+            }
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] Player lookup: {ex.Message}"); }
+
         // 6. Camera.main diagnostic — confirm it's non-null so SaveStateController won't crash
         try
         {
@@ -6420,6 +6491,9 @@ public class VRCamera : MonoBehaviour
                             _fpsControllerTransform = null;
                             _cameraPivotTransform   = null;
                             _cameraLookDisabled     = false;
+                            _playerRef              = null;
+                            _inAirVent              = false;
+                            _wasInAirVent           = false;
                             StopSprint();
                             // NOTE: do NOT set _movementDiscoveryDone = false here.
                             // Doing so would trigger DiscoverMovementSystem() at the bottom of
