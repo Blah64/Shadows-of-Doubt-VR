@@ -1032,6 +1032,16 @@ public class VRCamera : MonoBehaviour
             }
         }
 
+        // Keep Player.currentRoom updated — FirstPersonController is disabled (we drive
+        // movement via CC.Move), so its per-frame UpdateMovementPhysics/UpdateGameLocation
+        // call doesn't run.  Without this, room culling uses a stale currentRoom and areas
+        // don't load properly when the player moves between rooms.
+        if (_playerRef != null && _sceneLoadGrace <= 0)
+        {
+            try { _playerRef.UpdateGameLocation(); }
+            catch { }
+        }
+
         // One-shot movement system discovery (runs once after stereo is ready and game cam found).
         // Skip discovery when game camera has cullingMask=0 — that means we're on the main menu,
         // where FPSController exists but there's no ground geometry → gravity would pull us through the floor.
