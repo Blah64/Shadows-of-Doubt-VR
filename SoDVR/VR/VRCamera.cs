@@ -1047,6 +1047,17 @@ public class VRCamera : MonoBehaviour
             }
             catch { }
         }
+
+        // Final camera rotation: always point Camera.main at the left controller so the
+        // game's InteractionRaycastCheck (which runs in a later Update()) reads controller
+        // aim direction for action text, interact raycasts, etc.
+        // This runs AFTER UpdatePose sets head rotation for case board cursor — the last
+        // writer wins, and the game's interaction system is the final consumer before render.
+        if (_gameCamRef != null && _leftControllerGO != null)
+        {
+            try { _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation; }
+            catch { }
+        }
     }
 
     private void BuildCameraRig()
@@ -5634,12 +5645,22 @@ public class VRCamera : MonoBehaviour
                 bool imgNow    = false;
                 bool goActive  = false;
                 Vector3 worldPt = Vector3.zero;
+                Vector2 arrowSD = Vector2.zero;
+                int arrowLayer  = -1;
+                string shaderName = "?";
                 try { rootActive = container.root?.gameObject.activeInHierarchy ?? false; } catch { }
                 try { imgNow    = upc.img?.enabled ?? false; } catch { }
                 try { goActive  = upc.rect?.gameObject.activeInHierarchy ?? false; } catch { }
                 try { worldPt   = upc.rect?.TransformPoint(Vector3.zero) ?? Vector3.zero; } catch { }
+                try { arrowSD   = upc.rect?.sizeDelta ?? Vector2.zero; } catch { }
+                try { arrowLayer = upc.rect?.gameObject.layer ?? -1; } catch { }
+                try { shaderName = upc.img?.material?.shader?.name ?? "null"; } catch { }
+                Vector3 camPos = Vector3.zero;
+                try { camPos = _leftCam.transform.position; } catch { }
                 Log.LogInfo($"[UIPtr] vp=({vpx:F2},{vpy:F2}) onScreen={onScreen} proj={projected} " +
                             $"local=({localPt.x:F1},{localPt.y:F1}) world=({worldPt.x:F2},{worldPt.y:F2},{worldPt.z:F2}) " +
+                            $"cam=({camPos.x:F2},{camPos.y:F2},{camPos.z:F2}) " +
+                            $"sd=({arrowSD.x:F0},{arrowSD.y:F0}) layer={arrowLayer} shader={shaderName} " +
                             $"rootActive={rootActive} goActive={goActive} imgWas={imgWas} imgNow={imgNow}");
             }
 
