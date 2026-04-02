@@ -5296,18 +5296,9 @@ public class VRCamera : MonoBehaviour
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
         OpenXRManager.GetTriggerState(false, out bool pressed);
 
-        // While trigger is held, point game camera at left controller aim direction.
-        // The game's InteractionController raycasts from Camera.main each frame.
-        // NOTE: Only override ROTATION, not position (position yanks FPSController hierarchy).
-        if (pressed && _gameCamRef != null && _leftControllerGO != null)
-        {
-            _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation;
-            _interactAiming = true;
-        }
-        else if (_interactAiming && !pressed)
-        {
-            _interactAiming = false;
-        }
+        // Camera.main rotation is always redirected to controller in UpdateLeftInteractMarker.
+        if (pressed) _interactAiming = true;
+        else if (_interactAiming && !pressed) _interactAiming = false;
 
         bool edge = pressed && !_interactBtnPrev;
         _interactBtnPrev = pressed;
@@ -5343,11 +5334,14 @@ public class VRCamera : MonoBehaviour
 
         try
         {
-            // Ray origin: use Camera.main position (head/eye level) because the game's
-            // InteractionController fires from cam.transform.position. We only override
-            // Camera.main's ROTATION to match the controller (not position — that yanks
-            // the FPSController hierarchy). Using the same origin makes the dot show
-            // exactly what the game would hit when you pull the trigger.
+            // Always redirect Camera.main rotation to the left controller direction so
+            // the game's InteractionRaycastCheck (which reads Camera.main) uses hand aim.
+            // Position is NOT overridden — that yanks the FPSController hierarchy.
+            if (_gameCamRef != null)
+                _gameCamRef.transform.rotation = _leftControllerGO.transform.rotation;
+
+            // Ray origin: Camera.main position (head/eye level) — same as the game's
+            // InteractionController. Controller rotation only (not position).
             Vector3 lStart = _gameCamRef != null ? _gameCamRef.transform.position
                                                  : _leftControllerGO.transform.position;
             Vector3 lDir   = _leftControllerGO.transform.forward;
