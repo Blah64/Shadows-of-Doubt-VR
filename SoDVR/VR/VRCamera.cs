@@ -5570,56 +5570,56 @@ public class VRCamera : MonoBehaviour
             catch { continue; }
             if (!hasTarget) continue;
 
-            // Project world position to VR camera viewport (0-1)
-            Vector3 vp = _leftCam.WorldToViewportPoint(worldPos);
+            // Project world position using VR left camera to get screen pixel coords.
+            // The VR left camera renders to _leftRT (2554×2756); WorldToScreenPoint
+            // returns pixel coords in that resolution.
+            Vector3 screenPt = _leftCam.WorldToScreenPoint(worldPos);
 
-            // Behind camera: flip to opposite edge
-            if (vp.z < 0f)
+            // Behind camera: flip to opposite side of screen
+            bool behindCam = screenPt.z < 0f;
+            if (behindCam)
             {
-                vp.x = 1f - vp.x;
-                vp.y = 1f - vp.y;
-                vp.z = 0f;
+                screenPt.x = _leftCam.pixelWidth  - screenPt.x;
+                screenPt.y = _leftCam.pixelHeight - screenPt.y;
+                screenPt.z = 0.01f;
             }
 
-            // Check if on-screen (within viewport with small margin)
-            bool onScreen = vp.x > 0.05f && vp.x < 0.95f && vp.y > 0.05f && vp.y < 0.95f && vp.z > 0f;
+            float vpx = screenPt.x / _leftCam.pixelWidth;
+            float vpy = screenPt.y / _leftCam.pixelHeight;
+            bool onScreen = !behindCam &&
+                            vpx > 0.05f && vpx < 0.95f &&
+                            vpy > 0.05f && vpy < 0.95f;
 
-            // Clamp to edge when off-screen (arrow sits at border)
+            // Clamp off-screen positions to near the HUD edge
             if (!onScreen)
             {
-                float cx = vp.x - 0.5f;
-                float cy = vp.y - 0.5f;
+                float cx = vpx - 0.5f;
+                float cy = vpy - 0.5f;
                 float maxAbs = Mathf.Max(Mathf.Abs(cx), Mathf.Abs(cy));
-                if (maxAbs > 0.001f)
-                {
-                    float scale = 0.45f / maxAbs; // clamp to 0.45 from center
-                    cx *= scale;
-                    cy *= scale;
-                }
-                vp.x = cx + 0.5f;
-                vp.y = cy + 0.5f;
+                if (maxAbs > 0.001f) { float s = 0.45f / maxAbs; cx *= s; cy *= s; }
+                screenPt.x = (cx + 0.5f) * _leftCam.pixelWidth;
+                screenPt.y = (cy + 0.5f) * _leftCam.pixelHeight;
             }
 
-            // Map viewport to firstPersonUI local coords (pivot at center)
-            float localX = (vp.x - 0.5f) * fpSize.x;
-            float localY = (vp.y - 0.5f) * fpSize.y;
-
-            // Override position. The game uses rect.localPosition (not anchoredPosition).
+            // Convert screen coords to UIPointers local space using the VR camera.
+            // This is the correct WorldSpace canvas projection — equivalent to what the
+            // game does with null camera on ScreenSpace, but working for WorldSpace.
+            Vector2 localPt = Vector2.zero;
+            bool projected = false;
             try
             {
-                if (upc.rect != null)
-                    upc.rect.localPosition = new Vector3(localX, localY, 0f);
+                projected = RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                    container.GetComponent<RectTransform>(),
+                    new Vector2(screenPt.x, screenPt.y),
+                    _leftCam, out localPt);
             }
             catch { }
 
-            // Force visibility.
-            // Root cause: game's Update() does:
-            //   if (SignedAngle(target - player, player.forward, up) > 75°) img.enabled = false;
-            // In VR, Camera.main no longer tracks player body forward — angle check always
-            // fails → img.enabled=false → arrow invisible. No CanvasGroup involved.
-            // Fix: always force img.enabled=true and rend.SetAlpha directly.
+            // Override position and visibility
             try
             {
+                if (projected && upc.rect != null)
+                    upc.rect.localPosition = new Vector3(localPt.x, localPt.y, 0f);
                 upc.fadeIn = 1f;
                 if (upc.img  != null) upc.img.enabled = true;
                 if (upc.rend != null) upc.rend.SetAlpha(1f);
@@ -5627,44 +5627,17 @@ public class VRCamera : MonoBehaviour
             catch { }
 
             if ((_poseFrameCount % 180) == 0)
-            {
-                // Also dump Image color alpha and UIPointers container sizeDelta
-                // to diagnose why the arrow isn't rendering despite img=true/rend=ok.
-                string imgColor = "n/a";
-                try { if (upc.img != null) imgColor = $"({upc.img.color.r:F2},{upc.img.color.g:F2},{upc.img.color.b:F2},{upc.img.color.a:F2})"; }
-                catch { imgColor = "err"; }
-                string containerSz = "n/a";
-                try
-                {
-                    var crt = container.GetComponent<RectTransform>();
-                    if (crt != null) containerSz = $"sd={crt.sizeDelta} anch={crt.anchorMin}→{crt.anchorMax}";
-                }
-                catch { }
-                string rectParentSz = "n/a";
-                try
-                {
-                    if (upc.rect?.parent != null)
-                    {
-                        var prt = upc.rect.parent.GetComponent<RectTransform>();
-                        if (prt != null) rectParentSz = $"sd={prt.sizeDelta}";
-                    }
-                }
-                catch { }
-                Log.LogInfo($"[UIPtr] override vp=({vp.x:F2},{vp.y:F2}) onScreen={onScreen} -> local=({localX:F1},{localY:F1}) img={(upc.img != null ? upc.img.enabled.ToString() : "null")} rend={(upc.rend != null ? "ok" : "null")} imgColor={imgColor} container={containerSz} rectParent={rectParentSz}");
-            }
+                Log.LogInfo($"[UIPtr] vp=({vpx:F2},{vpy:F2}) onScreen={onScreen} projected={projected} local=({localPt.x:F1},{localPt.y:F1})");
 
-            // Rotation: point arrow toward target direction when off-screen
-            if (!onScreen)
+            // Rotation: point arrow toward target when off-screen
+            float rotAngle = Mathf.Atan2(vpy - 0.5f, vpx - 0.5f) * Mathf.Rad2Deg;
+            try
             {
-                float angle = Mathf.Atan2(vp.y - 0.5f, vp.x - 0.5f) * Mathf.Rad2Deg;
-                try { upc.rect.localRotation = Quaternion.Euler(0f, 0f, angle - 90f); }
-                catch { }
+                upc.rect.localRotation = onScreen
+                    ? Quaternion.identity
+                    : Quaternion.Euler(0f, 0f, rotAngle - 90f);
             }
-            else
-            {
-                try { upc.rect.localRotation = Quaternion.identity; }
-                catch { }
-            }
+            catch { }
         }
     }
 
