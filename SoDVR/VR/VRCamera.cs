@@ -5497,40 +5497,11 @@ public class VRCamera : MonoBehaviour
         catch { return; }
         if (container == null) return;
 
-        // Periodic diagnostic: log container state every 180 frames
+        // Periodic diagnostic
         if (_poseFrameCount - _uiPointerDiagFrame >= 180)
         {
             _uiPointerDiagFrame = _poseFrameCount;
-            Log.LogInfo($"[UIPtr] container='{container.gameObject.name}' childCount={container.childCount} fpUI={(_firstPersonUI != null ? _firstPersonUI.sizeDelta.ToString() : "null")}");
-            for (int di = 0; di < container.childCount && di < 5; di++)
-            {
-                var dc = container.GetChild(di);
-                if (dc == null) continue;
-                var dupc = dc.GetComponent<UIPointerController>();
-                string objInfo = "";
-                try
-                {
-                    if (dupc?.objective?.queueElement != null)
-                        objInfo = $" usePointer={dupc.objective.queueElement.usePointer} worldPos={dupc.objective.queueElement.pointerPosition}";
-                }
-                catch { }
-                // Also dump rect info
-                string rectInfo = "";
-                try
-                {
-                    if (dupc?.rect != null)
-                    {
-                        var rp = dupc.rect.parent;
-                        rectInfo = $" rect.parent='{(rp != null ? rp.gameObject.name : "null")}'" +
-                                   $" rect.anchoredPos={dupc.rect.anchoredPosition}" +
-                                   $" rect.localPos={dupc.rect.localPosition}" +
-                                   $" rect.sd={dupc.rect.sizeDelta}" +
-                                   $" rect.active={dupc.rect.gameObject.activeSelf}";
-                    }
-                }
-                catch { }
-                Log.LogInfo($"[UIPtr]   child[{di}]: '{dc.gameObject.name}' active={dc.gameObject.activeSelf} upc={dupc != null}{objInfo}{rectInfo}");
-            }
+            Log.LogInfo($"[UIPtr] container='{container.gameObject.name}' childCount={container.childCount}");
         }
 
         Vector2 fpSize = _firstPersonUI.sizeDelta; // typically (100, 100)
@@ -5596,51 +5567,30 @@ public class VRCamera : MonoBehaviour
             float localX = (vp.x - 0.5f) * fpSize.x;
             float localY = (vp.y - 0.5f) * fpSize.y;
 
-            // Override the arrow's position
+            // Override position. The game uses rect.localPosition (not anchoredPosition).
             try
             {
                 if (upc.rect != null)
-                {
-                    upc.rect.anchoredPosition = new Vector2(localX, localY);
                     upc.rect.localPosition = new Vector3(localX, localY, 0f);
-                }
             }
             catch { }
 
-            // Force alpha visible — the game's Update() fades CanvasGroup.alpha to 0
-            // because its broken WorldSpace projection thinks arrows are off-screen.
-            // Setting upc.alpha = 1 influences the *target* for the game's lerp, but
-            // the actual CanvasGroup alpha may still be near 0. Override it directly.
+            // Force visibility.
+            // Root cause: game's Update() does:
+            //   if (SignedAngle(target - player, player.forward, up) > 75°) img.enabled = false;
+            // In VR, Camera.main no longer tracks player body forward — angle check always
+            // fails → img.enabled=false → arrow invisible. No CanvasGroup involved.
+            // Fix: always force img.enabled=true and rend.SetAlpha directly.
             try
             {
-                upc.alpha  = 1f;
                 upc.fadeIn = 1f;
+                if (upc.img  != null) upc.img.enabled = true;
                 if (upc.rend != null) upc.rend.SetAlpha(1f);
             }
             catch { }
 
-            // Direct CanvasGroup override — search the UIPointer(Clone) and its rect
-            CanvasGroup? cg = null;
-            try
-            {
-                cg = child.GetComponent<CanvasGroup>();
-                if (cg == null && upc.rect != null)
-                    cg = upc.rect.GetComponent<CanvasGroup>();
-                if (cg == null)
-                    cg = child.GetComponentInChildren<CanvasGroup>();
-            }
-            catch { }
-
-            float cgAlphaBefore = cg != null ? cg.alpha : -1f;
-            if (cg != null)
-            {
-                try { cg.alpha = 1f; }
-                catch { }
-            }
-
-
             if ((_poseFrameCount % 180) == 0)
-                Log.LogInfo($"[UIPtr] override vp=({vp.x:F2},{vp.y:F2}) onScreen={onScreen} -> local=({localX:F1},{localY:F1}) upc.alpha={upc.alpha:F2} cg={(cg != null ? $"found alpha_before={cgAlphaBefore:F2}" : "null")}");
+                Log.LogInfo($"[UIPtr] override vp=({vp.x:F2},{vp.y:F2}) onScreen={onScreen} -> local=({localX:F1},{localY:F1}) img={(upc.img != null ? upc.img.enabled.ToString() : "null")} rend={(upc.rend != null ? "ok" : "null")}");
 
             // Rotation: point arrow toward target direction when off-screen
             if (!onScreen)
