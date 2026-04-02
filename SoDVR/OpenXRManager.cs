@@ -54,7 +54,7 @@ public static class OpenXRManager
     private static IntPtr _pfnSyncActions, _pfnLocateSpace, _pfnGetActionStateBoolean;
     private static IntPtr _pfnGetActionStateVector2f;
     private static ulong  _actionSet, _poseAction, _triggerAction, _thumbAction, _menuButtonAction, _gripAction;
-    private static ulong  _buttonAAction, _buttonBAction, _buttonXAction, _thumbClickAction;
+    private static ulong  _buttonAAction, _buttonBAction, _buttonXAction, _thumbClickAction, _yButtonAction;
     private static ulong  _rightAimSpace, _leftAimSpace;
     private static ulong  _rightHandPath, _leftHandPath;
     public  static bool   ActionSetsReady { get; private set; }
@@ -1406,9 +1406,10 @@ public static class OpenXRManager
             _triggerAction     = CreateAction("trigger",      "Trigger",      1, _leftHandPath, _rightHandPath);
             _thumbAction       = CreateAction("thumbstick",   "Thumbstick",   3, _leftHandPath, _rightHandPath);
             _gripAction        = CreateAction("grip",         "Grip",         1, _leftHandPath, _rightHandPath);
-            // Menu button: left-hand only — used to open/close the pause menu (ESC equivalent).
-            // Single subaction path (left hand). Bound to Y-button and menu-button below.
+            // Menu button: left controller menu button only → ESC (pause menu).
+            // Y button has its own separate action → Alternate (F key).
             _menuButtonAction  = CreateAction("menu_button",  "Menu Button",  1, _leftHandPath);
+            _yButtonAction     = CreateAction("y_button",     "Y Button",     1, _leftHandPath);
             _buttonAAction     = CreateAction("button_a",     "A Button",     1, _rightHandPath);
             _buttonBAction     = CreateAction("button_b",     "B Button",     1, _rightHandPath);
             _buttonXAction     = CreateAction("button_x",     "X Button",     1, _leftHandPath);
@@ -1435,8 +1436,9 @@ public static class OpenXRManager
             ulong thumbClickL    = XrStringToPath("/user/hand/left/input/thumbstick/click");
 
             // XrActionSuggestedBinding = action(8) + binding(8) = 16 bytes
-            // Include both Y-button and menu-button bindings for _menuButtonAction; runtime
-            // picks whichever is available on the actual hardware.
+            // Y button and menu button are separate actions:
+            //   y/click    → _yButtonAction    (Alternate / F key)
+            //   menu/click → _menuButtonAction (ESC)
             int bindCount = 15;
             IntPtr bindings = Marshal.AllocHGlobal(bindCount * 16);
             try
@@ -1452,7 +1454,7 @@ public static class OpenXRManager
                 WriteBinding(3,  _triggerAction,    trigLeft);
                 WriteBinding(4,  _thumbAction,      stickR);
                 WriteBinding(5,  _thumbAction,      stickL);
-                WriteBinding(6,  _menuButtonAction, menuBtnY);
+                WriteBinding(6,  _yButtonAction,    menuBtnY);
                 WriteBinding(7,  _menuButtonAction, menuBtnM);
                 WriteBinding(8,  _gripAction,       gripRight);
                 WriteBinding(9,  _gripAction,       gripLeft);
@@ -1479,7 +1481,7 @@ public static class OpenXRManager
             }
             finally { Marshal.FreeHGlobal(bindings); }
 
-            Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X} thumb=0x{_thumbAction:X} menu=0x{_menuButtonAction:X} grip=0x{_gripAction:X} btnA=0x{_buttonAAction:X} btnB=0x{_buttonBAction:X} btnX=0x{_buttonXAction:X} thumbClick=0x{_thumbClickAction:X}");
+            Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X} thumb=0x{_thumbAction:X} menu=0x{_menuButtonAction:X} grip=0x{_gripAction:X} btnA=0x{_buttonAAction:X} btnB=0x{_buttonBAction:X} btnX=0x{_buttonXAction:X} btnY=0x{_yButtonAction:X} thumbClick=0x{_thumbClickAction:X}");
         }
         catch (Exception ex) { Log.LogWarning($"  SetupActionSetsInstance: {ex}"); }
     }
@@ -1715,6 +1717,22 @@ public static class OpenXRManager
             return rc == 0;
         }
         catch (Exception ex) { Log.LogWarning($"  GetButtonXState: {ex.Message}"); return false; }
+    }
+
+    public static bool GetButtonYState(out bool pressed)
+    {
+        pressed = false;
+        if (!ActionSetsReady || _dGetActionStateBool == null || _yButtonAction == 0) return false;
+        try
+        {
+            Marshal.WriteInt64(_bActionGi, 16, (long)_yButtonAction);
+            Marshal.WriteInt64(_bActionGi, 24, (long)_leftHandPath);
+            int rc = _dGetActionStateBool(_session, _bActionGi, _bActionStateBool);
+            if (rc == 0)
+                pressed = Marshal.ReadInt32(_bActionStateBool, 16) != 0;
+            return rc == 0;
+        }
+        catch (Exception ex) { Log.LogWarning($"  GetButtonYState: {ex.Message}"); return false; }
     }
 
     public static bool GetThumbClickState(bool right, out bool pressed)

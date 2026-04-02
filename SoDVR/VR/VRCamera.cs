@@ -954,6 +954,7 @@ public class VRCamera : MonoBehaviour
                 UpdateJump();
                 UpdateInteract();
                 UpdateCrouch();
+                UpdateYButton();
                 UpdateSprint();
                 UpdateNotebook();
                 UpdateFlashlight();
@@ -5043,6 +5044,8 @@ public class VRCamera : MonoBehaviour
     /// <summary>Left X → C (crouch toggle).</summary>
     private float _crouchCooldownUntil;
     private bool  _crouchNeedsRelease;
+    private float _yBtnCooldownUntil;
+    private bool  _yBtnNeedsRelease;
     private void UpdateCrouch()
     {
         if (VRSettingsPanel.RootGO?.activeSelf == true) return;
@@ -5062,6 +5065,30 @@ public class VRCamera : MonoBehaviour
             Log.LogInfo("[VRCamera] Crouch (C)");
         }
         catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateCrouch: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Left Y button → Alternate (F key by default).
+    /// Same 3-phase debounce as Crouch/Menu.
+    /// </summary>
+    private void UpdateYButton()
+    {
+        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
+        if (Time.realtimeSinceStartup < _yBtnCooldownUntil) return;
+        OpenXRManager.GetButtonYState(out bool pressed);
+        if (_yBtnNeedsRelease) { if (!pressed) _yBtnNeedsRelease = false; return; }
+        if (!pressed) return;
+        _yBtnNeedsRelease    = true;
+        _yBtnCooldownUntil   = Time.realtimeSinceStartup + 0.3f;
+        try
+        {
+            const byte VK_F = 0x46;
+            const uint KEYEVENTF_KEYUP = 0x0002;
+            keybd_event(VK_F, 0, 0,               UIntPtr.Zero);
+            keybd_event(VK_F, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            Log.LogInfo("[VRCamera] Y button → Alternate (F)");
+        }
+        catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateYButton: {ex.Message}"); }
     }
 
     /// <summary>
