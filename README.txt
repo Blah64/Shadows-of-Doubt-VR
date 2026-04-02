@@ -4,8 +4,8 @@ SoDVR — VR Controller Mapping
 RIGHT CONTROLLER
 ----------------
 Trigger              UI click (point at menu and pull)
-A button             Jump (Space)
-B button             Notebook / Map (Tab)
+A button             Jump (Space), or Right-click on canvas when aiming
+B button             Notebook / Map (Tab), or Middle-click drag on canvas when aiming
 Grip                 Drag canvas panels (CaseBoard, menus)
 Thumbstick left/right  Rotate (snap turn or smooth — configurable in VR Settings)
 Thumbstick up/down   Scroll VR Settings panel (when open)
@@ -17,7 +17,7 @@ Menu button (below stick)  Pause menu (ESC)
 Y button                   Alternate / Use item (F)
 X button                   Crouch toggle (C)
 Trigger                    Interact — doors, objects, NPCs (E)
-Grip                       Inventory (X)
+Grip                       Right-click on canvas (case board context menu, etc)
 Thumbstick                 Move player (head-relative)
 Thumbstick click           Sprint toggle (auto-stops when stick returns to centre)
 
