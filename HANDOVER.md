@@ -1,7 +1,111 @@
 # SoDVR — Technical Handover
 
-**Date**: 2026-04-01 (updated end of Phase 14 partial)
-**Phase**: 14 in progress — case board interaction parked, HUD settings plan ready
+**Date**: 2026-04-03 (updated end of Phase 15)
+**Phase**: 16 — case board interaction fixes (parked issues from NotesWork.md)
+
+---
+
+## Phase 15 (2026-04-03) — Minimap interaction COMPLETE ✓
+
+### What was done
+
+**B button pan** — direct `content.anchoredPosition` manipulation on the minimap ScrollRect.
+`ExecuteEvents` drag chain (`initializePotentialDrag` → `OnBeginDrag` → `OnDrag`) is not exposed
+in IL2CPP interop so ScrollRect.m_Dragging stays false and `OnDrag` returns early. Pan is implemented
+by plane-raycasting to the minimap canvas, converting to viewport-local delta each frame.
+
+**Trigger click — open evidence note** — `MapController.mapCursorNode` is driven by our own
+`InverseTransformPoint + MapToNode + nodeMap.TryGetValue` each frame, bypassing MapController's broken
+`ScreenPointToLocalPointInRectangle(camera=null)` path (always null for WorldSpace canvases).
+`_minimapLastKnownNode` holds a fallback for the frame where MapController resets the node after our Update.
+
+**A button right-click — context menu** — `TryRightClickCanvas` calls `mapCtrl.mapContextMenu.OpenMenu()`
+directly. Fresh node computed from ray at click time (not stale lastKnown) to avoid wrong-location menus.
+
+**`_minimapCanvasRef` override** — `_cursorTargetCanvas` was always WindowCanvas (evidence note sitting
+in front of the minimap). Both A/B button target selection and the per-frame MapCursor update now
+plane-raycast + bounds-check against `_minimapCanvasRef` (cached at scan time) independently.
+
+**Pinned note visibility restored** — `isScrollViewport` skip in the RectMask2D disable loop was
+leaving RectMask2D enabled on ALL ScrollRect viewports, clipping pinned notes in WorldSpace.
+
+**Floor navigation** — floor +/- buttons on MinimapCanvas are standard UI Buttons, clickable via trigger.
+Rooms at load=1+. `mapCtrl.load` is the floor currently displayed. `_minimapLastKnownNode` is cleared
+when `mapCtrl.load` changes.
+
+### Key fields added
+```csharp
+private Canvas?  _minimapCanvasRef;      // cached at scan time
+private NewNode? _minimapLastKnownNode;  // fallback when MapController resets mapCursorNode
+private float    _minimapLastLoad;       // floor level at last node cache — cleared on floor change
+```
+
+### Commit
+`4648a66` — "Add minimap interaction: pan, location click, context menu"
+
+---
+
+## Phase 14 Session 2 (2026-04-02) — Compass arrow + TDR fixes
+
+### GPU TDR fix — DONE ✓
+
+`UpdateInventory()` was setting `_gameCamRef.transform.rotation = _leftControllerGO.transform.rotation`
+every frame while grip was held.  This drove expensive HDRP shadow/volumetric recalculations → nvlddmkm.sys TDR (crash) on Blackwell GPU.
+
+Fix: removed the rotation override from `UpdateInventory()`.  Camera.main is already redirected to controller direction safely in two places:
+1. **End of `Update()`** — game's `InteractionRaycastCheck` runs in a later Update and reads this for action text / interact raycasts
+2. **Post-`FrameEndStereo`** — used for held item tracking
+
+### Action text fix — DONE ✓
+
+After removing the grip redirect, `UpdatePose()` (line ~884) was the last writer of Camera.main rotation in Update — it wrote VR head rotation.  The game's interaction system then aimed at the head, not the controller.
+
+Fix: added one line at the very **end** of `Update()` that overwrites Camera.main rotation with the left controller direction.  The game's `InteractionRaycastCheck` runs in a later Update (script ordering) and reads the controller direction → action text labels now point from the controller correctly.
+
+### UIPointerController overlays — CONFIRMED WORKING ✓
+
+A force-visibility test (red squares) proved UIPointerController overlays were already rendering.  The "missing arrow" complaint was about a different element entirely.  The force test was reverted and the overlays remain functional (commit `f2652ae`).
+
+### Awareness compass — INITIAL FIX IMPLEMENTED, AWAITING TEST (commit `f040235`)
+
+**What it is**: NOT a canvas.  The awareness compass is a **3D MeshRenderer system** on `InterfaceController`.
+
+```
+compassContainer  (public serialized GO)
+  └── backgroundTransform  (ring MeshRenderer)
+        └── spawned icons  (Instantiate(awarenessIndicator, backgroundTransform))
+              ├── imageTransform  (billboard, faces camera)
+              └── arrowTransform  (points at threat; localZ ≈ -5 at rest)
+```
+
+**Why it's invisible in VR**:
+1. `compassContainer` is parented to game camera hierarchy in scene — tracks suppressed game cam
+2. `backgroundTransform.rotation = LookRotation(Vector3.forward, Vector3.up)` → faces world-forward, not VR cam
+3. `imageTransform.rotation = game cam rotation` = controller direction, not VR head
+
+**Fix added** — `UpdateCompass()` called from `LateUpdate()` after `InterfaceController.Update()`, before render:
+```csharp
+_compassContainer.position = headPos + headFwd * 1.2f + headUp * (-0.55f);
+backgroundTransform.rotation = LookRotation(headFwd, headUp);
+foreach icon: imageTransform.rotation = _leftCam.transform.rotation;
+```
+
+**New fields**:
+```csharp
+private Transform? _compassContainer;   // cached step 5h in DiscoverMovementSystem
+private bool       _compassDiagDone;
+private const float CompassDist    = 1.2f;
+private const float CompassYOffset = -0.55f;
+```
+
+**Diagnostic logging** fires on first LateUpdate call after discovery — logs world pos, local pos, parent/grandparent names, lossyScale, and icon count. Look for `[Compass]` lines in the log.
+
+**What needs to happen next**:
+1. Run game, get into a session where an NPC spots you (spawns awareness icons)
+2. Read `[Compass]` log lines — verify parent chain, check world/local positions and scale
+3. Tune `CompassDist` / `CompassYOffset` so compass appears at screen-bottom
+4. If still invisible: check layer, check material shader compatibility with HDRP
+5. Full technical notes: `VRMod/ArrowWork.md`
 
 ---
 
@@ -104,7 +208,7 @@ When ActionPanelCanvas was grip-dragged, it stored a self-referential zero offse
 | `VRSettingsPanelInternal` | 1.60m | Working ✓ |
 | `CaseCanvas` | 1.80m | Working ✓ (BG suppressed, pin board interactive; pin steal issue parked) |
 | `LocationDetailsCanvas` | 1.80m | Working ✓ (grip-draggable) |
-| `MinimapCanvas` | 1.50m | Partially working |
+| `MinimapCanvas` | 1.50m | Working ✓ (pan, location click, context menu) |
 
 ---
 

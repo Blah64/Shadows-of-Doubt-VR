@@ -275,7 +275,7 @@ When the player loads a save from the main menu (same Unity scene reused):
 | `VRSettingsPanelInternal` | 1.60m | Working ✓ |
 | `CaseCanvas` | 1.80m | Working ✓ (BG suppressed, pin board interactive) |
 | `LocationDetailsCanvas` | 1.80m | Working ✓ (grip-draggable) |
-| `MinimapCanvas` | 1.50m | Partially working |
+| `MinimapCanvas` | 1.50m | Working ✓ (pan, location click, context menu) |
 
 ## Phase 12 status (COMPLETE — 2026-03-30)
 - Case board pin drag (direct RectTransform manipulation) ✓
@@ -290,13 +290,22 @@ When the player loads a save from the main menu (same Unity scene reused):
 - ActionPanelCanvas excluded from grip-draggable canvas set ✓
 - Save-load warp eliminated ✓
 
-## Phase 14 status (IN PROGRESS — 2026-04-01)
-Partial work done:
+## Phase 14 status (COMPLETE — 2026-04-03)
 - A button → right-click on any aimed canvas (not just case board) ✓
 - B button → middle-click drag on any aimed canvas ✓
 - Jump/notebook suppressed when aiming at canvas ✓
 - `_cursorTargetCanvas` field tracks nearest aimed-at canvas ✓
 - HUD settings plan written (plan file at `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`) — NOT YET IMPLEMENTED
+
+## Phase 15 status (COMPLETE — 2026-04-03)
+MinimapCanvas fully interactive:
+- B button pans map (direct `content.anchoredPosition` — ExecuteEvents drag unavailable in IL2CPP) ✓
+- Trigger click opens evidence note for aimed map location ✓
+- A button right-click opens context menu (Plot Route, Open Evidence) ✓
+- Floor navigation buttons (+/-) clickable in VR → rooms at load=1+ selectable ✓
+- `_minimapCanvasRef` cached at scan; A/B and MapCursor raycast against it directly (bypasses `_cursorTargetCanvas` = WindowCanvas obstruction)
+- `mapCursorNode` driven via `InverseTransformPoint` + `MapToNode` + `nodeMap` lookup (camera=null path broken)
+- RectMask2D disable-all (removed `isScrollViewport` skip) — restored pinned note visibility ✓
 
 ### PARKED issues (see NotesWork.md for full analysis)
 Three case board interaction issues were investigated but not resolved:
@@ -319,6 +328,79 @@ The `ContextMenus` container under `TooltipCanvas` has two types of children:
 - `PinnedQuickMenu(Clone)` — hover tooltip (should NOT trigger freeze)
 Filter by `childName.StartsWith("ContextMenu")` to distinguish them (implemented 2026-04-01).
 
+## CRITICAL: Awareness compass — 3D MeshRenderer system (discovered 2026-04-02)
+
+The "awareness compass" (circle with directional arrows at screen-bottom) is **NOT a UI canvas**.
+It is a 3D MeshRenderer system on `InterfaceController`:
+
+```
+compassContainer (public serialized GameObject)
+  └── backgroundTransform (Transform — the ring MeshRenderer)
+        └── spawned icons (Instantiate(PrefabControls.Instance.awarenessIndicator, backgroundTransform))
+              ├── imageTransform  — faces camera (billboard)
+              └── arrowTransform  — points toward threat
+```
+
+`InterfaceController.Update()` drives it each frame:
+```csharp
+backgroundTransform.rotation = Quaternion.LookRotation(Vector3.forward, Vector3.up); // world-forward
+awarenessIcon.spawned.transform.rotation = Quaternion.LookRotation(camPos - targetPos, Vector3.up);
+awarenessIcon.imageTransform.rotation = CameraController.Instance.cam.transform.rotation;
+```
+
+**In VR it's invisible** because: `compassContainer` tracks the suppressed game camera; `backgroundTransform.rotation` = world-forward (not VR-cam-forward); `imageTransform` faces the controller direction (game cam = controller aim).
+
+**Fix**: `UpdateCompass()` in `LateUpdate()` (after `InterfaceController.Update()`, before `_leftCam.Render()`):
+1. `_compassContainer.position = headPos + headFwd * CompassDist + headUp * CompassYOffset`
+2. `backgroundTransform.rotation = LookRotation(headFwd, headUp)`
+3. For each icon: `imageTransform.rotation = _leftCam.transform.rotation`
+
+Constants (tunable): `CompassDist = 1.2f`, `CompassYOffset = -0.55f`.
+Cache: `_compassContainer` set in `DiscoverMovementSystem` step 5h from `_interfaceCtrl.compassContainer`.
+Full analysis: `VRMod/ArrowWork.md`.
+
+## CRITICAL: Minimap interaction — direct canvas raycast required (Phase 15)
+
+`_cursorTargetCanvas` is unreliable for minimap when an evidence note (WindowCanvas) is open in front of it.
+All minimap-specific paths use `_minimapCanvasRef` (cached at scan time) with a direct plane-raycast + bounds check:
+
+```csharp
+// In per-frame MapCursor update — always runs against _minimapCanvasRef regardless of _cursorTargetCanvas:
+var mmPlane = new Plane(-_minimapCanvasRef.transform.forward, _minimapCanvasRef.transform.position);
+if (mmPlane.Raycast(new Ray(rPos, rFwd), out float mmDist) && mmDist > 0f)
+{
+    Vector3 localXYZ = mapCtrl.overlayAll.InverseTransformPoint(rPos + rFwd * mmDist);
+    Vector2 nodeCoords = mapCtrl.MapToNode(new Vector2(localXYZ.x, localXYZ.y));
+    var key = new Vector3(Mathf.RoundToInt(nodeCoords.x), Mathf.RoundToInt(nodeCoords.y), mapCtrl.load);
+    PathFinder.Instance.nodeMap.TryGetValue(key, out NewNode node);
+    mapCtrl.mapCursorNode = node;
+    _minimapLastKnownNode = node;  // trigger-click fallback (MapController resets node after our Update)
+}
+```
+
+`rmbTarget` (A button) and `mmbTarget` (B button) both apply the same bounds-check override:
+if ray hits `_minimapCanvasRef` rect → set target to `_minimapCanvasRef` regardless of `_cursorTargetCanvas`.
+
+**Node floors**: `mapCtrl.load` = currently viewed floor on map. Floor 0 = streets + building entries.
+Rooms are at load=1+. Floor buttons on MinimapCanvas are standard UI Buttons — clickable via trigger.
+`MapToNode(localPos2D)` = `(Floor(x/32f), Floor(y/32f))`. nodeMap key = `Vector3(nodeX, nodeY, load)`.
+
+**TryRightClickCanvas** computes a fresh node from the ray at click time (not stale `_minimapLastKnownNode`)
+to ensure the context menu always opens for the node currently under the cursor.
+
+## CRITICAL: GPU TDR — do NOT set Camera.main rotation in Update() every frame (discovered 2026-04-02)
+
+Setting `_gameCamRef.transform.rotation = _leftControllerGO.transform.rotation` in `Update()` every frame
+while grip is held drives expensive HDRP shadow/volumetric recalculations → GPU TDR (nvlddmkm.sys Blackwell).
+
+**Safe locations for Camera.main rotation override:**
+- **End of `Update()`** (after all movement logic) — safe; game's `InteractionRaycastCheck` runs in a
+  later Update and reads it, so action text / interact raycasts use controller direction ✓
+- **`LateUpdate` / post-`FrameEndStereo`** — safe; used for held item tracking ✓
+
+**NEVER** set it inside a per-frame conditional block that runs for extended periods (e.g., "while grip held").
+The `UpdateInventory()` grip-camera-redirect was removed as the TDR source (2026-04-02).
+
 ## History
 - git `1be2b0e` — full VDXR-internal patching approach (archived checkpoint, do not rebase)
 - git `346a6df` — **Phase 5 complete**: standard loader working, stereo image in headset
@@ -330,4 +412,5 @@ Filter by `childName.StartsWith("ContextMenu")` to distinguish them (implemented
 - **Phase 11 complete** (2026-03-30): Movement — all controls bound, held item + arm tracking, VR arm display (`255dafc`)
 - **Phase 12 complete** (2026-03-30): Case board pin drag, context menu world-lock (`1ee8e9d`)
 - **Phase 13 complete** (2026-03-30): Save-load warp fix, ActionPanelCanvas grip-drag deadlock fix (`d0bd328`)
-- **Phase 14 in progress** (2026-04-01): A/B button canvas clicks, HUD settings plan written, case board interaction issues parked in NotesWork.md (`79fc4dd` + uncommitted VRCamera.cs changes)
+- **Phase 14 complete** (2026-04-01/02): A/B button canvas clicks, GPU TDR fix, action text fix, awareness compass VR fix, HUD settings plan written (`79fc4dd`, `f040235`)
+- **Phase 15 complete** (2026-04-03): Minimap pan/click/right-click, pinned note visibility restored, `_minimapCanvasRef` direct raycast (`4648a66`)

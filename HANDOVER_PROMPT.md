@@ -14,7 +14,10 @@ Then read the main source files:
 - `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\OpenXRManager.cs`
 - `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\SoDVR\VR\VRSettingsPanel.cs`
 
-## What is working (Phase 13 complete, Phase 14 partial)
+Also read the parked case board investigation notes:
+- `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\NotesWork.md`
+
+## What is working (Phase 15 complete — last commit 4648a66)
 
 - Stereo rendering in headset ✓
 - Head tracking ✓
@@ -35,39 +38,58 @@ Then read the main source files:
 | Left grip | Inventory (X key) |
 | Right trigger | UI click |
 | Right A | Jump (or right-click when aiming at a canvas) |
-| Right B | Notebook/map (Tab) (or middle-click drag when aiming at a canvas) |
+| Right B | Notebook/map (Tab) (or middle-click drag / minimap pan when aiming at a canvas) |
 
 - **Held item tracking** — carried world objects follow VR controller ✓
 - **VR arm display** — both arms track their respective controllers ✓
 - **Left laser beam** — LineRenderer on left controller, toggle in VR Settings ✓
 - **Case board** — pins/notes/evidence interactive, pin drag working ✓
 - **Save/load** — no warp after loading a save game ✓
-- **Case board grip-drag** — panels (map, notes, bio, etc.) relocatable; ActionPanelCanvas fixed in place ✓
+- **Case board grip-drag** — panels relocatable; ActionPanelCanvas fixed in place ✓
+- **Action text** — left controller aim direction used for interact raycasts ✓
+- **Minimap** — B button pan, trigger click opens evidence note, A right-click opens context menu ✓
+- **Floor navigation on map** — floor +/- buttons clickable, room nodes at load=1+ ✓
 
-## Known issues / parked work
+## Active work: Case board interaction fixes (Phase 16)
 
-**Parked (see NotesWork.md for full analysis + suggested fixes):**
-- Context menu aim dot / visual misalignment (game writes screen coords + Z-scale=0 every frame to ContextMenu(Clone))
-- Opened pinned notes (WindowCanvas) aim dot misalignment — not yet diagnosed
-- Pin proximity "stealing" with 2+ pins on case board — coordinate space drift after context menu
+Three issues are parked in `NotesWork.md` with full analysis. These are the target for this session:
 
-**Other:**
-- MinimapCanvas partially working
+### Problem 1: Context menu aim dot / visual misalignment
+The game overwrites `ContextMenu(Clone).localPosition` to screen coords, `localRot.y ≈ 284°`,
+and `localScale.z = 0` every frame. Our zeroing (in 3 locations) may lose the race.
+Z-scale=0 may also prevent correct bounds testing.
+
+**Current state**: TooltipCanvas is frozen at the correct world position when context menu active.
+But the ContextMenu(Clone) content may still be visually offset because the game resets it.
+
+**Suggested approach**: Reparent `ContextMenu(Clone)` away from game control at first detection,
+then the game's positioning MonoBehaviour loses its handle and stops writing to it.
+Alternatively intercept the MonoBehaviour that drives the position each frame.
+
+### Problem 2: Opened pinned notes (WindowCanvas) aim dot misalignment
+When a note is opened from a pin on the case board, the WindowCanvas appears but the aim dot
+(and therefore trigger-click) doesn't align with the visible window.
+
+**Not yet diagnosed** — needs diagnostic logging to compare aim dot position vs canvas transform.
+
+### Problem 3: Pin proximity "stealing" with 2+ pins
+When 2 or more pins are present, the wrong pin gets targeted. Coordinate space was fixed
+(anchoredPosition → localPosition), but "2 children, no pin close enough" errors still appear
+after context menu is used. `hitLocal` from `InverseTransformPoint` may drift after the
+context menu freeze/unfreeze cycle.
+
+**Current state**: likely needs per-pin distance logging immediately after context menu closes
+to see what coordinates are being compared.
+
+## Other known issues
+
+- Context menu from map (A right-click): menu items may not respond if `mapCursorNode` gets
+  reset before user clicks a menu item — may need investigation
+- Awareness compass (3D MeshRenderer system): VR fix implemented but not confirmed working
+  (needs NPC spotting the player to spawn awareness icons)
+- HUD settings plan written but not implemented (plan: `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`)
 - Some additive items show as semi-transparent white, not original colours
-- PopupMessage gets scale-reset by game (fixed each scan cycle, slight lag)
 - No comfort options yet (vignette, configurable snap-turn degrees, IPD)
-- Jump while stationary — may not work in some states (not diagnosed)
-- Notebook B-press — reportedly opens and instantly closes (not diagnosed)
-
-## Ready to implement (plan written, not started)
-
-**HUD settings** — 5 adjustable settings in VR Settings General tab + auto-hide:
-- Plan file: `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`
-- Files to modify: `SoDVR/VR/VRSettingsPanel.cs` + `SoDVR/VR/VRCamera.cs`
-
-## Uncommitted changes
-
-`SoDVR/VR/VRCamera.cs` has uncommitted changes from the last session (case board interaction attempts — parked). Commit or review before starting new work.
 
 ## Build & deploy
 ```bash
@@ -76,6 +98,12 @@ dotnet build SoDVR/SoDVR.csproj -c Release
 cp SoDVR/bin/Release/net6.0/SoDVR.dll "../BepInEx/plugins/SoDVR.dll"
 ```
 Log: `E:\SteamLibrary\steamapps\common\Shadows of Doubt\BepInEx\LogOutput.log`
+
+**Mono branch** for decompiling game assembly:
+`E:\SteamLibrary\steamapps\common\Shadows of Doubt\Shadows of Doubt_Data\Managed\Assembly-CSharp.dll`
+Use `ilspycmd` to decompile — e.g. `ilspycmd "...Assembly-CSharp.dll" -t MapContextMenu`
+
+Ask me to switch to the mono branch when you need to read game source.
 
 When I say **"done"** it means I've run the game and the log is ready. Always read it immediately.
 
