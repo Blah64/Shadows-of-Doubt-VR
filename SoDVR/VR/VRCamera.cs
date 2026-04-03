@@ -111,6 +111,16 @@ public class VRCamera : MonoBehaviour
     private readonly HashSet<int>         _caseContentIds = new();
     private Canvas?                       _casePanelCanvas;
     private int                           _casePanelId = -1;
+    // MinimapCanvas ScrollRect Viewport — cached so UpdateMinimapZoom() can compute
+    // a fitting zoom scale that makes the full city fit within the Viewport at min zoom.
+    private Transform?                    _minimapViewportTransform;
+    private bool                          _minimapZoomApplied;
+    private bool                          _minimapPanActive;
+    private Vector2                       _minimapPanLastScreenPos;
+    private ScrollRect?                   _minimapScrollRect;
+    private NewNode?                      _minimapLastKnownNode; // last node found under VR aim
+    private float                         _minimapLastLoad = -1f; // floor level when _minimapLastKnownNode was set
+    private Canvas?                       _minimapCanvasRef;     // cached reference to MinimapCanvas
 
     // PopupMessage / TutorialMessage: nested dialog canvases under TooltipCanvas.
     // When active, TooltipCanvas is repositioned as a Menu dialog instead of a tooltip.
@@ -1661,6 +1671,10 @@ public class VRCamera : MonoBehaviour
                 // Awareness compass: reposition and reorient for VR head view.
                 UpdateCompass();
 
+                // Minimap: set ZoomContent zoom range so the full city fits within the
+                // Viewport at minimum zoom (applied once after MapController is ready).
+                UpdateMinimapZoom();
+
                 // No GL.invertCulling — HDRP flipYMode handles both Y-flip and culling.
                 _rightCam.Render();
                 _leftCam.Render();
@@ -1860,6 +1874,9 @@ public class VRCamera : MonoBehaviour
                 _casePanelCanvas = canvas;
                 _casePanelId = id;
             }
+            // Cache MinimapCanvas — used for direct ray-hit checks independent of _cursorTargetCanvas.
+            if (cname.IndexOf("Minimap", StringComparison.OrdinalIgnoreCase) >= 0)
+                _minimapCanvasRef = canvas;
         }
 
         // Reparent pass: canvases physically inside GameCanvas (or any other scaled canvas)
@@ -2033,6 +2050,29 @@ public class VRCamera : MonoBehaviour
                     catch { }
                 }
                 _nestedCanvasIds.Add(nid);   // always nested — never independently positioned
+
+                // ScrollRect content canvases render on top of their parent canvas's sibling
+                // elements (e.g. MapControls buttons) in WorldSpace because nested canvases
+                // bypass hierarchy draw order. Fix: push them below the parent by setting
+                // sortingOrder = -1. MapControls buttons (renderQueue 3008) then win.
+                try
+                {
+                    bool isScrollContent = false;
+                    var scrollWalker = nc.transform.parent;
+                    for (int sw = 0; sw < 4 && scrollWalker != null; sw++)
+                    {
+                        if (scrollWalker.GetComponent<ScrollRect>() != null) { isScrollContent = true; break; }
+                        scrollWalker = scrollWalker.parent;
+                    }
+                    if (isScrollContent)
+                    {
+                        nc.overrideSorting = true;
+                        nc.sortingOrder = -1;
+                        Log.LogInfo($"[VRCamera] NestedCanvas '{nc.gameObject.name}' in '{root.gameObject.name}': sortingOrder=-1 (ScrollRect content)");
+                    }
+                }
+                catch { }
+
                 Log.LogInfo($"[VRCamera] NestedCanvas '{nc.gameObject.name}' in '{root.gameObject.name}' patched={patched}");
             }
         }
@@ -2238,6 +2278,55 @@ public class VRCamera : MonoBehaviour
         return null;
     }
 
+    // Set ZoomContent.zoomLimit.x and desiredZoom so the full city fits within the Viewport
+    // at minimum zoom — eliminating map overflow at zoom-out.
+    // Called once after _minimapViewportTransform is cached and MapController is ready.
+    private void UpdateMinimapZoom()
+    {
+        if (_minimapZoomApplied || _minimapViewportTransform == null) return;
+        try
+        {
+            var mapCtrl = MapController.Instance;
+            if (mapCtrl == null) return;
+
+            var zc = mapCtrl.zoomController;
+            if (zc == null) return;
+
+            // Prefer MapController.viewport (authoritative) over our cached transform.
+            var vpRT = mapCtrl.viewport
+                    ?? (_minimapViewportTransform as RectTransform
+                        ?? _minimapViewportTransform?.GetComponent<RectTransform>());
+            if (vpRT == null) return;
+
+            // normalSize is the Content sizeDelta at zoom=1 (full city).
+            var normalSize = zc.normalSize;
+            // Viewport uses stretch anchors so sizeDelta=(0,0); rect.size gives actual layout size.
+            var vpSize = vpRT.rect.size;
+            Log.LogInfo($"[VRCamera] MinimapZoom diag: normalSize={normalSize} vpRect={vpSize} vpSizeDelta={vpRT.sizeDelta} zoom={zc.zoom} zoomLimit={zc.zoomLimit}");
+            if (normalSize.x <= 0 || normalSize.y <= 0 || vpSize.x <= 0 || vpSize.y <= 0) return;
+
+            // Scale factor to fit the full city within the Viewport rect.
+            float fitZoom = Mathf.Min(vpSize.x / normalSize.x, vpSize.y / normalSize.y);
+            fitZoom = Mathf.Clamp(fitZoom, 0.01f, 1f);
+
+            // Allow zooming out to fitZoom (whole city fits) and in up to original max.
+            float maxZoom = zc.zoomLimit.y;
+            zc.zoomLimit = new UnityEngine.Vector2(fitZoom, maxZoom);
+
+            // Start zoomed in to show the player's neighbourhood, not the whole city.
+            // Use 4x the fit zoom so a reasonable area is visible without overflow.
+            float startZoom = Mathf.Min(fitZoom * 4f, maxZoom);
+            zc.desiredZoom  = startZoom;
+
+            _minimapZoomApplied = true;
+            Log.LogInfo($"[VRCamera] MinimapZoom: vpSize={vpSize} normalSize={normalSize} fitZoom={fitZoom:F3} startZoom={startZoom:F3} maxZoom={maxZoom:F1}");
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"[VRCamera] UpdateMinimapZoom: {ex.Message}");
+        }
+    }
+
     private void RelaxMenuCanvasClipping(Canvas canvas)
     {
         if (!ShouldRelaxMenuClipping(canvas)) return;
@@ -2259,6 +2348,87 @@ public class VRCamera : MonoBehaviour
                 {
                     var mg = mask.graphic;
                     if (mg != null) mg.color = new Color(mg.color.r, mg.color.g, mg.color.b, 0f);
+                }
+                catch { }
+                // For the MinimapCanvas ScrollRect Viewport: keep the stencil Mask enabled.
+                // The Mask clips the map content using stencil — this only works if we DON'T
+                // replace child materials (which would lose the stencil state Mask applied).
+                // We cache the Viewport transform so ForceUIZTestAlways can skip patching its content.
+                // For all other ScrollRect Viewports: disable Mask and add RectMask2D instead.
+                bool skipMaskDisable = false;
+                try
+                {
+                    bool isScrollViewport = mask.transform.parent != null
+                        && mask.transform.parent.GetComponent<ScrollRect>() != null;
+                    if (isScrollViewport)
+                    {
+                        bool isMinimapViewport = false;
+                        var cvWalk = mask.transform.parent;
+                        for (int cv = 0; cv < 6 && cvWalk != null; cv++)
+                        {
+                            if ((cvWalk.gameObject.name ?? "").IndexOf("Minimap", StringComparison.OrdinalIgnoreCase) >= 0)
+                            { isMinimapViewport = true; break; }
+                            cvWalk = cvWalk.parent;
+                        }
+                        if (isMinimapViewport)
+                        {
+                            // Stencil Mask is disabled (HDRP uses stencil buffer internally,
+                            // conflicting with UI stencil → map content invisible inside mask).
+                            // RectMask2D can't clip nested Canvas children.
+                            // Instead: scale ZoomContent so the city fits within the Viewport
+                            // at minimum zoom (no overflow at zoom-out), applied in UpdateMinimapZoom().
+                            _minimapViewportTransform = mask.transform;
+                            _minimapZoomApplied = false; // re-apply zoom fit on next LateUpdate
+                            Log.LogInfo($"[VRCamera] MinimapViewport: '{mask.gameObject.name}' cached (Mask disabled, zoom-fit will be applied)");
+
+                            // Diagnostic: log Viewport and Content geometry so we understand the scale/overflow
+                            try
+                            {
+                                var vp = mask.transform as RectTransform;
+                                var sr = mask.transform.parent?.GetComponent<ScrollRect>();
+                                var content = sr?.content;
+                                if (vp != null)
+                                    Log.LogInfo($"[MapDiag] Viewport rt: sizeDelta={vp.sizeDelta} ancPos={vp.anchoredPosition} lossyScale={vp.lossyScale}");
+                                if (content != null)
+                                {
+                                    var ct = content.transform as RectTransform ?? content.transform.GetComponent<RectTransform>();
+                                    if (ct != null)
+                                        Log.LogInfo($"[MapDiag] Content rt: sizeDelta={ct.sizeDelta} ancPos={ct.anchoredPosition} localScale={ct.localScale} lossyScale={ct.lossyScale}");
+                                    // World-space corners of Content
+                                    var corners = new Vector3[4];
+                                    if (ct != null) { ct.GetWorldCorners(corners); Log.LogInfo($"[MapDiag] Content worldCorners: BL={corners[0].ToString("F2")} TR={corners[2].ToString("F2")}"); }
+                                }
+                                if (vp != null)
+                                {
+                                    var corners = new Vector3[4];
+                                    vp.GetWorldCorners(corners);
+                                    Log.LogInfo($"[MapDiag] Viewport worldCorners: BL={corners[0].ToString("F2")} TR={corners[2].ToString("F2")}");
+                                }
+                                // List direct children of Content
+                                if (content != null)
+                                {
+                                    var sb = new System.Text.StringBuilder();
+                                    for (int ci = 0; ci < System.Math.Min(content.childCount, 8); ci++)
+                                    {
+                                        var ch = content.GetChild(ci);
+                                        if (ch == null) continue;
+                                        sb.Append(ch.gameObject.name); sb.Append('(');
+                                        var cc = ch.gameObject.GetComponent<Canvas>();
+                                        sb.Append(cc != null ? $"Canvas.en={cc.enabled}" : "noCanvas");
+                                        sb.Append(") ");
+                                    }
+                                    Log.LogInfo($"[MapDiag] Content children[0..7]: {sb}");
+                                }
+                            }
+                            catch (Exception diagEx) { Log.LogWarning($"[MapDiag] {diagEx.Message}"); }
+                        }
+                        else if (mask.gameObject.GetComponent<RectMask2D>() == null)
+                        {
+                            // Non-minimap ScrollRect Viewport: RectMask2D replaces stencil Mask.
+                            mask.gameObject.AddComponent<RectMask2D>();
+                            Log.LogInfo($"[VRCamera] Added RectMask2D to '{mask.gameObject.name}' (replacing stencil Mask on ScrollRect viewport)");
+                        }
+                    }
                 }
                 catch { }
                 mask.enabled = false;
@@ -2910,6 +3080,26 @@ public class VRCamera : MonoBehaviour
 
     private int ForceUIZTestAlways(Canvas canvas, bool logQueueMap = true)
     {
+        // Discover MinimapCanvas Viewport via ScrollRect regardless of whether masks have
+        // already been processed (s_menuMaskRelaxedCanvases skips the Mask loop on re-runs).
+        if (_minimapViewportTransform == null)
+        {
+            try
+            {
+                bool isMinimapCanvas = (canvas.gameObject.name ?? "").IndexOf("Minimap", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (isMinimapCanvas)
+                {
+                    var sr = canvas.GetComponentInChildren<ScrollRect>(true);
+                    if (sr?.viewport != null)
+                    {
+                        _minimapViewportTransform = sr.viewport;
+                        _minimapZoomApplied = false;
+                        Log.LogInfo($"[VRCamera] MinimapViewport discovered via ScrollRect: '{sr.viewport.gameObject.name}'");
+                    }
+                }
+            }
+            catch { }
+        }
         try
         {
             RelaxMenuCanvasClipping(canvas);
@@ -2939,6 +3129,7 @@ public class VRCamera : MonoBehaviour
             {
                 var g = graphics[i];
                 if (g == null) continue;
+
                 Material orig;
                 // Use sharedMaterial to avoid creating orphaned unique material instances.
                 // g.material (getter) creates a new instance that we'd immediately replace,
@@ -4344,6 +4535,61 @@ public class VRCamera : MonoBehaviour
         Vector3 rPos = _rightControllerGO.transform.position;
         Vector3 rFwd = _rightControllerGO.transform.forward;
 
+        // ── Drive MapController.mapCursorNode directly while aimed at MinimapCanvas ──
+        // MapController.Update() uses ScreenPointToLocalPointInRectangle(camera=null) which
+        // silently breaks for WorldSpace canvases → mapCursorNode always null.
+        // Bypass: convert world hit point to overlayAll local coords via InverseTransformPoint,
+        // call MapToNode(), look up PathFinder.nodeMap, and set mapCursorNode ourselves.
+        // BepInEx Update() runs after game scripts so we overwrite MapController's null each frame.
+        // Always raycast against MinimapCanvas directly — _cursorTargetCanvas may be WindowCanvas
+        // (an open evidence note) sitting in front of the minimap, but the user is aiming past it.
+        var _mmCanvasForCursor = _minimapCanvasRef;
+        if (_mmCanvasForCursor != null && _mmCanvasForCursor.gameObject.activeInHierarchy)
+        {
+            try
+            {
+                var mapCtrl = MapController.Instance;
+                if (mapCtrl?.overlayAll != null)
+                {
+                    var mmPlane = new Plane(-_mmCanvasForCursor.transform.forward, _mmCanvasForCursor.transform.position);
+                        if (mmPlane.Raycast(new Ray(rPos, rFwd), out float mmDist) && mmDist > 0f)
+                        {
+                            Vector3 mmWP   = rPos + rFwd * mmDist;
+                            // World hit point → overlayAll local space (= map pixel coords)
+                            Vector3 localXYZ = mapCtrl.overlayAll.InverseTransformPoint(mmWP);
+                            Vector2 localPos2D = new Vector2(localXYZ.x, localXYZ.y);
+                            // Node grid coords
+                            Vector2 nodeCoords = mapCtrl.MapToNode(localPos2D);
+                            var nodeKey = new Vector3(
+                                Mathf.RoundToInt(nodeCoords.x),
+                                Mathf.RoundToInt(nodeCoords.y),
+                                mapCtrl.load);
+                            // Look up and set mapCursorNode
+                            var pf = PathFinder.Instance;
+                            if (pf?.nodeMap != null)
+                            {
+                                NewNode foundNode = null;
+                                // Clear cached node if floor changed
+                                if (mapCtrl.load != _minimapLastLoad)
+                                {
+                                    _minimapLastKnownNode = null;
+                                    _minimapLastLoad = mapCtrl.load;
+                                }
+                                if (pf.nodeMap.TryGetValue(nodeKey, out foundNode))
+                                {
+                                    mapCtrl.mapCursorNode = foundNode;
+                                    _minimapLastKnownNode = foundNode;
+                                    _minimapLastLoad = mapCtrl.load;
+                                }
+                                else
+                                    mapCtrl.mapCursorNode = null;
+                            }
+                        }
+                    }
+                }
+                catch { }
+        }
+
         // ── Case board drag handling (left-click = trigger) ──────────────
         if (_cbDragActive)
         {
@@ -4723,13 +4969,28 @@ public class VRCamera : MonoBehaviour
                 if (_cbANeedsRelease) { if (!aPressed) _cbANeedsRelease = false; }
                 else if (aPressed)
                 {
-                    // Prefer aimed canvas; fall back to case board when aiming at nothing
+                    // Prefer aimed canvas; fall back to case board when aiming at nothing.
+                    // Override to minimap if ray hits it — _cursorTargetCanvas may be a note
+                    // window sitting in front of the minimap.
                     Canvas? rmbTarget = _cursorHasTarget ? _cursorTargetCanvas
                                       : (cbOpen ? _casePanelCanvas : null);
+                    if (_minimapCanvasRef != null && _minimapCanvasRef.gameObject.activeInHierarchy &&
+                        rmbTarget != _minimapCanvasRef)
+                    {
+                        var _mmPlaneA = new Plane(-_minimapCanvasRef.transform.forward, _minimapCanvasRef.transform.position);
+                        if (_mmPlaneA.Raycast(new Ray(rPos, rFwd), out float _mmDistA) && _mmDistA > 0f)
+                        {
+                            var _mmLocalA = _minimapCanvasRef.transform.InverseTransformPoint(rPos + rFwd * _mmDistA);
+                            var _mmRTA = _minimapCanvasRef.GetComponent<RectTransform>();
+                            if (_mmRTA != null && _mmRTA.rect.Contains(new Vector2(_mmLocalA.x, _mmLocalA.y)))
+                                rmbTarget = _minimapCanvasRef;
+                        }
+                    }
                     if (rmbTarget != null)
                     {
                         // Position CursorRigidbody when targeting case board
                         bool targetIsCaseBoard = (rmbTarget == _casePanelCanvas);
+                        bool targetIsMinimap   = (rmbTarget.gameObject.name ?? "").IndexOf("Minimap", StringComparison.OrdinalIgnoreCase) >= 0;
                         if (targetIsCaseBoard && _cbCursorRbRT != null && _cbContentContainerRT != null && _casePanelCanvas != null)
                         {
                             try
@@ -4742,14 +5003,25 @@ public class VRCamera : MonoBehaviour
                             catch { }
                         }
                         GetCaseBoardScreenPos(rPos, rFwd, rmbTarget, moveCursor: true);
-                        const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
-                        const uint MOUSEEVENTF_RIGHTUP   = 0x0010;
-                        mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, UIntPtr.Zero);
-                        mouse_event(MOUSEEVENTF_RIGHTUP,   0, 0, 0, UIntPtr.Zero);
+
+                        if (targetIsMinimap)
+                        {
+                            // Map elements use Unity event system (IPointerClickHandler) for
+                            // right-click context menus — mouse_event doesn't reach them.
+                            // Use ExecuteEvents with right button on the raycasted GO instead.
+                            TryRightClickCanvas(rPos, rFwd, rmbTarget);
+                        }
+                        else
+                        {
+                            const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+                            const uint MOUSEEVENTF_RIGHTUP   = 0x0010;
+                            mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, UIntPtr.Zero);
+                            mouse_event(MOUSEEVENTF_RIGHTUP,   0, 0, 0, UIntPtr.Zero);
+                        }
                         _cbANeedsRelease = true;
                         _cbACooldownUntil = Time.realtimeSinceStartup + 1.0f;
                         if (targetIsCaseBoard) _cbCursorPauseUntil = Time.realtimeSinceStartup + 3.0f;
-                        Log.LogInfo($"[VRCamera] Right-click on '{rmbTarget.gameObject.name}' (mouse_event)");
+                        Log.LogInfo($"[VRCamera] Right-click on '{rmbTarget.gameObject.name}' ({(targetIsMinimap ? "ExecuteEvents" : "mouse_event")})");
                     }
                 }
             }
@@ -4758,16 +5030,84 @@ public class VRCamera : MonoBehaviour
         // ── Right B → middle-click drag on any aimed canvas (case board strings, notes, etc.) ──
         // Mid-drag stays active until B is released, even if aim target changes.
         // When neither case board open nor aiming at canvas: B falls through to UpdateNotebook().
-        if (cbOpen || _cursorHasTarget || _cbMidDragActive)
+        if (cbOpen || _cursorHasTarget || _cbMidDragActive || _minimapPanActive)
         {
             const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
             const uint MOUSEEVENTF_MIDDLEUP   = 0x0040;
 
-            // Prefer aimed canvas; fall back to case board when aiming at nothing
+            // Prefer aimed canvas; fall back to case board when aiming at nothing.
+            // Override to minimap if ray hits it — _cursorTargetCanvas may be a note
+            // window sitting in front of the minimap.
             Canvas? mmbTarget = _cursorHasTarget ? _cursorTargetCanvas
                               : (cbOpen ? _casePanelCanvas : null);
+            if (_minimapCanvasRef != null && _minimapCanvasRef.gameObject.activeInHierarchy &&
+                mmbTarget != _minimapCanvasRef)
+            {
+                var _mmPlaneB = new Plane(-_minimapCanvasRef.transform.forward, _minimapCanvasRef.transform.position);
+                if (_mmPlaneB.Raycast(new Ray(rPos, rFwd), out float _mmDistB) && _mmDistB > 0f)
+                {
+                    var _mmLocalB = _minimapCanvasRef.transform.InverseTransformPoint(rPos + rFwd * _mmDistB);
+                    var _mmRTB = _minimapCanvasRef.GetComponent<RectTransform>();
+                    if (_mmRTB != null && _mmRTB.rect.Contains(new Vector2(_mmLocalB.x, _mmLocalB.y)))
+                        mmbTarget = _minimapCanvasRef;
+                }
+            }
 
-            if (_cbMidDragActive)
+            bool mmbTargetIsMinimap = (mmbTarget?.gameObject.name ?? "").IndexOf("Minimap", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            // ── Minimap pan: B button → direct content.anchoredPosition manipulation ──
+            // ExecuteEvents drag chain requires initializePotentialDrag (not exposed in IL2CPP interop)
+            // before OnBeginDrag/OnDrag will work. Instead we move content directly each frame.
+            if (_minimapPanActive)
+            {
+                OpenXRManager.GetButtonBState(out bool bNow);
+                if (!bNow)
+                {
+                    Log.LogInfo("[VRCamera] MinimapPan end");
+                    _minimapPanActive = false;
+                    _cbBNeedsRelease = true;
+                    _cbBCooldownUntil = Time.realtimeSinceStartup + 0.3f;
+                }
+                else if (_minimapScrollRect != null && _leftCam != null)
+                {
+                    // Continue pan: raycast to canvas, convert to viewport-local delta, shift content
+                    try
+                    {
+                        var vpRT = _minimapScrollRect.viewport;
+                        var contentRT = _minimapScrollRect.content;
+                        if (vpRT != null && contentRT != null)
+                        {
+                            var srCanvas = _minimapScrollRect.GetComponentInParent<Canvas>();
+                            if (srCanvas != null)
+                            {
+                                var plane = new Plane(-srCanvas.transform.forward, srCanvas.transform.position);
+                                if (plane.Raycast(new Ray(rPos, rFwd), out float dist) && dist > 0f)
+                                {
+                                    Vector3 wp2 = rPos + rFwd * dist;
+                                    Vector2 sp2 = (Vector2)_leftCam.WorldToScreenPoint(wp2);
+                                    if ((sp2 - _minimapPanLastScreenPos).sqrMagnitude > 0.01f)
+                                    {
+                                        // Convert both screen points to viewport-local coords
+                                        bool gotOld = RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                                            vpRT, _minimapPanLastScreenPos, _leftCam, out Vector2 oldLocal);
+                                        bool gotNew = RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                                            vpRT, sp2, _leftCam, out Vector2 newLocal);
+                                        if (gotOld && gotNew)
+                                        {
+                                            // Dragging right moves content right (grab-and-drag feel)
+                                            Vector2 localDelta = newLocal - oldLocal;
+                                            contentRT.anchoredPosition += localDelta;
+                                        }
+                                        _minimapPanLastScreenPos = sp2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            else if (_cbMidDragActive)
             {
                 // Mid-drag in progress: read button directly (no debounce, need release detection)
                 OpenXRManager.GetButtonBState(out bool bNow);
@@ -4798,11 +5138,36 @@ public class VRCamera : MonoBehaviour
                 if (_cbBNeedsRelease) { if (!bPressed) _cbBNeedsRelease = false; }
                 else if (bPressed && mmbTarget != null)
                 {
-                    GetCaseBoardScreenPos(rPos, rFwd, mmbTarget, moveCursor: true);
-                    mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, UIntPtr.Zero);
-                    _cbMidDragActive = true;
-                    _cbMidDragStarted = false;
-                    Log.LogInfo($"[VRCamera] Mid-press on '{mmbTarget?.gameObject.name}' (mouse_event)");
+                    if (mmbTargetIsMinimap)
+                    {
+                        // Start minimap pan — record start screen pos; content movement happens per-frame
+                        try
+                        {
+                            if (_minimapScrollRect == null)
+                                _minimapScrollRect = mmbTarget.GetComponentInChildren<ScrollRect>(true);
+                            if (_minimapScrollRect != null && _leftCam != null)
+                            {
+                                var plane = new Plane(-mmbTarget.transform.forward, mmbTarget.transform.position);
+                                if (plane.Raycast(new Ray(rPos, rFwd), out float dist) && dist > 0f)
+                                {
+                                    Vector3 wp2 = rPos + rFwd * dist;
+                                    Vector2 sp2 = (Vector2)_leftCam.WorldToScreenPoint(wp2);
+                                    _minimapPanActive = true;
+                                    _minimapPanLastScreenPos = sp2;
+                                    Log.LogInfo($"[VRCamera] MinimapPan start at {sp2.ToString("F0")} SR='{_minimapScrollRect.gameObject.name}'");
+                                }
+                            }
+                        }
+                        catch (Exception ex) { Log.LogWarning($"[VRCamera] MinimapPan start: {ex.Message}"); }
+                    }
+                    else
+                    {
+                        GetCaseBoardScreenPos(rPos, rFwd, mmbTarget, moveCursor: true);
+                        mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, UIntPtr.Zero);
+                        _cbMidDragActive = true;
+                        _cbMidDragStarted = false;
+                        Log.LogInfo($"[VRCamera] Mid-press on '{mmbTarget?.gameObject.name}' (mouse_event)");
+                    }
                 }
             }
         }
@@ -4814,6 +5179,11 @@ public class VRCamera : MonoBehaviour
                 const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
                 mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
                 _cbMidDragActive = false; _cbMidDragStarted = false;
+            }
+            if (_minimapPanActive)
+            {
+                Log.LogInfo("[VRCamera] MinimapPan cancelled (no target)");
+                _minimapPanActive = false;
             }
         }
 
@@ -6959,6 +7329,131 @@ public class VRCamera : MonoBehaviour
         }
     }
 
+    // Fire a right-button PointerClick via Unity's event system on the canvas element hit
+    // by the controller ray.  Used for MinimapCanvas where mouse_event doesn't reach
+    // IPointerClickHandler implementations (location marker context menus, etc.).
+    private void TryRightClickCanvas(Vector3 origin, Vector3 direction, Canvas targetCanvas)
+    {
+        try
+        {
+            if (_leftCam == null) return;
+            var gr = targetCanvas.GetComponent<GraphicRaycaster>();
+            if (gr == null || !gr.enabled) return;
+            var plane = new Plane(-targetCanvas.transform.forward, targetCanvas.transform.position);
+            if (!plane.Raycast(new Ray(origin, direction), out float d) || d <= 0f) return;
+            Vector3 wp = origin + direction * d;
+            Vector3 sp = _leftCam.WorldToScreenPoint(wp);
+
+            var es = EventSystem.current;
+            if (es == null) return;
+            var ped = new PointerEventData(es);
+            ped.position = new Vector2(sp.x, sp.y);
+            ped.button   = PointerEventData.InputButton.Right;
+
+            var results = new Il2CppSystem.Collections.Generic.List<RaycastResult>();
+            gr.Raycast(ped, results);
+            if (results.Count == 0) return;
+
+            // Skip transparent overlay buttons (e.g. ControllerSelectMapButton alpha=0).
+            int bestIdx = 0;
+            for (int ri = 0; ri < results.Count; ri++)
+            {
+                var rgo = results[ri].gameObject;
+                if (rgo == null) continue;
+                bool hasHiddenBtn = false;
+                try
+                {
+                    var rbtr = rgo.transform;
+                    for (int rbl = 0; rbl < 6 && rbtr != null; rbl++)
+                    {
+                        var rbtn = rbtr.GetComponent<Button>();
+                        if (rbtn != null)
+                        {
+                            bool hidden = false;
+                            try { hidden = !rbtn.IsInteractable(); } catch { }
+                            if (!hidden)
+                            {
+                                try { var gr2 = rbtr.gameObject.GetComponent<Graphic>(); if (gr2 != null) hidden = gr2.color.a < 0.01f; } catch { }
+                            }
+                            hasHiddenBtn = hidden;
+                            break; // found a button at this level — stop walking
+                        }
+                        rbtr = rbtr.parent;
+                    }
+                }
+                catch { }
+                if (!hasHiddenBtn) { bestIdx = ri; break; }
+            }
+            var go = results[bestIdx].gameObject;
+            if (go == null) return;
+
+            ped.pointerEnter            = go;
+            ped.pointerPress            = go;
+            ped.rawPointerPress         = go;
+            ped.pressPosition           = ped.position;
+            ped.pointerCurrentRaycast   = results[bestIdx];
+            ped.pointerPressRaycast     = results[bestIdx];
+            ped.eligibleForClick        = true;
+
+            // Map buildings have raycastTarget=false so we always hit Viewport, not a building.
+            // Instead, mapCursorNode is driven by VirtualCursorController.lastKnownPos (set each frame).
+            // Open the map context menu directly — no ButtonController, no mouseInputMode toggle needed.
+            bool rcHandled = false;
+            bool targetIsMinimapRC = (targetCanvas.gameObject.name ?? "").IndexOf("Minimap", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (targetIsMinimapRC)
+            {
+                try
+                {
+                    var mapCtrl = MapController.Instance;
+                    // Compute fresh node from current ray — don't rely on stale lastKnown
+                    NewNode rcNode = mapCtrl?.mapCursorNode;
+                    if (rcNode == null && mapCtrl?.overlayAll != null)
+                    {
+                        try
+                        {
+                            var mmPlaneRC = new Plane(-targetCanvas.transform.forward, targetCanvas.transform.position);
+                            if (mmPlaneRC.Raycast(new Ray(origin, direction), out float mmDistRC) && mmDistRC > 0f)
+                            {
+                                var localRC = mapCtrl.overlayAll.InverseTransformPoint(origin + direction * mmDistRC);
+                                var ncRC = mapCtrl.MapToNode(new Vector2(localRC.x, localRC.y));
+                                var keyRC = new Vector3(Mathf.RoundToInt(ncRC.x), Mathf.RoundToInt(ncRC.y), mapCtrl.load);
+                                NewNode fn = null;
+                                if (PathFinder.Instance?.nodeMap?.TryGetValue(keyRC, out fn) == true)
+                                    rcNode = fn;
+                            }
+                        }
+                        catch { }
+                    }
+                    if (mapCtrl?.mapContextMenu != null && rcNode != null)
+                    {
+                        mapCtrl.mapCursorNode = rcNode; // freeze correct node for menu item callbacks
+                        mapCtrl.mapContextMenu.OpenMenu();
+                        rcHandled = true;
+                        Log.LogInfo($"[VRCamera] TryRightClickCanvas: OpenMenu for node='{rcNode.gameLocation?.name}'");
+                    }
+                    else
+                    {
+                        Log.LogInfo($"[VRCamera] TryRightClickCanvas: minimap skip — node={(rcNode == null ? "null" : "ok")} menu={(mapCtrl?.mapContextMenu == null ? "null" : "ok")}");
+                    }
+                }
+                catch (Exception rcEx) { Log.LogWarning($"[VRCamera] TryRightClickCanvas MinimapRC: {rcEx.Message}"); }
+            }
+
+            if (!rcHandled)
+            {
+                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerEnterHandler);
+                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerDownHandler);
+                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerUpHandler);
+                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerClickHandler);
+            }
+            Log.LogInfo($"[VRCamera] TryRightClickCanvas: '{go.name}' on '{targetCanvas.gameObject.name}' (mouseMode={targetIsMinimapRC})");
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"[VRCamera] TryRightClickCanvas: {ex.Message}");
+        }
+    }
+
     private Vector2 GetCaseBoardScreenPos(Vector3 origin, Vector3 direction, Canvas? targetCanvas = null,
                                            bool moveCursor = false)
     {
@@ -7134,7 +7629,57 @@ public class VRCamera : MonoBehaviour
 
                 if (results.Count > 0)
                 {
-                    var go = results[0].gameObject;
+                    // On MinimapCanvas, a transparent overlay Button (ControllerSelectMapButton,
+                    // alpha=0) sits at results[0] and intercepts every click.  Pre-scan all results
+                    // to find the first one whose hierarchy contains a visible, interactable Button.
+                    // Only do this for MinimapCanvas — other canvases (case board, context menus)
+                    // rely on results[0] being an IPointerClickHandler without a Button, and would
+                    // break if we redirected them to a Button found deeper in the results list.
+                    int bestResultIdx = 0;
+                    bool hitCanvasIsMinimap = (hitCanvas.gameObject.name ?? "").IndexOf("Minimap", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (hitCanvasIsMinimap)
+                    {
+                        // Skip results that have a HIDDEN Unity Button in their hierarchy.
+                        // Use the first result that either has a visible button OR has no button at all.
+                        // (Previously looked for "first visible button" which broke building clicks —
+                        //  map buildings use ButtonController, not Unity Button, so no visible Button
+                        //  was ever found and bestResultIdx stayed at 0 = ControllerSelectMapButton.)
+                        for (int ri = 0; ri < results.Count; ri++)
+                        {
+                            var rgo = results[ri].gameObject;
+                            if (rgo == null) continue;
+                            bool hasHiddenBtn = false;
+                            try
+                            {
+                                var rbtr = rgo.transform;
+                                for (int rbl = 0; rbl < 6 && rbtr != null; rbl++)
+                                {
+                                    var rbtn = rbtr.GetComponent<Button>();
+                                    if (rbtn != null)
+                                    {
+                                        bool rbtnHidden = false;
+                                        try { rbtnHidden = !rbtn.IsInteractable(); } catch { }
+                                        if (!rbtnHidden)
+                                        {
+                                            try
+                                            {
+                                                var rbtnGr = rbtr.gameObject.GetComponent<Graphic>();
+                                                if (rbtnGr != null) rbtnHidden = rbtnGr.color.a < 0.01f;
+                                            }
+                                            catch { }
+                                        }
+                                        hasHiddenBtn = rbtnHidden; // hidden if button present AND hidden
+                                        break; // found a button — stop walking
+                                    }
+                                    rbtr = rbtr.parent;
+                                }
+                            }
+                            catch { }
+                            if (!hasHiddenBtn) { bestResultIdx = ri; break; }
+                        }
+                    }
+                    var go = results[bestResultIdx].gameObject;
+                    var bestResult = results[bestResultIdx];
 
                     // CaseCanvas interaction filter: only process clicks that land on (or inside)
                     // a GameObject with a Button component in its hierarchy. Generic elements
@@ -7302,8 +7847,8 @@ public class VRCamera : MonoBehaviour
                     ped.rawPointerPress    = go;
                     ped.pointerDrag        = go;
                     ped.pressPosition      = ped.position;
-                    ped.pointerCurrentRaycast = results[0];
-                    ped.pointerPressRaycast   = results[0];
+                    ped.pointerCurrentRaycast = bestResult;
+                    ped.pointerPressRaycast   = bestResult;
                     ped.eligibleForClick   = true;
                     ped.button             = PointerEventData.InputButton.Left;
 
@@ -7345,6 +7890,26 @@ public class VRCamera : MonoBehaviour
                             var btn = btr.GetComponent<Button>();
                             if (btn != null)
                             {
+                                // Skip buttons that the game has marked non-interactable OR hidden.
+                                // e.g. ControllerSelectMapButton on MinimapCanvas has alpha=0 and
+                                // intercepts every map click when no gamepad is connected.
+                                // Check both interactable flag and target graphic alpha.
+                                bool btnHidden = false;
+                                try { btnHidden = !btn.IsInteractable(); } catch { }
+                                if (!btnHidden)
+                                {
+                                    // btn.image uses m_TargetGraphic as Image — returns null in IL2CPP
+                                    // if targetGraphic is stored as Graphic base type. Use GetComponent
+                                    // instead to reliably check alpha of the button's own graphic.
+                                    try
+                                    {
+                                        var btnGr = btr.gameObject.GetComponent<Graphic>();
+                                        if (btnGr != null) btnHidden = btnGr.color.a < 0.01f;
+                                    }
+                                    catch { }
+                                }
+                                if (btnHidden) { btr = btr.parent; continue; }
+
                                 int persistentCount = btn.onClick.GetPersistentEventCount();
 
                                 // Only claim this as Button-handled if there are persistent listeners
@@ -7415,11 +7980,50 @@ public class VRCamera : MonoBehaviour
                     // custom IPointerClickHandler implementations (e.g. notes, toggles).
                     if (!handledByButton)
                     {
-                        ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerEnterHandler);
-                        ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerDownHandler);
-                        ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerUpHandler);
-                        ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerClickHandler);
-                        ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.submitHandler);
+                        if (hitCanvasIsMinimap)
+                        {
+                            // Map buildings have raycastTarget=false — GraphicRaycaster always returns
+                            // Viewport, never the building tile. Instead use mapCursorNode which is set
+                            // each frame from VirtualCursorController.lastKnownPos (set above).
+                            bool minimapHandled = false;
+                            try
+                            {
+                                var mapCtrl = MapController.Instance;
+                                var node = mapCtrl?.mapCursorNode ?? _minimapLastKnownNode;
+                                if (node != null && node.gameLocation != null)
+                                {
+                                    InterfaceController.Instance.SpawnWindow(
+                                        node.gameLocation.evidenceEntry,
+                                        Evidence.DataKey.location);
+                                    minimapHandled = true;
+                                    _forceScanFrames = 30;
+                                    Log.LogInfo($"[VRCamera] MinimapClick: SpawnWindow node='{node.gameLocation.name}'");
+                                }
+                                else
+                                {
+                                    Log.LogInfo($"[VRCamera] MinimapClick: mapCursorNode={(node == null ? "null" : "noGameLocation")}");
+                                }
+                            }
+                            catch (Exception mmex) { Log.LogWarning($"[VRCamera] MinimapClick: {mmex.Message}"); }
+
+                            if (!minimapHandled)
+                            {
+                                // No node under cursor — fall back to standard events (floor buttons etc.)
+                                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerEnterHandler);
+                                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerDownHandler);
+                                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerUpHandler);
+                                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerClickHandler);
+                                ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.submitHandler);
+                            }
+                        }
+                        else
+                        {
+                            ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerEnterHandler);
+                            ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerDownHandler);
+                            ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerUpHandler);
+                            ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.pointerClickHandler);
+                            ExecuteEvents.ExecuteHierarchy(go, ped, ExecuteEvents.submitHandler);
+                        }
                     }
 
                     return; // handled — stop checking further canvases
