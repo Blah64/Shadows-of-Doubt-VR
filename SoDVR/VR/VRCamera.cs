@@ -96,7 +96,7 @@ public class VRCamera : MonoBehaviour
     private readonly HashSet<int>         _positionedCanvases = new();
     // Last VR-placed world position + rotation for each canvas (set in LateUpdate/pre-render,
     // re-enforced in Update before aim-dot scan so the game's overwrites don't desync visuals vs interaction).
-    private readonly Dictionary<int, (Vector3 pos, Quaternion rot)> _canvasVRPose = new();
+    private readonly Dictionary<int, (Vector3 pos, Quaternion rot, Vector3 scale)> _canvasVRPose = new();
     // Tracks the last-known active state of each managed canvas (by instance ID).
     // When a canvas transitions false→true AND its name is in s_recentreOnActivate,
     // we clear it from _positionedCanvases so it gets repositioned at the current head.
@@ -237,6 +237,7 @@ public class VRCamera : MonoBehaviour
     private bool       _prevContextMenuActive;    // previous frame context-menu active state (edge detection for force-rescan)
     private bool       _contextMenuFreezeApplied; // true once we've computed the freeze pos/rot for context menu
     private Vector3    _contextMenuFreezePos;    // world position to enforce while context menu is frozen
+    private Vector3    _windowNoteWorldOffset;   // world-space shift applied to WindowCanvas to center Note visual for aim dot scan
     private Quaternion _contextMenuFreezeRot;    // world rotation to enforce while context menu is frozen
     private Vector3    _contextMenuChildWorldPos; // actual world pos of context menu child after zeroing (set in pre-render)
     // Relative offsets (position + rotation) from primary CaseCanvas to other CaseBoard canvases.
@@ -1386,7 +1387,10 @@ public class VRCamera : MonoBehaviour
                 if (mr != null && dotShader != null)
                 {
                     mr.material = new Material(dotShader);
-                    mr.material.color = new Color(1f, 1f, 1f, 0.9f);
+                    // HDR magenta — contrasts against both dark (case board) and light (note paper)
+                    // backgrounds; same colour as the cursor canvas dot.  Plain white was invisible
+                    // on the white/paper-tone evidence note panel background.
+                    mr.material.color = new Color(64f, 0f, 64f, 1f);
                     mr.material.renderQueue = 4000; // render on top of everything
                 }
                 adGO.SetActive(false);
@@ -4231,6 +4235,10 @@ public class VRCamera : MonoBehaviour
                 if (!_canvasVRPose.TryGetValue(kvpFz.Key, out var vrPose)) continue;
                 kvpFz.Value.transform.position = vrPose.pos;
                 kvpFz.Value.transform.rotation = vrPose.rot;
+                // Re-apply snapshotted scale — counteracts game resetting WindowCanvas.localScale
+                // to 1.0 every frame. Skip HUD canvases (they don't have per-frame scale resets).
+                if (!GetCategoryDefaults(GetCanvasCategory(kvpFz.Value.gameObject.name)).IsHUD)
+                    kvpFz.Value.transform.localScale = vrPose.scale;
             }
             // Also zero ContextMenus + children (game resets to screen coords every frame).
             // Only set localPosition — anchoredPosition would override based on anchor config.
@@ -4262,6 +4270,48 @@ public class VRCamera : MonoBehaviour
                     catch { }
                     break;
                 }
+            }
+        }
+
+        // Shift WindowCanvas world position so Note visual center = canvas center.
+        // The game's RectTransform layout puts Note.localPosition far outside the canvas rect
+        // (e.g. center at (-960,540) = canvas top-left corner). We can't override localPosition
+        // (RectTransform layout recalculates it). Instead, shift the canvas world position so
+        // the Note's visual center IS at the canvas plane center. The aim dot bounds check then
+        // naturally passes for the entire Note.
+        _windowNoteWorldOffset = Vector3.zero;
+        if (_actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf)
+        {
+            foreach (var kvpWc in _managedCanvases)
+            {
+                if (kvpWc.Value == null || !kvpWc.Value.gameObject.activeSelf) continue;
+                if ((kvpWc.Value.gameObject.name ?? "").IndexOf("Window", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (GetCanvasCategory(kvpWc.Value.gameObject.name) != CanvasCategory.Menu) continue;
+                try
+                {
+                    var wt = kvpWc.Value.transform;
+                    for (int nci = 0; nci < wt.childCount; nci++)
+                    {
+                        var nch = wt.GetChild(nci);
+                        if (nch == null || !nch.gameObject.activeSelf) continue;
+                        var nrt = nch.GetComponent<RectTransform>();
+                        if (nrt == null) continue;
+                        string cname = nch.gameObject.name ?? "";
+                        if (!cname.Equals("Note", StringComparison.OrdinalIgnoreCase)) continue;
+                        // Note center in canvas local space:
+                        //   pivot (0,1) → center offset = (+halfW, -halfH)
+                        //   localPos + (sizeDelta.x * (0.5-pivot.x), sizeDelta.y * (0.5-pivot.y))
+                        float noteCenterLocalX = nch.localPosition.x + nrt.sizeDelta.x * (0.5f - nrt.pivot.x);
+                        float noteCenterLocalY = nch.localPosition.y + nrt.sizeDelta.y * (0.5f - nrt.pivot.y);
+                        // Convert local offset to world offset
+                        Vector3 localOffset = new Vector3(noteCenterLocalX, noteCenterLocalY, 0f);
+                        _windowNoteWorldOffset = wt.TransformVector(localOffset);
+                        wt.position += _windowNoteWorldOffset;
+                        break; // first active Note only
+                    }
+                }
+                catch { }
+                break; // only one WindowCanvas
             }
         }
 
@@ -4335,8 +4385,6 @@ public class VRCamera : MonoBehaviour
 
             if (foundHit && bestCanvas != null)
             {
-                if (Time.frameCount % 120 == 0)
-                    Log.LogInfo($"[VRCamera] AimDot primary → '{bestCanvas.gameObject.name}' depth={bestDepth:F2} totalHits={_aimDotHits.Count}");
                 _cursorHasTarget   = true;
                 _cursorTargetCanvas = bestCanvas;
                 _cursorTargetPos   = bestCanvas.transform.position;
@@ -4376,6 +4424,22 @@ public class VRCamera : MonoBehaviour
             {
                 try { if (_aimDotPool[i].activeSelf) _aimDotPool[i].SetActive(false); } catch { }
             }
+        }
+
+        // Undo the WindowCanvas world-position shift applied before the aim dot scan.
+        // The shift was needed so the aim dot scan+placement aligns with the Note visual.
+        // Now restore the original position so rendering and click handling see the game's layout.
+        if (_windowNoteWorldOffset != Vector3.zero)
+        {
+            foreach (var kvpWc in _managedCanvases)
+            {
+                if (kvpWc.Value == null || !kvpWc.Value.gameObject.activeSelf) continue;
+                if ((kvpWc.Value.gameObject.name ?? "").IndexOf("Window", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (GetCanvasCategory(kvpWc.Value.gameObject.name) != CanvasCategory.Menu) continue;
+                try { kvpWc.Value.transform.position -= _windowNoteWorldOffset; } catch { }
+                break;
+            }
+            _windowNoteWorldOffset = Vector3.zero;
         }
 
         // Dedicated CaseCanvas (pin board) aim dot — raycasts against the CaseCanvas plane
@@ -5002,7 +5066,20 @@ public class VRCamera : MonoBehaviour
                             }
                             catch { }
                         }
-                        GetCaseBoardScreenPos(rPos, rFwd, rmbTarget, moveCursor: true);
+                        // When case board is open and aimed at ActionPanelCanvas (the frame around
+                        // the board), redirect cursor positioning to CaseCanvas plane so the
+                        // right-click lands at pin-board coordinates, not the panel frame.
+                        // Only redirect ActionPanelCanvas — leave WindowCanvas, minimap, etc. alone.
+                        Canvas? cursorPosCanvas = rmbTarget;
+                        if (cbOpen
+                            && _casePanelCanvas != null
+                            && !targetIsMinimap
+                            && !targetIsCaseBoard
+                            && (rmbTarget.gameObject.name ?? "").IndexOf("ActionPanel", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            cursorPosCanvas = _casePanelCanvas;
+                        }
+                        GetCaseBoardScreenPos(rPos, rFwd, cursorPosCanvas, moveCursor: true);
 
                         if (targetIsMinimap)
                         {
@@ -6671,6 +6748,9 @@ public class VRCamera : MonoBehaviour
         }
         catch { }
 
+        // (Note centering removed — we now shift WindowCanvas world position in Update
+        // for aim dot alignment, not the Note child localPosition which RectTransform blocks.)
+
         // Snapshot all managed canvas poses RIGHT BEFORE rendering.
         // These are re-enforced in Update (before aim-dot scan) to counteract
         // the game overwriting canvas transforms between frames.
@@ -6680,7 +6760,8 @@ public class VRCamera : MonoBehaviour
             if (_nestedCanvasIds.Contains(kvpSnap.Key)) continue;
             try
             {
-                _canvasVRPose[kvpSnap.Key] = (kvpSnap.Value.transform.position, kvpSnap.Value.transform.rotation);
+                _canvasVRPose[kvpSnap.Key] = (kvpSnap.Value.transform.position, kvpSnap.Value.transform.rotation, kvpSnap.Value.transform.localScale);
+                // One-shot diagnostic: compare snapshot position with what we set in PositionCanvases
             }
             catch { }
         }
@@ -7621,6 +7702,35 @@ public class VRCamera : MonoBehaviour
             Vector3 screenPt = _leftCam.WorldToScreenPoint(hitWorld);
             var ped = new PointerEventData(es);
             ped.position = new Vector2(screenPt.x, screenPt.y);
+
+            // If context menu is active and this is TooltipCanvas, zero ContextMenus + active child
+            // immediately before raycasting so GraphicRaycaster sees non-degenerate transforms.
+            // The game sets ContextMenu(Clone).localScale.z = 0 and localPosition = screen coords
+            // every frame; without zeroing here the raycaster can't find the menu items.
+            if (_prevContextMenuActive && (hitCanvas.gameObject.name ?? "").IndexOf("Tooltip", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                try
+                {
+                    var cmZeroTr = hitCanvas.transform.Find("ContextMenus");
+                    if (cmZeroTr != null)
+                    {
+                        cmZeroTr.localPosition = Vector3.zero;
+                        cmZeroTr.localRotation = Quaternion.identity;
+                        cmZeroTr.localScale    = Vector3.one;
+                        for (int czi = 0; czi < cmZeroTr.childCount; czi++)
+                        {
+                            var czChild = cmZeroTr.GetChild(czi);
+                            if (!czChild.gameObject.activeSelf) continue;
+                            if (!(czChild.gameObject.name ?? "").StartsWith("ContextMenu")) continue;
+                            czChild.localPosition = Vector3.zero;
+                            czChild.localRotation = Quaternion.identity;
+                            czChild.localScale    = Vector3.one;
+                            break;
+                        }
+                    }
+                }
+                catch { }
+            }
 
             try
             {
