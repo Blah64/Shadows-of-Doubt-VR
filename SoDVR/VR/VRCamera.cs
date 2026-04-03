@@ -4758,7 +4758,21 @@ public class VRCamera : MonoBehaviour
                         }
                         else
                         {
-                            Log.LogInfo($"[VRCamera] CB direct drag end: '{_cbDragGO?.name}'");
+                            // Sync game's internal offsets list (for save) with the final drag position.
+                            // ForceDragController was avoided during drag (wrong coord ref), so call
+                            // SetPositionDirect once here at release to persist the position on save.
+                            if (_cbDirectDragDCP != null && _cbDirectDragRT != null)
+                            {
+                                try
+                                {
+                                    Vector2 finalPos = new Vector2(_cbDirectDragRT.localPosition.x, _cbDirectDragRT.localPosition.y);
+                                    _cbDirectDragDCP.SetPositionDirect(finalPos);
+                                    Log.LogInfo($"[VRCamera] CB direct drag end: SetPositionDirect({finalPos.x:F0},{finalPos.y:F0}) '{_cbDragGO?.name}'");
+                                }
+                                catch (Exception ex) { Log.LogWarning($"[VRCamera] CB SetPositionDirect: {ex.Message}"); }
+                            }
+                            else
+                                Log.LogInfo($"[VRCamera] CB direct drag end: '{_cbDragGO?.name}'");
                         }
                     }
                     else if (_cbDragStarted && _cbDragIsNative && _cbDragGO != null && _cbDragPED != null)
@@ -4795,7 +4809,8 @@ public class VRCamera : MonoBehaviour
                 {
                     try
                     {
-                        var plane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+                        // Use parentRT's actual plane (not CaseCanvas pivot) to avoid z-depth parallax
+                        var plane = new Plane(-_cbDirectDragParentRT.transform.forward, _cbDirectDragParentRT.transform.position);
                         var ray = new Ray(rPos, rFwd);
                         if (plane.Raycast(ray, out float d) && d > 0f)
                         {
@@ -4818,11 +4833,10 @@ public class VRCamera : MonoBehaviour
                             if (_cbDirectDragPastDeadZone)
                             {
                                 Vector2 newLocal = hitLocal + _cbDirectDragGrabOffset;
-                                // Use ForceDragController so the game updates its internal offsets list
-                                // (ensures pin position is saved when case board is closed/game saved).
-                                if (_cbDirectDragDCP != null)
-                                    _cbDirectDragDCP.ForceDragController(newLocal);
-                                else if (_cbDirectDragRT != null)
+                                // Direct localPosition set — ForceDragController uses a different
+                                // internal coordinate reference and moves pins to wrong positions.
+                                // SetPositionDirect is called once at drag END to sync the offsets list.
+                                if (_cbDirectDragRT != null)
                                     _cbDirectDragRT.localPosition = new Vector3(newLocal.x, newLocal.y, _cbDirectDragRT.localPosition.z);
                             }
                         }
@@ -4910,8 +4924,8 @@ public class VRCamera : MonoBehaviour
                             if (parentRT != null)
                             {
                                 // Compute grab offset: difference from ray hit to pin's localPosition.
-                                // Each frame, pin tracks ray hit + this offset → matches aim dot 1:1.
-                                var plane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
+                                // Use parentRT's actual plane (not CaseCanvas pivot) to eliminate z-depth parallax.
+                                var plane = new Plane(-parentRT.transform.forward, parentRT.transform.position);
                                 var ray = new Ray(rPos, rFwd);
                                 if (plane.Raycast(ray, out float d) && d > 0f)
                                 {
@@ -4989,47 +5003,39 @@ public class VRCamera : MonoBehaviour
                         int pinnedCount = pinnedContainer?.childCount ?? 0;
                         if (pinnedCount > 0 && _casePanelCanvas != null)
                         {
-                            var plane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
-                            var ray = new Ray(rPos, rFwd);
-                            if (plane.Raycast(ray, out float d) && d > 0f)
+                            // World-space ray-to-pin proximity (immune to z-depth parallax).
+                            // Project each pin's world position onto the ray and measure perpendicular
+                            // distance — no canvas-space conversion needed, no plane required.
+                            float bestDistWorld = float.MaxValue;
+                            RectTransform? bestPinRT = null;
+                            for (int pi = 0; pi < pinnedCount; pi++)
                             {
-                                Vector3 wp = rPos + rFwd * d;
-                                // Convert hit point to Pinned container local coords (canvas units)
-                                // World-space distance is useless — canvas lossyScale ≈ 0.0003 makes
-                                // all pin world positions cluster at the container center.
-                                var pinnedRT = pinnedContainer.GetComponent<RectTransform>();
-                                if (pinnedRT == null) pinnedRT = _cbContentContainerRT;
-                                Vector3 hitLocal3 = pinnedRT.InverseTransformPoint(wp);
-                                Vector2 hitLocal = new Vector2(hitLocal3.x, hitLocal3.y);
-
-                                // Find closest pin in canvas-unit space using visual center
-                                // (pins may have non-center pivots; localPosition is the pivot point,
-                                // not the visual center — use visual center for accurate proximity)
-                                float bestDist = float.MaxValue;
-                                RectTransform? bestPinRT = null;
-                                for (int pi = 0; pi < pinnedCount; pi++)
+                                var pinTr = pinnedContainer.GetChild(pi);
+                                if (pinTr == null || !pinTr.gameObject.activeSelf) continue;
+                                var pinRT = pinTr.GetComponent<RectTransform>();
+                                if (pinRT == null) continue;
+                                Vector3 pinWorld = pinTr.position;
+                                float tPin = Mathf.Max(0f, Vector3.Dot(pinWorld - rPos, rFwd));
+                                float dWorld = Vector3.Distance(rPos + rFwd * tPin, pinWorld);
+                                if (dWorld < bestDistWorld) { bestDistWorld = dWorld; bestPinRT = pinRT; }
+                            }
+                            // Threshold: 400 canvas units converted to world metres via lossyScale
+                            var pinnedRT2 = pinnedContainer.TryCast<RectTransform>()
+                                         ?? pinnedContainer.GetComponent<RectTransform>();
+                            float lossyS = (pinnedRT2 != null) ? Mathf.Abs(pinnedRT2.lossyScale.x) : 0.001f;
+                            float grabThreshold = 400f * Mathf.Max(lossyS, 0.0001f);
+                            if (bestPinRT != null && bestDistWorld < grabThreshold)
+                            {
+                                var parentRT = bestPinRT.parent?.GetComponent<RectTransform>() ?? _cbContentContainerRT;
+                                // Raycast against parentRT's actual plane (not CaseCanvas pivot) for
+                                // accurate grab-offset computation — eliminates z-depth parallax.
+                                var pinPlane = new Plane(-parentRT.transform.forward, parentRT.transform.position);
+                                if (pinPlane.Raycast(new Ray(rPos, rFwd), out float ppd) && ppd > 0f)
                                 {
-                                    var pinTr = pinnedContainer.GetChild(pi);
-                                    if (pinTr == null || !pinTr.gameObject.activeSelf) continue;
-                                    var pinRT = pinTr.GetComponent<RectTransform>();
-                                    if (pinRT == null) continue;
-                                    // Visual center = localPosition + (0.5 - pivot) * rect size
-                                    Vector2 pinVisCenter = new Vector2(
-                                        pinRT.localPosition.x + (0.5f - pinRT.pivot.x) * pinRT.rect.width,
-                                        pinRT.localPosition.y + (0.5f - pinRT.pivot.y) * pinRT.rect.height);
-                                    float dist = Vector2.Distance(pinVisCenter, hitLocal);
-                                    if (dist < bestDist)
-                                    {
-                                        bestDist = dist;
-                                        bestPinRT = pinRT;
-                                    }
-                                }
-                                // Threshold in canvas units — pin visual size ~200 units,
-                                // use 400 for comfortable grab radius
-                                if (bestPinRT != null && bestDist < 400f)
-                                {
-                                    var parentRT = bestPinRT.parent?.GetComponent<RectTransform>() ?? _cbContentContainerRT;
-                                    // Find DragCasePanel so ForceDragController keeps game's offsets in sync for save
+                                    Vector3 hitWp = rPos + rFwd * ppd;
+                                    Vector3 hitLocal3 = parentRT.InverseTransformPoint(hitWp);
+                                    Vector2 hitLocal = new Vector2(hitLocal3.x, hitLocal3.y);
+                                    Vector2 bestPinLocal = new Vector2(bestPinRT.localPosition.x, bestPinRT.localPosition.y);
                                     var pinDCP2 = bestPinRT.GetComponent<DragCasePanel>();
                                     _cbDragActive = true;
                                     _cbDirectDrag = true;
@@ -5041,14 +5047,13 @@ public class VRCamera : MonoBehaviour
                                     _cbDirectDragRT = bestPinRT;
                                     _cbDirectDragParentRT = parentRT;
                                     _cbDirectDragDCP = pinDCP2;
-                                    Vector2 bestPinLocal = new Vector2(bestPinRT.localPosition.x, bestPinRT.localPosition.y);
                                     _cbDirectDragGrabOffset = bestPinLocal - hitLocal;
                                     _cbDirectDragStartLocal = bestPinLocal;
                                     _cbDirectDragStartHitLocal = hitLocal;
                                     _cbDirectDragPastDeadZone = false;
                                     _cbDragGO = bestPinRT.gameObject;
                                     foundPin = true;
-                                    Log.LogInfo($"[VRCamera] CB pin found via Pinned scan: '{bestPinRT.gameObject.name}' visDist={bestDist:F0} localPos=({bestPinRT.localPosition.x:F0},{bestPinRT.localPosition.y:F0}) hitLocal=({hitLocal.x:F0},{hitLocal.y:F0}) dcp={(pinDCP2 != null)}");
+                                    Log.LogInfo($"[VRCamera] CB pin found via Pinned scan: '{bestPinRT.gameObject.name}' worldDist={bestDistWorld:F4} localPos=({bestPinRT.localPosition.x:F0},{bestPinRT.localPosition.y:F0}) hitLocal=({hitLocal.x:F0},{hitLocal.y:F0}) grabOffset=({_cbDirectDragGrabOffset.x:F0},{_cbDirectDragGrabOffset.y:F0}) dcp={(pinDCP2 != null)}");
                                 }
                             }
                         }
@@ -5157,34 +5162,27 @@ public class VRCamera : MonoBehaviour
                                 int pinnedCountRMB = pinnedCtnrRMB?.childCount ?? 0;
                                 if (pinnedCountRMB > 0 && _casePanelCanvas != null)
                                 {
-                                    var rmbPlane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
-                                    if (rmbPlane.Raycast(new Ray(rPos, rFwd), out float rmbDist) && rmbDist > 0f)
+                                    // World-space proximity (immune to z-depth parallax)
+                                    float rmbBestDist = float.MaxValue;
+                                    Transform? rmbBestPin = null;
+                                    for (int rpi = 0; rpi < pinnedCountRMB; rpi++)
                                     {
-                                        Vector3 rmbWp = rPos + rFwd * rmbDist;
-                                        var pinnedRTrmb = pinnedCtnrRMB.GetComponent<RectTransform>() ?? _cbContentContainerRT;
-                                        Vector3 rmbHl3 = pinnedRTrmb.InverseTransformPoint(rmbWp);
-                                        Vector2 rmbHitLocal = new Vector2(rmbHl3.x, rmbHl3.y);
-
-                                        float rmbBestDist = float.MaxValue;
-                                        Transform? rmbBestPin = null;
-                                        for (int rpi = 0; rpi < pinnedCountRMB; rpi++)
-                                        {
-                                            var rmbPinTr = pinnedCtnrRMB.GetChild(rpi);
-                                            if (rmbPinTr == null || !rmbPinTr.gameObject.activeSelf) continue;
-                                            var rmbPinRT = rmbPinTr.GetComponent<RectTransform>();
-                                            if (rmbPinRT == null) continue;
-                                            // Use visual center (accounts for non-center pivot)
-                                            Vector2 rmbVisCenter = new Vector2(
-                                                rmbPinRT.localPosition.x + (0.5f - rmbPinRT.pivot.x) * rmbPinRT.rect.width,
-                                                rmbPinRT.localPosition.y + (0.5f - rmbPinRT.pivot.y) * rmbPinRT.rect.height);
-                                            float rmbPinDist = Vector2.Distance(rmbVisCenter, rmbHitLocal);
-                                            if (rmbPinDist < rmbBestDist) { rmbBestDist = rmbPinDist; rmbBestPin = rmbPinTr; }
-                                        }
-
-                                        if (rmbBestPin != null && rmbBestDist < 400f)
-                                        {
-                                            // Walk 3 levels from pin GO to find ContextMenuController
-                                            var rmbCtxWalk = rmbBestPin;
+                                        var rmbPinTr = pinnedCtnrRMB.GetChild(rpi);
+                                        if (rmbPinTr == null || !rmbPinTr.gameObject.activeSelf) continue;
+                                        if (rmbPinTr.GetComponent<RectTransform>() == null) continue;
+                                        Vector3 rmbPinWorld = rmbPinTr.position;
+                                        float rmbT = Mathf.Max(0f, Vector3.Dot(rmbPinWorld - rPos, rFwd));
+                                        float rmbWd = Vector3.Distance(rPos + rFwd * rmbT, rmbPinWorld);
+                                        if (rmbWd < rmbBestDist) { rmbBestDist = rmbWd; rmbBestPin = rmbPinTr; }
+                                    }
+                                    var rmbPinnedRT = pinnedCtnrRMB.TryCast<RectTransform>()
+                                                  ?? pinnedCtnrRMB.GetComponent<RectTransform>();
+                                    float rmbLossy = (rmbPinnedRT != null) ? Mathf.Abs(rmbPinnedRT.lossyScale.x) : 0.001f;
+                                    float rmbThreshold = 400f * Mathf.Max(rmbLossy, 0.0001f);
+                                    if (rmbBestPin != null && rmbBestDist < rmbThreshold)
+                                    {
+                                        // Walk 3 levels from pin GO to find ContextMenuController
+                                        var rmbCtxWalk = rmbBestPin;
                                             for (int rwl = 0; rwl < 4 && rmbCtxWalk != null; rwl++)
                                             {
                                                 bool rmbCtxFound = false;
@@ -5228,9 +5226,8 @@ public class VRCamera : MonoBehaviour
                                             if (!usedPinnedScanRMB)
                                                 Log.LogInfo($"[VRCamera] Pin ctx menu: no ContextMenuController on '{rmbBestPin.gameObject.name}' dist={rmbBestDist:F0}");
                                         }
-                                        else Log.LogInfo($"[VRCamera] Pin ctx menu: no pin nearby (count={pinnedCountRMB} bestDist={rmbBestDist:F0})");
+                                        else Log.LogInfo($"[VRCamera] Pin ctx menu: no pin nearby (count={pinnedCountRMB} bestDist={rmbBestDist:F4})");
                                     }
-                                }
                                 else Log.LogInfo($"[VRCamera] Pin ctx menu: Pinned children={pinnedCountRMB}");
                             }
                             catch (Exception ex) { Log.LogWarning($"[VRCamera] Pin ctx scan: {ex.Message}"); }
@@ -5440,35 +5437,29 @@ public class VRCamera : MonoBehaviour
                                     int pinnedCntMMB = pinnedCtnrMMB?.childCount ?? 0;
                                     if (pinnedCntMMB > 0)
                                     {
-                                        var mmbPlane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
-                                        if (mmbPlane.Raycast(new Ray(rPos, rFwd), out float mmbPlaneDist) && mmbPlaneDist > 0f)
+                                        // World-space proximity (immune to z-depth parallax)
+                                        float mmbBest = float.MaxValue;
+                                        Transform? mmbBestTr = null;
+                                        for (int mpi = 0; mpi < pinnedCntMMB; mpi++)
                                         {
-                                            Vector3 mmbWp = rPos + rFwd * mmbPlaneDist;
-                                            var pRTmmb = pinnedCtnrMMB.GetComponent<RectTransform>() ?? _cbContentContainerRT;
-                                            Vector3 mmbHl3 = pRTmmb.InverseTransformPoint(mmbWp);
-                                            Vector2 mmbHL = new Vector2(mmbHl3.x, mmbHl3.y);
-                                            float mmbBest = float.MaxValue;
-                                            Transform? mmbBestTr = null;
-                                            for (int mpi = 0; mpi < pinnedCntMMB; mpi++)
-                                            {
-                                                var mpTr = pinnedCtnrMMB.GetChild(mpi);
-                                                if (mpTr == null || !mpTr.gameObject.activeSelf) continue;
-                                                var mpRT = mpTr.GetComponent<RectTransform>();
-                                                if (mpRT == null) continue;
-                                                // Use visual center (accounts for non-center pivot)
-                                                Vector2 mpVisCenter = new Vector2(
-                                                    mpRT.localPosition.x + (0.5f - mpRT.pivot.x) * mpRT.rect.width,
-                                                    mpRT.localPosition.y + (0.5f - mpRT.pivot.y) * mpRT.rect.height);
-                                                float mpd = Vector2.Distance(mpVisCenter, mmbHL);
-                                                if (mpd < mmbBest) { mmbBest = mpd; mmbBestTr = mpTr; }
-                                            }
-                                            if (mmbBestTr != null && mmbBest < 400f)
-                                            {
-                                                pinTargetMMB = mmbBestTr.gameObject;
-                                                Log.LogInfo($"[VRCamera] Mid-press Pinned scan: '{pinTargetMMB.name}' dist={mmbBest:F0}");
-                                            }
-                                            else Log.LogInfo($"[VRCamera] Mid-press Pinned scan: no pin (count={pinnedCntMMB} best={mmbBest:F0})");
+                                            var mpTr = pinnedCtnrMMB.GetChild(mpi);
+                                            if (mpTr == null || !mpTr.gameObject.activeSelf) continue;
+                                            if (mpTr.GetComponent<RectTransform>() == null) continue;
+                                            Vector3 mpWorld = mpTr.position;
+                                            float mpT = Mathf.Max(0f, Vector3.Dot(mpWorld - rPos, rFwd));
+                                            float mpWd = Vector3.Distance(rPos + rFwd * mpT, mpWorld);
+                                            if (mpWd < mmbBest) { mmbBest = mpWd; mmbBestTr = mpTr; }
                                         }
+                                        var mmbPinnedRT = pinnedCtnrMMB.TryCast<RectTransform>()
+                                                       ?? pinnedCtnrMMB.GetComponent<RectTransform>();
+                                        float mmbLossy = (mmbPinnedRT != null) ? Mathf.Abs(mmbPinnedRT.lossyScale.x) : 0.001f;
+                                        float mmbThreshold = 400f * Mathf.Max(mmbLossy, 0.0001f);
+                                        if (mmbBestTr != null && mmbBest < mmbThreshold)
+                                        {
+                                            pinTargetMMB = mmbBestTr.gameObject;
+                                            Log.LogInfo($"[VRCamera] Mid-press Pinned scan: '{pinTargetMMB.name}' worldDist={mmbBest:F4}");
+                                        }
+                                        else Log.LogInfo($"[VRCamera] Mid-press Pinned scan: no pin (count={pinnedCntMMB} best={mmbBest:F4})");
                                     }
                                 }
 
