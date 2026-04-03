@@ -439,8 +439,9 @@ public class VRCamera : MonoBehaviour
     private bool              _cbDirectDrag;         // true = using direct RT manipulation instead of EventSystem
     private RectTransform?    _cbDirectDragRT;       // the pin's RectTransform (citizen/PlayerStickyNote)
     private RectTransform?    _cbDirectDragParentRT; // parent of pin (Pinned) — coordinate reference
-    private Vector2           _cbDirectDragGrabOffset; // offset from ray hit to pin center at grab time
-    private Vector2           _cbDirectDragStartAnchored; // pin's anchoredPosition at press (for revert on click)
+    private DragCasePanel?    _cbDirectDragDCP;      // DragCasePanel component — call ForceDragController() so game saves position
+    private Vector2           _cbDirectDragGrabOffset; // offset from ray hit to pin localPosition at grab time
+    private Vector2           _cbDirectDragStartLocal; // pin's localPosition at press time (for dead-zone recompute)
     private Vector2           _cbDirectDragStartHitLocal; // aim point in canvas coords at grab time
     private bool              _cbDirectDragPastDeadZone; // true = aim moved past dead zone, pin is tracking
     private const float       ClickMaxCanvasUnits = 200f; // dead zone: aim must move this far before pin starts tracking
@@ -4782,7 +4783,7 @@ public class VRCamera : MonoBehaviour
                 }
                 catch (Exception ex) { Log.LogWarning($"[VRCamera] CB drag release: {ex.Message}"); }
                 _cbDragActive = false; _cbDragStarted = false; _cbDragGO = null; _cbDragCanvas = null; _cbDragPED = null; _cbDragIsNative = false;
-                _cbDirectDrag = false; _cbDirectDragRT = null; _cbDirectDragParentRT = null;
+                _cbDirectDrag = false; _cbDirectDragRT = null; _cbDirectDragParentRT = null; _cbDirectDragDCP = null;
                 _cbMouseOnlyDrag = false;
             }
             else if (triggerNow)
@@ -4808,16 +4809,21 @@ public class VRCamera : MonoBehaviour
                                 if (aimDist >= ClickMaxCanvasUnits)
                                 {
                                     _cbDirectDragPastDeadZone = true;
-                                    // Recompute grab offset from current aim to pin's START position
+                                    // Recompute grab offset from current aim to pin's START localPosition
                                     // so pin doesn't jump when dead zone is crossed
-                                    _cbDirectDragGrabOffset = _cbDirectDragStartAnchored - hitLocal;
+                                    _cbDirectDragGrabOffset = _cbDirectDragStartLocal - hitLocal;
                                     Log.LogInfo($"[VRCamera] CB pin dead zone crossed: aimDist={aimDist:F0}");
                                 }
                             }
                             if (_cbDirectDragPastDeadZone)
                             {
                                 Vector2 newLocal = hitLocal + _cbDirectDragGrabOffset;
-                                _cbDirectDragRT.localPosition = new Vector3(newLocal.x, newLocal.y, _cbDirectDragRT.localPosition.z);
+                                // Use ForceDragController so the game updates its internal offsets list
+                                // (ensures pin position is saved when case board is closed/game saved).
+                                if (_cbDirectDragDCP != null)
+                                    _cbDirectDragDCP.ForceDragController(newLocal);
+                                else if (_cbDirectDragRT != null)
+                                    _cbDirectDragRT.localPosition = new Vector3(newLocal.x, newLocal.y, _cbDirectDragRT.localPosition.z);
                             }
                         }
                     }
@@ -4883,20 +4889,16 @@ public class VRCamera : MonoBehaviour
                     {
                         // Walk up from hit GO to find the DragCasePanel ancestor (citizen/PlayerStickyNote)
                         RectTransform? pinRT = null;
+                        DragCasePanel? pinDCP = null;
                         var walker = _cbDragGO.transform;
                         for (int wi = 0; wi < 8 && walker != null; wi++)
                         {
                             // DragCasePanel is the draggable pin component
-                            var comps = walker.GetComponents<Component>();
-                            bool hasDCP = false;
-                            foreach (var comp in comps)
-                            {
-                                if (comp != null && comp.GetIl2CppType().Name == "DragCasePanel")
-                                { hasDCP = true; break; }
-                            }
-                            if (hasDCP)
+                            var dcpComp = walker.GetComponent<DragCasePanel>();
+                            if (dcpComp != null)
                             {
                                 pinRT = walker.GetComponent<RectTransform>();
+                                pinDCP = dcpComp;
                                 break;
                             }
                             walker = walker.parent;
@@ -4907,7 +4909,7 @@ public class VRCamera : MonoBehaviour
                             var parentRT = pinRT.parent.GetComponent<RectTransform>();
                             if (parentRT != null)
                             {
-                                // Compute grab offset: difference from ray hit to pin center.
+                                // Compute grab offset: difference from ray hit to pin's localPosition.
                                 // Each frame, pin tracks ray hit + this offset → matches aim dot 1:1.
                                 var plane = new Plane(-_casePanelCanvas.transform.forward, _casePanelCanvas.transform.position);
                                 var ray = new Ray(rPos, rFwd);
@@ -4916,15 +4918,17 @@ public class VRCamera : MonoBehaviour
                                     Vector3 wp = rPos + rFwd * d;
                                     Vector3 local3 = parentRT.InverseTransformPoint(wp);
                                     Vector2 hitLocal = new Vector2(local3.x, local3.y);
+                                    Vector2 pinLocalPos = new Vector2(pinRT.localPosition.x, pinRT.localPosition.y);
                                     _cbDirectDragRT = pinRT;
                                     _cbDirectDragParentRT = parentRT;
-                                    _cbDirectDragGrabOffset = pinRT.anchoredPosition - hitLocal;
-                                    _cbDirectDragStartAnchored = pinRT.anchoredPosition;
+                                    _cbDirectDragDCP = pinDCP;
+                                    _cbDirectDragGrabOffset = pinLocalPos - hitLocal;
+                                    _cbDirectDragStartLocal = pinLocalPos;
                                     _cbDirectDragStartHitLocal = hitLocal;
                                     _cbDirectDragPastDeadZone = false;
                                     _cbDirectDrag = true;
                                     _cbDragStarted = true;
-                                    Log.LogInfo($"[VRCamera] CB direct drag setup: pin='{pinRT.gameObject.name}' parent='{parentRT.gameObject.name}' anchored={pinRT.anchoredPosition} localHit=({local3.x:F1},{local3.y:F1}) grabOffset={_cbDirectDragGrabOffset}");
+                                    Log.LogInfo($"[VRCamera] CB direct drag setup: pin='{pinRT.gameObject.name}' parent='{parentRT.gameObject.name}' localPos={pinLocalPos} localHit=({local3.x:F1},{local3.y:F1}) grabOffset={_cbDirectDragGrabOffset} dcp={(pinDCP != null)}");
                                 }
                             }
                         }
@@ -4998,7 +5002,9 @@ public class VRCamera : MonoBehaviour
                                 Vector3 hitLocal3 = pinnedRT.InverseTransformPoint(wp);
                                 Vector2 hitLocal = new Vector2(hitLocal3.x, hitLocal3.y);
 
-                                // Find closest pin in canvas-unit space
+                                // Find closest pin in canvas-unit space using visual center
+                                // (pins may have non-center pivots; localPosition is the pivot point,
+                                // not the visual center — use visual center for accurate proximity)
                                 float bestDist = float.MaxValue;
                                 RectTransform? bestPinRT = null;
                                 for (int pi = 0; pi < pinnedCount; pi++)
@@ -5007,10 +5013,11 @@ public class VRCamera : MonoBehaviour
                                     if (pinTr == null || !pinTr.gameObject.activeSelf) continue;
                                     var pinRT = pinTr.GetComponent<RectTransform>();
                                     if (pinRT == null) continue;
-                                    // Compare in local-space units (InverseTransformPoint returns
-                                    // pivot-relative coords; localPosition is in the same space)
-                                    Vector2 pinLocal = new Vector2(pinRT.localPosition.x, pinRT.localPosition.y);
-                                    float dist = Vector2.Distance(pinLocal, hitLocal);
+                                    // Visual center = localPosition + (0.5 - pivot) * rect size
+                                    Vector2 pinVisCenter = new Vector2(
+                                        pinRT.localPosition.x + (0.5f - pinRT.pivot.x) * pinRT.rect.width,
+                                        pinRT.localPosition.y + (0.5f - pinRT.pivot.y) * pinRT.rect.height);
+                                    float dist = Vector2.Distance(pinVisCenter, hitLocal);
                                     if (dist < bestDist)
                                     {
                                         bestDist = dist;
@@ -5022,6 +5029,8 @@ public class VRCamera : MonoBehaviour
                                 if (bestPinRT != null && bestDist < 400f)
                                 {
                                     var parentRT = bestPinRT.parent?.GetComponent<RectTransform>() ?? _cbContentContainerRT;
+                                    // Find DragCasePanel so ForceDragController keeps game's offsets in sync for save
+                                    var pinDCP2 = bestPinRT.GetComponent<DragCasePanel>();
                                     _cbDragActive = true;
                                     _cbDirectDrag = true;
                                     _cbDragStarted = true;
@@ -5031,14 +5040,15 @@ public class VRCamera : MonoBehaviour
                                     _cbMouseOnlyDrag = false;
                                     _cbDirectDragRT = bestPinRT;
                                     _cbDirectDragParentRT = parentRT;
+                                    _cbDirectDragDCP = pinDCP2;
                                     Vector2 bestPinLocal = new Vector2(bestPinRT.localPosition.x, bestPinRT.localPosition.y);
                                     _cbDirectDragGrabOffset = bestPinLocal - hitLocal;
-                                    _cbDirectDragStartAnchored = bestPinLocal;
+                                    _cbDirectDragStartLocal = bestPinLocal;
                                     _cbDirectDragStartHitLocal = hitLocal;
                                     _cbDirectDragPastDeadZone = false;
                                     _cbDragGO = bestPinRT.gameObject;
                                     foundPin = true;
-                                    Log.LogInfo($"[VRCamera] CB pin found via Pinned scan: '{bestPinRT.gameObject.name}' canvasDist={bestDist:F0} localPos=({bestPinRT.localPosition.x:F0},{bestPinRT.localPosition.y:F0}) hitLocal=({hitLocal.x:F0},{hitLocal.y:F0})");
+                                    Log.LogInfo($"[VRCamera] CB pin found via Pinned scan: '{bestPinRT.gameObject.name}' visDist={bestDist:F0} localPos=({bestPinRT.localPosition.x:F0},{bestPinRT.localPosition.y:F0}) hitLocal=({hitLocal.x:F0},{hitLocal.y:F0}) dcp={(pinDCP2 != null)}");
                                 }
                             }
                         }
@@ -5163,8 +5173,11 @@ public class VRCamera : MonoBehaviour
                                             if (rmbPinTr == null || !rmbPinTr.gameObject.activeSelf) continue;
                                             var rmbPinRT = rmbPinTr.GetComponent<RectTransform>();
                                             if (rmbPinRT == null) continue;
-                                            float rmbPinDist = Vector2.Distance(
-                                                new Vector2(rmbPinRT.localPosition.x, rmbPinRT.localPosition.y), rmbHitLocal);
+                                            // Use visual center (accounts for non-center pivot)
+                                            Vector2 rmbVisCenter = new Vector2(
+                                                rmbPinRT.localPosition.x + (0.5f - rmbPinRT.pivot.x) * rmbPinRT.rect.width,
+                                                rmbPinRT.localPosition.y + (0.5f - rmbPinRT.pivot.y) * rmbPinRT.rect.height);
+                                            float rmbPinDist = Vector2.Distance(rmbVisCenter, rmbHitLocal);
                                             if (rmbPinDist < rmbBestDist) { rmbBestDist = rmbPinDist; rmbBestPin = rmbPinTr; }
                                         }
 
@@ -5442,7 +5455,11 @@ public class VRCamera : MonoBehaviour
                                                 if (mpTr == null || !mpTr.gameObject.activeSelf) continue;
                                                 var mpRT = mpTr.GetComponent<RectTransform>();
                                                 if (mpRT == null) continue;
-                                                float mpd = Vector2.Distance(new Vector2(mpRT.localPosition.x, mpRT.localPosition.y), mmbHL);
+                                                // Use visual center (accounts for non-center pivot)
+                                                Vector2 mpVisCenter = new Vector2(
+                                                    mpRT.localPosition.x + (0.5f - mpRT.pivot.x) * mpRT.rect.width,
+                                                    mpRT.localPosition.y + (0.5f - mpRT.pivot.y) * mpRT.rect.height);
+                                                float mpd = Vector2.Distance(mpVisCenter, mmbHL);
                                                 if (mpd < mmbBest) { mmbBest = mpd; mmbBestTr = mpTr; }
                                             }
                                             if (mmbBestTr != null && mmbBest < 400f)
