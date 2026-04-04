@@ -64,6 +64,10 @@
       <HintPath>$(InteropDir)\UnityEngine.AudioModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="UnityEngine.Physics2DModule">
+      <HintPath>$(InteropDir)\UnityEngine.Physics2DModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="UnityEngine.InputLegacyModule">
       <HintPath>$(InteropDir)\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>false</Private>
