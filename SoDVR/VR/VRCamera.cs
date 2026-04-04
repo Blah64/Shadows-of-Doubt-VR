@@ -8851,6 +8851,28 @@ public class VRCamera : MonoBehaviour
                         }
                     }
 
+                    // Activate TMP_InputField for keyboard entry.
+                    // ExecuteEvents alone does not set EventSystem.selectedGameObject,
+                    // so the input field never enters edit mode. Walk up from the hit GO
+                    // to find a TMP_InputField and explicitly activate it.
+                    try
+                    {
+                        var ifWalker = go?.transform;
+                        for (int ifi = 0; ifi < 6 && ifWalker != null; ifi++)
+                        {
+                            var tmpIF = ifWalker.GetComponent<TMP_InputField>();
+                            if (tmpIF != null)
+                            {
+                                es.SetSelectedGameObject(ifWalker.gameObject);
+                                tmpIF.ActivateInputField();
+                                Log.LogInfo($"[VRCamera] TMP_InputField activated: '{ifWalker.gameObject.name}'");
+                                break;
+                            }
+                            ifWalker = ifWalker.parent;
+                        }
+                    }
+                    catch (Exception ifEx) { Log.LogWarning($"[VRCamera] InputField activate: {ifEx.Message}"); }
+
                     return; // handled — stop checking further canvases
                 }
                 // No graphic at this canvas plane — fall through to next closest canvas
