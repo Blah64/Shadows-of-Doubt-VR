@@ -297,6 +297,45 @@ When the player loads a save from the main menu (same Unity scene reused):
 - `_cursorTargetCanvas` field tracks nearest aimed-at canvas ✓
 - HUD settings plan written (plan file at `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`) — NOT YET IMPLEMENTED
 
+## Phase 19 status (COMPLETE — 2026-04-04)
+B button hold-to-show for map/notebook:
+- B held → Tab key held (map stays open), B released → Tab UP (`92f92f5`) ✓
+- `_tabHeldDown` bool + `ReleaseTabKey()` helper; removed `_notebookCooldownUntil`, `_notebookBtnNeedsRelease`, `_pendingTabUpFrame`
+- Flashing fix: `_cursorHasTarget` suppression skipped while `_tabHeldDown` (map itself would toggle Tab) ✓
+- On B release: MinimapCanvas + WindowCanvas removed from `_positionedCanvases`/`_gripDragEnforce` for fresh head-relative placement on next open ✓
+
+## CRITICAL: B button (notebook/map) — hold-to-show, NOT toggle (2026-04-04)
+The game's Tab key is hold-to-show: map/notebook is visible while Tab is HELD.
+`UpdateNotebook()` sends Tab DOWN on B press, Tab UP on B release via `ReleaseTabKey()`.
+- Do NOT use momentary press (Tab DOWN + deferred UP) — map opens and instantly closes
+- `_tabHeldDown` guards against `_cursorHasTarget` triggering release while map is open
+- `ReleaseTabKey()` is also called when case board opens or VR settings open
+
+## Phase 18 status (COMPLETE — 2026-04-04)
+Grip-drag and window position improvements:
+- Grip-drag generalized: ALL `_windowNestedList` nested canvases draggable (not just "Note") (`8338fba`) ✓
+- Sub-child filter: canvases that are children of another nested canvas (`Scroll View` inside `Note`) are skipped; parent is the draggable unit ✓
+- Bounds margin 0.65× sizeDelta on nested pre-pass (prevents near-edge miss → WindowCanvas fallback) ✓
+- WindowCanvas excluded from top-level grip-drag — it is a container; missing nested pre-pass drops safely ✓
+- `_gripDragEnforce` dict: absolute world positions enforced every Update AND LateUpdate so game resets can't override ✓
+- Map position persists after grip-drag release; anchor-relative offsets (`_gripDragAnchorOffsets`) restored on case board reopen ✓
+- Update-time enforcement ensures aim dots + clicks work correctly on moved top-level canvases ✓
+- Diagnostic log cleanup: 426 lines removed (`92caaec`) ✓
+
+## CRITICAL: Nested canvas grip-drag — sub-child filter and container hierarchy (2026-04-04)
+`_windowNestedList` contains ALL nested canvases under WindowCanvas (Note, Scroll View, evidence windows).
+- `Scroll View` is a CHILD of `Note` in the Unity hierarchy → `nc.transform.IsChildOf(other.transform)` is true
+- Sub-children must be skipped in the grip-drag pre-pass or bounds check fails (Scroll View uses stretch anchors → negative sizeDelta)
+- Moving a parent nested canvas moves all its children (correct — Scroll View should travel with its Note)
+- WindowCanvas itself must NOT be in the top-level drag candidates — it is the container for all notes
+
+## CRITICAL: _gripDragEnforce — absolute position enforcement for moved canvases (2026-04-04)
+`_gripDragEnforce` (Dictionary<int, (Vector3 pos, Quaternion rot)>) stores absolute world positions for grip-dragged top-level canvases (map, location details, etc.).
+- Enforced in BOTH Update (before aim dot scan) AND LateUpdate (after PositionCanvases)
+- Populated on grip-drag release; also updated when `PositionCanvases` restores from `_gripDragAnchorOffsets` on case board reopen
+- Cleared entry-by-entry when canvas is destroyed; entries cleared for specific canvases on B release (MinimapCanvas, WindowCanvas)
+- Distinct from `_gripDragAnchorOffsets` (ActionPanel-relative, for reopen) — enforce has absolute world pos
+
 ## Phase 15 status (COMPLETE — 2026-04-03)
 MinimapCanvas fully interactive:
 - B button pans map (direct `content.anchoredPosition` — ExecuteEvents drag unavailable in IL2CPP) ✓
@@ -414,3 +453,7 @@ The `UpdateInventory()` grip-camera-redirect was removed as the TDR source (2026
 - **Phase 13 complete** (2026-03-30): Save-load warp fix, ActionPanelCanvas grip-drag deadlock fix (`d0bd328`)
 - **Phase 14 complete** (2026-04-01/02): A/B button canvas clicks, GPU TDR fix, action text fix, awareness compass VR fix, HUD settings plan written (`79fc4dd`, `f040235`)
 - **Phase 15 complete** (2026-04-03): Minimap pan/click/right-click, pinned note visibility restored, `_minimapCanvasRef` direct raycast (`4648a66`)
+- **Phase 16 complete** (2026-04-03): Case board context menu + string connect + aim dot fix (`e39e82e`)
+- **Phase 17 complete** (2026-04-03): Note warp fix, individual note 6DOF drag, multi-spawn, aim dot on moved notes (`9e52b49`)
+- **Phase 18 complete** (2026-04-04): Grip-drag generalized to all nested canvases, map position persistence, diagnostic log cleanup (`8338fba`, `92caaec`)
+- **Phase 19 complete** (2026-04-04): B button hold-to-show for map/notebook, fresh placement on each open (`92f92f5`)

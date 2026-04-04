@@ -1,7 +1,61 @@
 # SoDVR — Technical Handover
 
-**Date**: 2026-04-03 (updated end of Phase 15)
-**Phase**: 16 — case board interaction fixes (parked issues from NotesWork.md)
+**Date**: 2026-04-04 (updated end of Phase 19)
+**Phase**: 20 — polish and remaining issues
+
+---
+
+## Phase 16–19 (2026-04-03/04) — Grip-drag polish + B button COMPLETE ✓
+
+### Phase 16 (commit `e39e82e`)
+Case board context menu, string connect, aim dot fixes. See previous HANDOVER notes.
+
+### Phase 17 (commit `9e52b49`)
+Note warp fix, individual note 6DOF drag (nested canvas drag), aim dot on moved notes.
+
+### Phase 18 (commits `8338fba`, `92caaec`)
+
+**Grip-drag generalized to all nested canvases**
+
+Previously only "Note" canvases were grip-draggable. Now ALL `_windowNestedList` nested canvases (evidence windows, detective notebook content, etc.) can be individually moved.
+
+Key discoveries:
+- `Scroll View` is a child of `Note` in Unity hierarchy → sub-child filter required: skip canvases whose `transform.IsChildOf(other.transform)` for any other nested canvas
+- `Scroll View` uses stretch anchors → `sizeDelta` is negative → bounds check always fails if used directly
+- Bounds margin 0.65× sizeDelta prevents near-edge misses that fell through to WindowCanvas
+- `WindowCanvas` must be excluded from top-level grip-drag — it is a container; grabbing it moved all children at once
+
+**_gripDragEnforce dict** — absolute world position enforcement:
+```csharp
+private readonly Dictionary<int, (Vector3 pos, Quaternion rot)> _gripDragEnforce = new();
+```
+- Populated on grip-drag release (alongside `_gripDragAnchorOffsets` relative-to-anchor entry)
+- Also updated when `PositionCanvases` restores from anchor offset on case board reopen
+- Enforced in BOTH `Update()` (before aim dot scan) AND `LateUpdate()` (after `PositionCanvases`)
+- Cleared when canvas destroyed; specific entries cleared on B button release (MinimapCanvas, WindowCanvas)
+
+**Case board reopen**: on ActionPanelCanvas activation, all canvases with `_gripDragAnchorOffsets` entries are removed from `_positionedCanvases` AND `_gripDragEnforce`, so `PositionCanvases` recomputes from anchor-relative offset relative to the new ActionPanelCanvas position.
+
+**Diagnostic log cleanup**: 426 lines of one-time/verbose debug logs removed. Retained: compass one-time diag, pin/arm/carry periodic status, all operational logs.
+
+### Phase 19 (commit `92f92f5`)
+
+**B button: hold-to-show for map/notebook**
+
+Game's Tab key is hold-to-show: map/notebook visible while Tab is held. Previous implementation sent a momentary press (Tab DOWN + deferred UP) → map opened and instantly closed.
+
+Fix: `_tabHeldDown` bool tracks whether we are holding Tab.
+```csharp
+private bool _tabHeldDown;  // true while we are holding Tab key down
+```
+- B pressed → `keybd_event(VK_TAB, DOWN)`, `_tabHeldDown = true`
+- B held → Tab stays held (no action)
+- B released → `ReleaseTabKey()` → `keybd_event(VK_TAB, UP)`, `_tabHeldDown = false`
+- `ReleaseTabKey()` also called when case board opens or VR settings open
+
+**Flashing fix**: `_cursorHasTarget` suppression was triggering Tab release when map opened (map became cursor target → suppress → release → close → cursor gone → press again). Fix: skip `_cursorHasTarget` suppression while `_tabHeldDown` is true.
+
+**Fresh placement**: on B release, MinimapCanvas and WindowCanvas removed from `_positionedCanvases` and `_gripDragEnforce` → next open gets fresh head-relative placement.
 
 ---
 
@@ -198,36 +252,35 @@ When ActionPanelCanvas was grip-dragged, it stored a self-referential zero offse
 | Canvas | Size | Status |
 |--------|------|--------|
 | `MenuCanvas` | 1.20m | Working ✓ |
-| `WindowCanvas` (notes/notebook) | 1.20m | Working ✓ (aim dot misalignment when opened from pin board — parked) |
+| `WindowCanvas` (notes/notebook) | 1.20m | Working ✓ (aim dot misalignment when opened from pin board — parked; individual nested canvases grip-draggable) |
 | `ActionPanelCanvas` | 1.60m | Working ✓ (case board anchor, not grip-draggable) |
 | `DialogCanvas` | 1.20m | Working ✓ |
-| `BioDisplayCanvas` | 1.80m | Working ✓ |
+| `BioDisplayCanvas` | 1.80m | Working ✓ (grip-draggable, position saved) |
 | `GameCanvas`/HUD | 1.50m | Working ✓ |
 | `TooltipCanvas` | 0.80m | Working ✓ (context menu aim alignment partial — parked) |
 | `PopupMessage` | 1.20m | Working ✓ (scale enforced each cycle) |
 | `VRSettingsPanelInternal` | 1.60m | Working ✓ |
 | `CaseCanvas` | 1.80m | Working ✓ (BG suppressed, pin board interactive; pin steal issue parked) |
-| `LocationDetailsCanvas` | 1.80m | Working ✓ (grip-draggable) |
-| `MinimapCanvas` | 1.50m | Working ✓ (pan, location click, context menu) |
+| `LocationDetailsCanvas` | 1.80m | Working ✓ (grip-draggable, position saved) |
+| `MinimapCanvas` | 1.50m | Working ✓ (grip-draggable, hold-B to show, pan, location click, context menu) |
 
 ---
 
-## Known Issues / Polish Opportunities (Phase 14+)
+## Known Issues / Polish Opportunities (Phase 20+)
 
 **Parked (detailed in NotesWork.md):**
-- Context menu aim dot misalignment (game writes screen coords + Z-scale=0 every frame)
+- Context menu aim dot / visual misalignment (game writes screen coords + Z-scale=0 every frame)
 - Opened pinned notes (WindowCanvas) aim dot misalignment
 - Pin proximity stealing with 2+ pins on board
 
 **Other:**
-- MinimapCanvas — partially working, needs review
 - Some additive items — semi-transparent white overlays, not original colours
 - PopupMessage — game resets scale frequently (fixed each cycle, slight visual lag)
 - Comfort options not yet: vignette, configurable snap-turn degrees, IPD adjustment
 - VR arm rotation may need per-item tuning
-- Jump while stationary — may not work in some states (not diagnosed)
-- Notebook B-press — reportedly opens and instantly closes (not diagnosed)
-- **HUD settings plan** — 5 settings (distance, size, height, H.offset, laggy-follow) + auto-hide — plan written, not implemented
+- **HUD settings plan** — 5 settings (distance, size, height, H.offset, laggy-follow) + auto-hide — plan written (`C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`), not implemented
+- Map grip-drag interaction: after moving map, some interactions may still use old position (needs validation)
+- Minimap B-button: while held, map does not smoothly follow player rotation (placed once on press; OK since it's hold-to-show)
 
 ---
 

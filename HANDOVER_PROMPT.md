@@ -17,7 +17,7 @@ Then read the main source files:
 Also read the parked case board investigation notes:
 - `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\NotesWork.md`
 
-## What is working (Phase 15 complete — last commit 4648a66)
+## What is working (Phase 19 complete — last commit 92f92f5)
 
 - Stereo rendering in headset ✓
 - Head tracking ✓
@@ -38,58 +38,35 @@ Also read the parked case board investigation notes:
 | Left grip | Inventory (X key) |
 | Right trigger | UI click |
 | Right A | Jump (or right-click when aiming at a canvas) |
-| Right B | Notebook/map (Tab) (or middle-click drag / minimap pan when aiming at a canvas) |
+| Right B | Map/notebook — **hold to show** (Tab held while B held); middle-click drag when aiming at a canvas |
 
 - **Held item tracking** — carried world objects follow VR controller ✓
 - **VR arm display** — both arms track their respective controllers ✓
 - **Left laser beam** — LineRenderer on left controller, toggle in VR Settings ✓
 - **Case board** — pins/notes/evidence interactive, pin drag working ✓
 - **Save/load** — no warp after loading a save game ✓
-- **Case board grip-drag** — panels relocatable; ActionPanelCanvas fixed in place ✓
+- **Grip-drag** — individual note/evidence windows, map, location details, bio display all grip-draggable ✓
+  - Positions saved relative to ActionPanelCanvas; restored on case board reopen ✓
+  - Map position enforced every frame (game can't reset it) ✓
 - **Action text** — left controller aim direction used for interact raycasts ✓
-- **Minimap** — B button pan, trigger click opens evidence note, A right-click opens context menu ✓
+- **Minimap** — hold-B to show, grip-drag to reposition, trigger click opens evidence note, A right-click opens context menu ✓
 - **Floor navigation on map** — floor +/- buttons clickable, room nodes at load=1+ ✓
+- **Awareness compass** — VR fix implemented (UpdateCompass() in LateUpdate) ✓
 
-## Active work: Case board interaction fixes (Phase 16)
+## Active work: Polish (Phase 20)
 
-Three issues are parked in `NotesWork.md` with full analysis. These are the target for this session:
+The following issues are known and ready to work on:
 
-### Problem 1: Context menu aim dot / visual misalignment
-The game overwrites `ContextMenu(Clone).localPosition` to screen coords, `localRot.y ≈ 284°`,
-and `localScale.z = 0` every frame. Our zeroing (in 3 locations) may lose the race.
-Z-scale=0 may also prevent correct bounds testing.
+### Parked case board issues (detailed in NotesWork.md)
+1. **Context menu aim dot / visual misalignment** — game writes screen coords + Z-scale=0 every frame to ContextMenu(Clone); our zeroing may lose the race
+2. **Opened pinned notes (WindowCanvas) aim dot misalignment** — when note opened from pin, aim dot doesn't align with visible window
+3. **Pin proximity stealing** — with 2+ pins, wrong pin targeted after context menu is used
 
-**Current state**: TooltipCanvas is frozen at the correct world position when context menu active.
-But the ContextMenu(Clone) content may still be visually offset because the game resets it.
-
-**Suggested approach**: Reparent `ContextMenu(Clone)` away from game control at first detection,
-then the game's positioning MonoBehaviour loses its handle and stops writing to it.
-Alternatively intercept the MonoBehaviour that drives the position each frame.
-
-### Problem 2: Opened pinned notes (WindowCanvas) aim dot misalignment
-When a note is opened from a pin on the case board, the WindowCanvas appears but the aim dot
-(and therefore trigger-click) doesn't align with the visible window.
-
-**Not yet diagnosed** — needs diagnostic logging to compare aim dot position vs canvas transform.
-
-### Problem 3: Pin proximity "stealing" with 2+ pins
-When 2 or more pins are present, the wrong pin gets targeted. Coordinate space was fixed
-(anchoredPosition → localPosition), but "2 children, no pin close enough" errors still appear
-after context menu is used. `hitLocal` from `InverseTransformPoint` may drift after the
-context menu freeze/unfreeze cycle.
-
-**Current state**: likely needs per-pin distance logging immediately after context menu closes
-to see what coordinates are being compared.
-
-## Other known issues
-
-- Context menu from map (A right-click): menu items may not respond if `mapCursorNode` gets
-  reset before user clicks a menu item — may need investigation
-- Awareness compass (3D MeshRenderer system): VR fix implemented but not confirmed working
-  (needs NPC spotting the player to spawn awareness icons)
-- HUD settings plan written but not implemented (plan: `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`)
-- Some additive items show as semi-transparent white, not original colours
-- No comfort options yet (vignette, configurable snap-turn degrees, IPD)
+### Other polish items
+- **HUD settings** — plan ready at `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`; 5 settings (distance, size, height, H.offset, laggy-follow) + auto-hide; NOT YET IMPLEMENTED
+- **Comfort options** — vignette on snap-turn, configurable snap-turn degrees, IPD adjustment
+- Some additive items show as semi-transparent white (not original colours)
+- VR arm rotation may need per-item tuning for specific items
 
 ## Build & deploy
 ```bash
