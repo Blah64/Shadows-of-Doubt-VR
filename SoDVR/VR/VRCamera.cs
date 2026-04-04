@@ -420,9 +420,7 @@ public class VRCamera : MonoBehaviour
     private bool _crouchBtnPrev;
     private bool _interactBtnPrev;
     private bool  _notebookBtnPrev;
-    private float _notebookCooldownUntil;
-    private bool  _notebookBtnNeedsRelease;
-    private int   _pendingTabUpFrame = -1;  // frame at which to send Tab key-up (-1 = none)
+    private bool  _tabHeldDown;              // true while we are holding Tab key down for the game
     private float _jumpCooldownUntil;
     private bool  _jumpBtnNeedsRelease;
     private float _cbACooldownUntil;
@@ -6774,45 +6772,74 @@ public class VRCamera : MonoBehaviour
     /// <summary>Right B → Tab (notebook/map).  3-phase debounce (same as menu button).</summary>
     private void UpdateNotebook()
     {
-        // Deferred Tab key-up: hold Tab DOWN for 2 frames so the game's Input.GetKey(Tab) sees it.
-        // Instant down+up in the same frame was being missed by the game, causing toggle to not stick.
-        if (_pendingTabUpFrame >= 0 && _frameCount >= _pendingTabUpFrame)
+        if (VRSettingsPanel.RootGO?.activeSelf == true)
         {
-            const byte VK_TAB_UP = 0x09;
-            const uint KEYEVENTF_KEYUP_2 = 0x0002;
-            try { keybd_event(VK_TAB_UP, 0, KEYEVENTF_KEYUP_2, UIntPtr.Zero); }
-            catch { }
-            _pendingTabUpFrame = -1;
+            // Release Tab if held while VR settings opened
+            if (_tabHeldDown) ReleaseTabKey();
+            return;
         }
-
-        if (VRSettingsPanel.RootGO?.activeSelf == true) return;
-
-        // Phase 1: time-based lockout — don't even read button state during cooldown.
-        // Reading state during cooldown caused bounce values to corrupt _prev, re-triggering.
-        if (Time.realtimeSinceStartup < _notebookCooldownUntil) return;
 
         OpenXRManager.GetButtonBState(out bool pressed);
 
-        // Phase 2: wait for physical release after fire (guards against bounce after cooldown).
-        if (_notebookBtnNeedsRelease) { if (!pressed) _notebookBtnNeedsRelease = false; return; }
+        // When case board is open, B = middle-click — suppress Tab.
+        // Don't suppress based on _cursorHasTarget while Tab is held — the map/notebook
+        // itself becomes the cursor target, which would create a rapid toggle loop.
+        bool caseBoardOpen = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf;
+        if (caseBoardOpen)
+        {
+            if (_tabHeldDown) ReleaseTabKey();
+            return;
+        }
+        // When NOT holding Tab, suppress if aiming at a canvas (B = middle-click on canvas)
+        if (!_tabHeldDown && _cursorHasTarget)
+            return;
 
-        // Phase 3: fire on press.
-        if (!pressed) return;
-        // When case board is open or aiming at a canvas, Right B = middle-click — suppress Tab
-        if (_actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf) return;
-        if (_cursorHasTarget) return; // B = middle-click on canvas; handled by UpdateUIInput
+        // Hold-to-show: hold Tab while B is physically held
+        if (pressed && !_tabHeldDown)
+        {
+            try
+            {
+                const byte VK_TAB = 0x09;
+                keybd_event(VK_TAB, 0, 0, UIntPtr.Zero); // key DOWN
+                _tabHeldDown = true;
+                Log.LogInfo("[VRCamera] Notebook Tab DOWN (hold-to-show)");
+            }
+            catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateNotebook DOWN: {ex.Message}"); }
+        }
+        else if (!pressed && _tabHeldDown)
+        {
+            ReleaseTabKey();
+            // Remove map/notebook canvases from _positionedCanvases so they get
+            // fresh head-relative placement next time they open.
+            try
+            {
+                foreach (var kvp in _managedCanvases)
+                {
+                    if (kvp.Value == null) continue;
+                    string cn = kvp.Value.gameObject.name ?? "";
+                    if (cn.Equals("MinimapCanvas", StringComparison.OrdinalIgnoreCase)
+                        || cn.Equals("WindowCanvas", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _positionedCanvases.Remove(kvp.Key);
+                        _gripDragEnforce.Remove(kvp.Key);
+                    }
+                }
+            }
+            catch { }
+        }
+    }
 
-        _notebookBtnNeedsRelease = true;
-        _notebookCooldownUntil = Time.realtimeSinceStartup + 1.0f;
+    private void ReleaseTabKey()
+    {
         try
         {
             const byte VK_TAB = 0x09;
-            // Send key DOWN only — key UP deferred to 3 frames later so game sees held state
-            keybd_event(VK_TAB, 0, 0, UIntPtr.Zero);
-            _pendingTabUpFrame = _frameCount + 3;
-            Log.LogInfo($"[VRCamera] Notebook (Tab DOWN) t={Time.realtimeSinceStartup:F3} cooldown={_notebookCooldownUntil:F3} upFrame={_pendingTabUpFrame}");
+            const uint KEYEVENTF_KEYUP = 0x0002;
+            keybd_event(VK_TAB, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            Log.LogInfo("[VRCamera] Notebook Tab UP");
         }
-        catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateNotebook: {ex.Message}"); }
+        catch { }
+        _tabHeldDown = false;
     }
 
     /// <summary>Right thumbstick click → middle mouse button (flashlight toggle).</summary>
