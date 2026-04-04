@@ -253,9 +253,6 @@ public class VRCamera : MonoBehaviour
     private readonly Dictionary<int, (Vector3 pos, Quaternion rot)> _gripDragEnforce = new(); // absolute world positions enforced every LateUpdate
     private Canvas? _actionPanelCanvas;       // ActionPanelCanvas reference — anchor for grip-drag offsets
     private int     _actionPanelId = -1;
-    private bool _caseBoardChildDumped;  // one-time diagnostic flag
-    private bool _caseBoardDiagDone;   // one-time CaseBoard visibility diagnostic
-
     // ── Individual nested note grip-drag ─────────────────────────────────────
     // Allows dragging individual Note canvases apart inside WindowCanvas.
     // Uses full 6DOF world-space tracking (same as regular grip-drag) converted to local space.
@@ -269,7 +266,6 @@ public class VRCamera : MonoBehaviour
     // WindowCanvas-relative offsets for grip-dragged nested canvases (survive reopen/recentre).
     private readonly Dictionary<int, (Vector3 localOffset, Quaternion localRot)> _nestedDragRelative = new();
     private int  _placementIndex;     // incremental depth offset counter per placement cycle
-    private int  _clickDiagCount;     // click component diagnostic counter
 
     // Canvases without CanvasGroup that have enough active Graphics to be considered
     // "actually showing content".  Updated every scan cycle.  Used by depth scan / click
@@ -341,9 +337,6 @@ public class VRCamera : MonoBehaviour
     // Negative = shift selection point to the left (from player's view).
     private const float PinFixedOffsetX = -0.50f;
     private const float PinVisualCorrectionY = 1.0f;
-
-    // ── HUD diagnostics ──────────────────────────────────────────────
-    private bool _hudDiagDone;
 
     // ── Scene-change guard ────────────────────────────────────────────────────
     // When Unity loads a new scene (save load, new game) we stop calling
@@ -1506,32 +1499,6 @@ public class VRCamera : MonoBehaviour
             _gameCamDisableDelay = 10;
             Log.LogInfo($"[VRCamera] Found game camera: '{cam.gameObject.name}' pos={cam.transform.position} (suppress in 10 frames)");
 
-            // ── Diagnostic: dump game camera properties ──
-            try
-            {
-                Log.LogInfo($"[VRCamera] GameCam diag: allowHDR={cam.allowHDR} allowMSAA={cam.allowMSAA}" +
-                            $" clearFlags={cam.clearFlags} bgColor={cam.backgroundColor}" +
-                            $" cullingMask=0x{cam.cullingMask:X8} near={cam.nearClipPlane} far={cam.farClipPlane}" +
-                            $" depth={cam.depth} renderingPath={cam.renderingPath}");
-                var gameHD = cam.gameObject.GetComponent<HDAdditionalCameraData>();
-                if (gameHD != null)
-                {
-                    Log.LogInfo($"[VRCamera] GameCam HDRP: customRendering={gameHD.customRenderingSettings}" +
-                                $" AA={gameHD.antialiasing} dither={gameHD.dithering}" +
-                                $" volumeLayerMask=0x{gameHD.volumeLayerMask.value:X8}" +
-                                $" probeLayerMask=0x{gameHD.probeLayerMask.value:X8}" +
-                                $" clearColorMode={gameHD.clearColorMode}" +
-                                $" bgHDR={gameHD.backgroundColorHDR}" +
-                                $" stopNaNs={gameHD.stopNaNs}" +
-                                $" invertFaceCulling={gameHD.invertFaceCulling}");
-                }
-                else
-                {
-                    Log.LogInfo("[VRCamera] GameCam has NO HDAdditionalCameraData");
-                }
-            }
-            catch (Exception diagEx) { Log.LogWarning($"[VRCamera] Diagnostic failed: {diagEx.Message}"); }
-
             // ── Copy game camera settings to VR eye cameras ──
             CopyGameCameraSettings(cam, _leftCam);
             CopyGameCameraSettings(cam, _rightCam);
@@ -2183,20 +2150,6 @@ public class VRCamera : MonoBehaviour
         }
         catch { }
 
-        // Post-scan: dump MenuCanvas state so we can diagnose black-screen on startup.
-        if (_menuCanvasRef != null && _frameCount <= 300)
-        {
-            try
-            {
-                bool mcEnabled  = _menuCanvasRef.enabled;
-                bool mcActive   = _menuCanvasRef.gameObject.activeSelf;
-                var  mcMode     = _menuCanvasRef.renderMode;
-                int  mcFades    = _managedFades.Count;
-                Log.LogInfo($"[VRCamera] MenuCanvasDiag: enabled={mcEnabled} active={mcActive} mode={mcMode} managedFades={mcFades}");
-            }
-            catch { }
-        }
-
         // Update no-CanvasGroup interactable cache.
         // For canvases without a CanvasGroup, we can't detect visibility via alpha.
         // Instead, count active Graphics — if below threshold, the canvas is "hidden"
@@ -2379,7 +2332,6 @@ public class VRCamera : MonoBehaviour
             var normalSize = zc.normalSize;
             // Viewport uses stretch anchors so sizeDelta=(0,0); rect.size gives actual layout size.
             var vpSize = vpRT.rect.size;
-            Log.LogInfo($"[VRCamera] MinimapZoom diag: normalSize={normalSize} vpRect={vpSize} vpSizeDelta={vpRT.sizeDelta} zoom={zc.zoom} zoomLimit={zc.zoomLimit}");
             if (normalSize.x <= 0 || normalSize.y <= 0 || vpSize.x <= 0 || vpSize.y <= 0) return;
 
             // Scale factor to fit the full city within the Viewport rect.
@@ -2457,47 +2409,6 @@ public class VRCamera : MonoBehaviour
                             _minimapViewportTransform = mask.transform;
                             _minimapZoomApplied = false; // re-apply zoom fit on next LateUpdate
                             Log.LogInfo($"[VRCamera] MinimapViewport: '{mask.gameObject.name}' cached (Mask disabled, zoom-fit will be applied)");
-
-                            // Diagnostic: log Viewport and Content geometry so we understand the scale/overflow
-                            try
-                            {
-                                var vp = mask.transform as RectTransform;
-                                var sr = mask.transform.parent?.GetComponent<ScrollRect>();
-                                var content = sr?.content;
-                                if (vp != null)
-                                    Log.LogInfo($"[MapDiag] Viewport rt: sizeDelta={vp.sizeDelta} ancPos={vp.anchoredPosition} lossyScale={vp.lossyScale}");
-                                if (content != null)
-                                {
-                                    var ct = content.transform as RectTransform ?? content.transform.GetComponent<RectTransform>();
-                                    if (ct != null)
-                                        Log.LogInfo($"[MapDiag] Content rt: sizeDelta={ct.sizeDelta} ancPos={ct.anchoredPosition} localScale={ct.localScale} lossyScale={ct.lossyScale}");
-                                    // World-space corners of Content
-                                    var corners = new Vector3[4];
-                                    if (ct != null) { ct.GetWorldCorners(corners); Log.LogInfo($"[MapDiag] Content worldCorners: BL={corners[0].ToString("F2")} TR={corners[2].ToString("F2")}"); }
-                                }
-                                if (vp != null)
-                                {
-                                    var corners = new Vector3[4];
-                                    vp.GetWorldCorners(corners);
-                                    Log.LogInfo($"[MapDiag] Viewport worldCorners: BL={corners[0].ToString("F2")} TR={corners[2].ToString("F2")}");
-                                }
-                                // List direct children of Content
-                                if (content != null)
-                                {
-                                    var sb = new System.Text.StringBuilder();
-                                    for (int ci = 0; ci < System.Math.Min(content.childCount, 8); ci++)
-                                    {
-                                        var ch = content.GetChild(ci);
-                                        if (ch == null) continue;
-                                        sb.Append(ch.gameObject.name); sb.Append('(');
-                                        var cc = ch.gameObject.GetComponent<Canvas>();
-                                        sb.Append(cc != null ? $"Canvas.en={cc.enabled}" : "noCanvas");
-                                        sb.Append(") ");
-                                    }
-                                    Log.LogInfo($"[MapDiag] Content children[0..7]: {sb}");
-                                }
-                            }
-                            catch (Exception diagEx) { Log.LogWarning($"[MapDiag] {diagEx.Message}"); }
                         }
                         else if (mask.gameObject.GetComponent<RectMask2D>() == null)
                         {
@@ -3583,57 +3494,6 @@ public class VRCamera : MonoBehaviour
 
         int cursorId = _cursorCanvas != null ? _cursorCanvas.GetInstanceID() : -1;
 
-        // One-time CaseCanvas child dump — understand what interactive elements exist
-        if (!_caseBoardChildDumped && Time.frameCount % 60 == 0)
-        {
-            foreach (var kvp in _managedCanvases)
-            {
-                if (kvp.Value == null) continue;
-                string dn = kvp.Value.gameObject.name ?? "";
-                if (!dn.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase)) continue;
-                if (!kvp.Value.gameObject.activeSelf) continue;
-                _caseBoardChildDumped = true;
-
-                // Dump direct children and their component types
-                var root = kvp.Value.transform;
-                Log.LogInfo($"[VRCamera] CaseCanvasDump: {root.childCount} direct children, renderMode={kvp.Value.renderMode}");
-                for (int ci = 0; ci < root.childCount && ci < 20; ci++)
-                {
-                    var ch = root.GetChild(ci);
-                    if (ch == null) continue;
-                    string chName = ch.gameObject.name ?? "?";
-                    bool chActive = ch.gameObject.activeSelf;
-                    // List component type names
-                    var comps = ch.GetComponents<Component>();
-                    var compNames = new System.Text.StringBuilder();
-                    foreach (var comp in comps)
-                    {
-                        if (comp == null) continue;
-                        try { compNames.Append(comp.GetIl2CppType()?.Name ?? "?").Append(","); } catch { }
-                    }
-                    Log.LogInfo($"[VRCamera]   child[{ci}] '{chName}' active={chActive} comps=[{compNames}]");
-
-                    // Dump grandchildren (1 level deeper)
-                    for (int gi = 0; gi < ch.childCount && gi < 10; gi++)
-                    {
-                        var gc = ch.GetChild(gi);
-                        if (gc == null) continue;
-                        string gcName = gc.gameObject.name ?? "?";
-                        bool gcActive = gc.gameObject.activeSelf;
-                        var gComps = gc.GetComponents<Component>();
-                        var gCompNames = new System.Text.StringBuilder();
-                        foreach (var comp in gComps)
-                        {
-                            if (comp == null) continue;
-                            try { gCompNames.Append(comp.GetIl2CppType()?.Name ?? "?").Append(","); } catch { }
-                        }
-                        Log.LogInfo($"[VRCamera]     grandchild[{gi}] '{gcName}' active={gcActive} comps=[{gCompNames}]");
-                    }
-                }
-                break;
-            }
-        }
-
         // Active-state tracking: detect false→true transitions to trigger recentre.
         foreach (var kvp in _managedCanvases)
         {
@@ -3788,30 +3648,6 @@ public class VRCamera : MonoBehaviour
                         _contextMenuFreezeRot = yawOnly;
                         _contextMenuFreezeApplied = true;
 
-                        // Diagnostic: log ContextMenus and child transforms to understand facing
-                        try
-                        {
-                            var cmTrDiag = canvas.transform.Find("ContextMenus");
-                            if (cmTrDiag != null)
-                            {
-                                Log.LogInfo($"[VRCamera] CM diag: TooltipCanvas pos={canvas.transform.position} rot={canvas.transform.rotation.eulerAngles} scale={canvas.transform.localScale}");
-                                Log.LogInfo($"[VRCamera] CM diag: ContextMenus localPos={cmTrDiag.localPosition} localRot={cmTrDiag.localRotation.eulerAngles} localScale={cmTrDiag.localScale}");
-                                for (int dci = 0; dci < cmTrDiag.childCount; dci++)
-                                {
-                                    var dchild = cmTrDiag.GetChild(dci);
-                                    if (!dchild.gameObject.activeSelf) continue;
-                                    Log.LogInfo($"[VRCamera] CM diag: child '{dchild.gameObject.name}' localPos={dchild.localPosition} localRot={dchild.localRotation.eulerAngles} localScale={dchild.localScale} worldRot={dchild.rotation.eulerAngles}");
-                                    // Also check first grandchild
-                                    if (dchild.childCount > 0)
-                                    {
-                                        var gc = dchild.GetChild(0);
-                                        Log.LogInfo($"[VRCamera] CM diag:   grandchild '{gc.gameObject.name}' localRot={gc.localRotation.eulerAngles} worldRot={gc.rotation.eulerAngles}");
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        catch { }
                         Log.LogInfo($"[VRCamera] Context menu freeze: dist={cmDist:F2} freezePos={_contextMenuFreezePos} freezeRot={_contextMenuFreezeRot.eulerAngles}");
                     }
 
@@ -3911,113 +3747,6 @@ public class VRCamera : MonoBehaviour
                         canvas.transform.localRotation = Quaternion.identity;
                         _positionedCanvases.Add(id);
                         Log.LogInfo($"[VRCamera] HUD parented '{canvas.gameObject.name}' to HUDAnchor");
-
-                        // One-time diagnostic: dump overlay/world-marker canvases + camera info
-                        if (!_hudDiagDone)
-                        {
-                            _hudDiagDone = true;
-                            try
-                            {
-                                // Camera dimensions — key for WorldToScreenPoint
-                                if (_gameCamRef != null)
-                                    Log.LogInfo($"[HUDDiag] Camera.main: pixel={_gameCamRef.pixelWidth}x{_gameCamRef.pixelHeight} fov={_gameCamRef.fieldOfView:F1} culling={_gameCamRef.cullingMask}");
-                                if (_leftCam != null)
-                                    Log.LogInfo($"[HUDDiag] LeftEye: pixel={_leftCam.pixelWidth}x{_leftCam.pixelHeight} fov={_leftCam.fieldOfView:F1}");
-                                Log.LogInfo($"[HUDDiag] Screen: {Screen.width}x{Screen.height}");
-
-                                var allCanvases = Resources.FindObjectsOfTypeAll<Canvas>();
-                                foreach (var dc in allCanvases)
-                                {
-                                    if (dc == null) continue;
-                                    string dn = dc.gameObject.name ?? "";
-                                    if (dn.Contains("GameWorld") || dn.Contains("gameWorld") ||
-                                        dn.Contains("Awareness") || dn.Contains("Pointer") ||
-                                        dn.Contains("firstPerson") || dn.Contains("speechBubble") ||
-                                        dn.Contains("Overlay") || dn.Contains("Selection") ||
-                                        dn.Contains("GameCanvas"))
-                                    {
-                                        string wcn = dc.worldCamera != null ? dc.worldCamera.name : "null";
-                                        string pn  = dc.transform.parent != null ? dc.transform.parent.name : "root";
-                                        var drt = dc.GetComponent<RectTransform>();
-                                        string sz = drt != null ? $"sd=({drt.sizeDelta.x:F0},{drt.sizeDelta.y:F0})" : "noRT";
-                                        Log.LogInfo($"[HUDDiag] Canvas '{dn}': mode={dc.renderMode} active={dc.gameObject.activeSelf} wCam={wcn} parent={pn} {sz} scale={dc.transform.localScale}");
-                                    }
-                                }
-
-                                // Look for InterfaceController.firstPersonUI
-                                try
-                                {
-                                    var ic = UnityEngine.Object.FindObjectOfType<InterfaceController>();
-                                    if (ic != null)
-                                    {
-                                        Log.LogInfo($"[HUDDiag] InterfaceController found. firstPersonUI={(ic.firstPersonUI != null ? ic.firstPersonUI.gameObject.name : "null")} gameWorldCanvas={(ic.gameWorldCanvas != null ? ic.gameWorldCanvas.gameObject.name : "null")}");
-                                        if (ic.firstPersonUI != null)
-                                        {
-                                            var fpRT = ic.firstPersonUI;
-                                            Log.LogInfo($"[HUDDiag] firstPersonUI: sd=({fpRT.sizeDelta.x:F0},{fpRT.sizeDelta.y:F0}) pos={fpRT.localPosition} childCount={fpRT.childCount}");
-                                            for (int ci = 0; ci < fpRT.childCount && ci < 10; ci++)
-                                            {
-                                                var ch = fpRT.GetChild(ci);
-                                                if (ch != null)
-                                                    Log.LogInfo($"[HUDDiag]   child[{ci}]: '{ch.gameObject.name}' active={ch.gameObject.activeSelf} pos={ch.localPosition}");
-                                            }
-                                        }
-                                    }
-                                    else
-                                    {
-                                        Log.LogInfo("[HUDDiag] InterfaceController not found");
-                                    }
-                                }
-                                catch (Exception icex) { Log.LogInfo($"[HUDDiag] IC exception: {icex.Message}"); }
-
-                                // Dump uiPointerContainer and OverlayCanvas to understand
-                                // objective arrow + through-wall overlay positioning
-                                try
-                                {
-                                    var ic3 = UnityEngine.Object.FindObjectOfType<InterfaceController>();
-                                    if (ic3 != null)
-                                    {
-                                        var upc = ic3.uiPointerContainer;
-                                        Log.LogInfo($"[HUDDiag] uiPointerContainer={(upc != null ? upc.gameObject.name : "null")} childCount={upc?.childCount ?? 0}");
-                                        if (upc != null)
-                                        {
-                                            var upcParent = upc.parent;
-                                            string upcPath = "";
-                                            var tr2 = (Transform)upc;
-                                            for (int depth = 0; depth < 6 && tr2 != null; depth++)
-                                            { upcPath = tr2.gameObject.name + (upcPath.Length > 0 ? "→" + upcPath : ""); tr2 = tr2.parent; }
-                                            Log.LogInfo($"[HUDDiag] uiPointerContainer path: {upcPath}");
-                                        }
-                                    }
-                                }
-                                catch (Exception ex2) { Log.LogInfo($"[HUDDiag] upcDiag: {ex2.Message}"); }
-
-                                // Dump OverlayCanvas children (top 10) to identify overlay types
-                                try
-                                {
-                                    var allC = Resources.FindObjectsOfTypeAll<Canvas>();
-                                    foreach (var oc in allC)
-                                    {
-                                        if (oc == null) continue;
-                                        string ocn = oc.gameObject.name ?? "";
-                                        if (!ocn.Equals("OverlayCanvas", StringComparison.OrdinalIgnoreCase)) continue;
-                                        Log.LogInfo($"[HUDDiag] OverlayCanvas active={oc.gameObject.activeSelf} childCount={oc.transform.childCount}");
-                                        for (int ci = 0; ci < oc.transform.childCount && ci < 10; ci++)
-                                        {
-                                            var ch = oc.transform.GetChild(ci);
-                                            if (ch == null) continue;
-                                            string compList = "";
-                                            var comps = ch.gameObject.GetComponents<Component>();
-                                            if (comps != null)
-                                                foreach (var c in comps) { if (c != null) compList += c.GetType().Name + " "; }
-                                            Log.LogInfo($"[HUDDiag]   OC child[{ci}]: '{ch.gameObject.name}' active={ch.gameObject.activeSelf} pos={ch.localPosition} comps=[{compList.Trim()}]");
-                                        }
-                                    }
-                                }
-                                catch (Exception ex3) { Log.LogInfo($"[HUDDiag] overlayCDiag: {ex3.Message}"); }
-                            }
-                            catch (Exception dex) { Log.LogInfo($"[HUDDiag] Exception: {dex.Message}"); }
-                        }
                     }
                     catch (Exception ex) { Log.LogWarning($"[VRCamera] HUD parent: {ex.Message}"); }
                 }
@@ -4047,23 +3776,6 @@ public class VRCamera : MonoBehaviour
 
             // PopupMessage/TutorialMessage: now nested under TooltipCanvas, handled in dialog mode above.
             string cname = canvas.gameObject.name ?? "";
-            // One-time CaseCanvas diagnostic: log CanvasGroup state to understand visibility
-            if (cat == CanvasCategory.CaseBoard && !_caseBoardDiagDone)
-            {
-                try
-                {
-                    var cg = canvas.GetComponent<CanvasGroup>();
-                    float cgA = cg != null ? cg.alpha : -1f;
-                    bool cgBR = cg != null ? cg.blocksRaycasts : true;
-                    bool vis = IsCanvasVisible(canvas);
-                    int graphicCount = 0;
-                    try { graphicCount = canvas.GetComponentsInChildren<Graphic>(false).Count; } catch { }
-                    Log.LogInfo($"[VRCamera] CaseBoardDiag '{cname}': CGalpha={cgA:F2} blocks={cgBR} visible={vis} activeGraphics={graphicCount} active={canvas.gameObject.activeSelf} enabled={canvas.enabled}");
-                }
-                catch { }
-                if (cname.Equals("CaseCanvas", StringComparison.OrdinalIgnoreCase))
-                    _caseBoardDiagDone = true;
-            }
             // ActionPanelCanvas: 0.15m closer than CaseBoard so action buttons are in front
             if (cname.Equals("ActionPanelCanvas", StringComparison.OrdinalIgnoreCase))
                 dist = GetCategoryDefaults(CanvasCategory.CaseBoard).Distance - 0.15f;
@@ -5963,11 +5675,10 @@ public class VRCamera : MonoBehaviour
             Canvas? bestNestedCanvas = null;
             try
             {
-                Log.LogInfo($"[VRCamera] GripDrag nested pre-pass: _windowNestedList.Count={_windowNestedList.Count}");
                 foreach (var nc in _windowNestedList)
                 {
-                    if (nc == null) { Log.LogInfo("[VRCamera]   nested: null"); continue; }
-                    if (!nc.gameObject.activeSelf) { Log.LogInfo($"[VRCamera]   nested: '{nc.gameObject.name}' SKIP inactive"); continue; }
+                    if (nc == null) continue;
+                    if (!nc.gameObject.activeSelf) continue;
                     // Skip if this canvas is a CHILD of another nested canvas (e.g. Scroll View
                     // inside a Note). The parent is the logical draggable unit — children are
                     // implementation details that should move with their parent.
@@ -5978,22 +5689,20 @@ public class VRCamera : MonoBehaviour
                         if (nc.transform.IsChildOf(other.transform))
                         { isSubChild = true; break; }
                     }
-                    if (isSubChild) { Log.LogInfo($"[VRCamera]   nested: '{nc.gameObject.name}' SKIP sub-child"); continue; }
+                    if (isSubChild) continue;
 
                     var nrt = nc.GetComponent<RectTransform>();
-                    if (nrt == null) { Log.LogInfo($"[VRCamera]   nested: '{nc.gameObject.name}' SKIP no RT"); continue; }
+                    if (nrt == null) continue;
                     var npl = new Plane(-nc.transform.forward, nc.transform.position);
-                    if (!npl.Raycast(ray, out float nd) || nd <= 0f) { Log.LogInfo($"[VRCamera]   nested: '{nc.gameObject.name}' SKIP raycast miss"); continue; }
+                    if (!npl.Raycast(ray, out float nd) || nd <= 0f) continue;
                     Vector3 nlp = nc.transform.InverseTransformPoint(ctrlPos + ctrlFwd * nd);
                     // 30% margin beyond half-size — forgiving enough to not miss near-edge grabs,
                     // tight enough to not grab adjacent notes
                     Vector2 nhs = nrt.sizeDelta * 0.65f;
                     if (Mathf.Abs(nlp.x) > nhs.x || Mathf.Abs(nlp.y) > nhs.y)
                     {
-                        Log.LogInfo($"[VRCamera]   nested: '{nc.gameObject.name}' SKIP bounds local=({nlp.x:F0},{nlp.y:F0}) hs=({nhs.x:F0},{nhs.y:F0})");
                         continue;
                     }
-                    Log.LogInfo($"[VRCamera]   nested: '{nc.gameObject.name}' HIT dist={nd:F2}");
                     if (nd < bestNestedDist)
                     {
                         bestNestedDist = nd;
@@ -6001,7 +5710,7 @@ public class VRCamera : MonoBehaviour
                     }
                 }
             }
-            catch (Exception nex) { Log.LogInfo($"[VRCamera] nested pre-pass exception: {nex.Message}"); }
+            catch { }
 
             if (bestNestedCanvas != null)
             {
@@ -6016,26 +5725,6 @@ public class VRCamera : MonoBehaviour
                 _gripNoteOffset      = Quaternion.Inverse(grabCtrlRot) * (hitPoint - ctrlPos);
                 _gripNoteHitLocalOff = Quaternion.Inverse(grabNoteRot) * (hitPoint - bestNestedCanvas.transform.position);
                 _gripNoteRotOffset   = Quaternion.Inverse(grabCtrlRot) * grabNoteRot;
-                // Log all nested canvases in the list for debugging hierarchy
-                try
-                {
-                    foreach (var ncDbg in _windowNestedList)
-                    {
-                        if (ncDbg == null) continue;
-                        string parentPath = "";
-                        var pw = ncDbg.transform.parent;
-                        for (int pi = 0; pi < 4 && pw != null; pi++)
-                        { parentPath += "/" + (pw.gameObject.name ?? "?"); pw = pw.parent; }
-                        bool isContainerDbg = false;
-                        foreach (var otherDbg in _windowNestedList)
-                        {
-                            if (otherDbg == null || otherDbg == ncDbg) continue;
-                            if (otherDbg.transform.IsChildOf(ncDbg.transform)) { isContainerDbg = true; break; }
-                        }
-                        Log.LogInfo($"[VRCamera] NestedList: '{ncDbg.gameObject.name}' active={ncDbg.gameObject.activeSelf} container={isContainerDbg} path={parentPath}");
-                    }
-                }
-                catch { }
                 Log.LogInfo($"[VRCamera] GripDrag nested start: '{bestNestedCanvas.gameObject.name}' dist={bestNestedDist:F2}");
             }
             else
@@ -6073,52 +5762,6 @@ public class VRCamera : MonoBehaviour
                     }
 
                     if (dist < bestGripDist) { bestGripDist = dist; bestGripCanvas = c; }
-                }
-
-                if (bestNestedCanvas == null && bestGripCanvas == null)
-                {
-                    // Diagnostic: log why grip failed to find any canvas
-                    int canvasCount = 0;
-                    foreach (var kvpDbg in _managedCanvases)
-                    {
-                        var cDbg = kvpDbg.Value;
-                        if (cDbg == null) continue;
-                        if (!cDbg.gameObject.activeSelf || !cDbg.enabled) continue;
-                        var catDbg = GetCanvasCategory(cDbg.gameObject.name);
-                        if (catDbg == CanvasCategory.Panel || catDbg == CanvasCategory.CaseBoard || catDbg == CanvasCategory.Menu)
-                        {
-                            canvasCount++;
-                            var plDbg = new Plane(-cDbg.transform.forward, cDbg.transform.position);
-                            bool rayHit = plDbg.Raycast(ray, out float dDbg) && dDbg > 0f;
-                            string boundsInfo = "";
-                            if (rayHit)
-                            {
-                                var rtDbg = cDbg.GetComponent<RectTransform>();
-                                if (rtDbg != null)
-                                {
-                                    Vector3 lpDbg = cDbg.transform.InverseTransformPoint(ctrlPos + ctrlFwd * dDbg);
-                                    Vector2 hsDbg = rtDbg.sizeDelta * 0.5f;
-                                    bool inBounds = Mathf.Abs(lpDbg.x) <= hsDbg.x && Mathf.Abs(lpDbg.y) <= hsDbg.y;
-                                    boundsInfo = $" local=({lpDbg.x:F0},{lpDbg.y:F0}) hs=({hsDbg.x:F0},{hsDbg.y:F0}) inBounds={inBounds}";
-                                }
-                            }
-                            Log.LogInfo($"[VRCamera] GripDiag: '{cDbg.gameObject.name}' cat={catDbg} rayHit={rayHit}{boundsInfo}");
-                        }
-                    }
-                    // Specific MinimapCanvas diagnostic
-                    if (_minimapCanvasRef != null)
-                    {
-                        bool mmActive = _minimapCanvasRef.gameObject.activeSelf;
-                        bool mmEnabled = _minimapCanvasRef.enabled;
-                        bool mmInManaged = _managedCanvases.ContainsKey(_minimapCanvasRef.GetInstanceID());
-                        bool mmNested = _nestedCanvasIds.Contains(_minimapCanvasRef.GetInstanceID());
-                        Log.LogInfo($"[VRCamera] GripDiag Minimap: active={mmActive} enabled={mmEnabled} managed={mmInManaged} nested={mmNested}");
-                    }
-                    else
-                    {
-                        Log.LogInfo("[VRCamera] GripDiag Minimap: _minimapCanvasRef=null");
-                    }
-                    Log.LogInfo($"[VRCamera] GripDiag: {canvasCount} canvases, gripAllowed={gripDragAllowed}");
                 }
 
                 if (bestGripCanvas != null)
@@ -6578,13 +6221,8 @@ public class VRCamera : MonoBehaviour
         catch { cbOpenJ = false; }
         bool vrSettingsOpen = VRSettingsPanel.RootGO != null && VRSettingsPanel.RootGO.activeSelf;
 
-        // Diagnostic: log jump state once per second
         float now = Time.realtimeSinceStartup;
         OpenXRManager.GetButtonAState(out bool aStateNow);
-        if ((int)now != (int)(now - dt)) // once per second
-        {
-            Log.LogInfo($"[VRCamera] JumpDiag: A={aStateNow} grounded={_playerCC.isGrounded} cbOpen={cbOpenJ} vrSettings={vrSettingsOpen} needsRelease={_jumpBtnNeedsRelease} cooldown={_jumpCooldownUntil:F1} now={now:F1}");
-        }
 
         if (vrSettingsOpen || cbOpenJ || _cursorHasTarget)
             return; // gravity applied above; suppress jump/right-click handled by UpdateUIInput
@@ -6809,7 +6447,6 @@ public class VRCamera : MonoBehaviour
     /// The game's positioning uses ScreenPointToLocalPointInRectangle with null camera,
     /// which produces garbage for WorldSpace canvases. We re-project using the VR camera.
     /// </summary>
-    private int _uiPointerDiagFrame = -1; // frame of last UIPointer diagnostic
     private void UpdateUIPointers()
     {
         if (_interfaceCtrl == null || _firstPersonUI == null || _leftCam == null) return;
@@ -6818,13 +6455,6 @@ public class VRCamera : MonoBehaviour
         try { container = _interfaceCtrl.uiPointerContainer; }
         catch { return; }
         if (container == null) return;
-
-        // Periodic diagnostic
-        if (_poseFrameCount - _uiPointerDiagFrame >= 180)
-        {
-            _uiPointerDiagFrame = _poseFrameCount;
-            Log.LogInfo($"[UIPtr] container='{container.gameObject.name}' childCount={container.childCount}");
-        }
 
         Vector2 fpSize = _firstPersonUI.sizeDelta; // typically (100, 100)
 
@@ -8108,11 +7738,9 @@ public class VRCamera : MonoBehaviour
                 // All canvases: require a Button (or DragCasePanel for pins) in hierarchy.
                 // Decorative elements (LensFlare, borders, backgrounds) have neither — returning
                 // them causes FireCaseBoardClick to silently eat the click.
-                // CaseCanvas also gets verbose component diagnostics for debugging.
                 {
                     bool hasBtn = false;
                     var walker = go.transform;
-                    var compDiag = isCaseCanvas ? new System.Text.StringBuilder() : null;
                     for (int wi = 0; wi < 8 && walker != null; wi++)
                     {
                         if (walker.GetComponent<Button>() != null) hasBtn = true;
@@ -8129,22 +7757,8 @@ public class VRCamera : MonoBehaviour
                             }
                             catch { }
                         }
-                        if (compDiag != null)
-                        {
-                            try
-                            {
-                                var comps = walker.GetComponents<Component>();
-                                compDiag.Append($"  [{wi}] '{walker.gameObject.name}': ");
-                                foreach (var comp in comps)
-                                    if (comp != null) compDiag.Append(comp.GetIl2CppType().Name).Append(", ");
-                                compDiag.AppendLine();
-                            }
-                            catch { }
-                        }
                         walker = walker.parent;
                     }
-                    if (compDiag != null && compDiag.Length > 0)
-                        Log.LogInfo($"[VRCamera] CBTarget hierarchy for '{go.name}':\n{compDiag}");
                     if (!hasBtn) continue; // skip non-interactive element — fall through to next candidate
                 }
 
@@ -8504,16 +8118,6 @@ public class VRCamera : MonoBehaviour
                         pt.Y = clientY;
                         ClientToScreen(hwnd, ref pt);
                         SetCursorPos(pt.X, pt.Y);
-                        // Diagnostic: log coordinates once per second when case board is open
-                        if ((int)Time.realtimeSinceStartup != (int)(Time.realtimeSinceStartup - Time.unscaledDeltaTime))
-                        {
-                            Vector3 mousePos = Input.mousePosition;
-                            var camMain = Camera.main;
-                            string camInfo = camMain != null
-                                ? $"pos=({camMain.transform.position.x:F1},{camMain.transform.position.y:F1},{camMain.transform.position.z:F1}) rot=({camMain.transform.eulerAngles.x:F0},{camMain.transform.eulerAngles.y:F0},{camMain.transform.eulerAngles.z:F0}) cull=0x{camMain.cullingMask:X}"
-                                : "NULL";
-                            Log.LogInfo($"[VRCamera] CursorDiag: wp=({wp.x:F2},{wp.y:F2},{wp.z:F2}) gameSp=({gameSp.x:F0},{gameSp.y:F0},{gameSp.z:F1}) client=({clientX},{clientY}) screen=({pt.X},{pt.Y}) Input.mouse=({mousePos.x:F0},{mousePos.y:F0}) Screen=({Screen.width}x{Screen.height}) camPx=({_gameCamRef.pixelWidth}x{_gameCamRef.pixelHeight}) CamMain=[{camInfo}] mouseOnly={_cbMouseOnlyDrag} lockState={UnityEngine.Cursor.lockState}");
-                        }
                     }
                 }
                 catch { }
@@ -8926,30 +8530,6 @@ public class VRCamera : MonoBehaviour
                     ped.pointerPressRaycast   = bestResult;
                     ped.eligibleForClick   = true;
                     ped.button             = PointerEventData.InputButton.Left;
-
-                    // Log component types on clicked GO + parent hierarchy
-                    if (_clickDiagCount < 10)
-                    {
-                        _clickDiagCount++;
-                        try
-                        {
-                            var tr = go.transform;
-                            for (int lvl = 0; lvl < 6 && tr != null; lvl++)
-                            {
-                                var comps = tr.gameObject.GetComponents<Component>();
-                                var sb = new System.Text.StringBuilder();
-                                foreach (var comp in comps)
-                                {
-                                    if (comp == null) continue;
-                                    sb.Append(comp.GetIl2CppType()?.Name ?? "?");
-                                    sb.Append(',');
-                                }
-                                Log.LogInfo($"[VRCamera] ClickHier[{lvl}] '{tr.gameObject.name}' comps=[{sb}]");
-                                tr = tr.parent;
-                            }
-                        }
-                        catch { }
-                    }
 
                     // ── Button detection ────────────────────────────────────────────
                     // Check for a Button FIRST. If found, use ONLY the manual persistent-
