@@ -57,13 +57,7 @@ Also read the parked case board investigation notes:
 
 The following issues are known and ready to work on:
 
-### Parked case board issues (detailed in NotesWork.md)
-1. **Context menu aim dot / visual misalignment** — game writes screen coords + Z-scale=0 every frame to ContextMenu(Clone); our zeroing may lose the race
-2. **Opened pinned notes (WindowCanvas) aim dot misalignment** — when note opened from pin, aim dot doesn't align with visible window
-3. **Pin proximity stealing** — with 2+ pins, wrong pin targeted after context menu is used
-
 ### Other polish items
-- **HUD settings** — plan ready at `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`; 5 settings (distance, size, height, H.offset, laggy-follow) + auto-hide; NOT YET IMPLEMENTED
 - **Comfort options** — vignette on snap-turn, configurable snap-turn degrees, IPD adjustment
 - Some additive items show as semi-transparent white (not original colours)
 - VR arm rotation may need per-item tuning for specific items

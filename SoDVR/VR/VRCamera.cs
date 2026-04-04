@@ -482,7 +482,16 @@ public class VRCamera : MonoBehaviour
     // We cache the render-time CC localPosition to compute the world-space delta.
     private bool              _cbCursorRbSearched;  // true = already searched (even if not found)
 
-    // Middle-click drag (Right B → create string between pinned notes)
+    // String drag (Right B → drag string between pinned notes on case board)
+    // Bypasses the game's CustomStringLink coroutine (requires desktopMode + Rewired input).
+    // We directly instantiate the preview string, update it each frame, and call
+    // FinishCustomStringLinkSelection / CancelCustomStringLinkSelection on release.
+    private bool                    _stringDragActive;
+    private PinnedItemController?   _stringDragSourcePin;
+    private RectTransform?          _stringDragFromRect;   // source pin's pinButtonController.rect
+    private RectTransform?          _stringDragPreviewRT;  // instantiated preview string
+
+    // Non-case-board mid-drag (B on other canvases — kept for generic middle-click drag)
     private bool              _cbMidDragActive;
     private bool              _cbMidDragStarted;
     private bool              _cbMidDragCaseBoard; // true = mid-drag started on case board plane
@@ -1681,6 +1690,7 @@ public class VRCamera : MonoBehaviour
                 // The game continuously repositions CaseCanvas to Camera.main-relative coords,
                 // so we must override it every frame to keep it near the VR player.
                 EnforceCaseCanvasPosition();
+                FixStringRotations();
                 EnforceWindowNestedZSeparation();
 
                 // Re-apply grip-drag position for top-level canvas.
@@ -5301,10 +5311,10 @@ public class VRCamera : MonoBehaviour
             }
         }
 
-        // ── Right B → middle-click drag on any aimed canvas (case board strings, notes, etc.) ──
-        // Mid-drag stays active until B is released, even if aim target changes.
+        // ── Right B → case board string drag / minimap pan / middle-click on canvas ──
+        // String drag stays active until B is released, even if aim target changes.
         // When neither case board open nor aiming at canvas: B falls through to UpdateNotebook().
-        if (cbOpen || _cursorHasTarget || _cbMidDragActive || _minimapPanActive)
+        if (cbOpen || _cursorHasTarget || _stringDragActive || _cbMidDragActive || _minimapPanActive)
         {
             const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
             const uint MOUSEEVENTF_MIDDLEUP   = 0x0040;
@@ -5381,17 +5391,120 @@ public class VRCamera : MonoBehaviour
                     catch { }
                 }
             }
+            // ── String drag in progress (VR B held on case board pin) ──
+            else if (_stringDragActive)
+            {
+                OpenXRManager.GetButtonBState(out bool bNow);
+                if (!bNow)
+                {
+                    // ── B released: find target pin and finish/cancel string link ──
+                    try
+                    {
+                        PinnedItemController? targetPin = null;
+                        if (_cbContentContainerRT != null && _casePanelCanvas != null)
+                        {
+                            var pinnedCtnr = _cbContentContainerRT.transform.Find("Pinned");
+                            int cnt = pinnedCtnr?.childCount ?? 0;
+                            if (cnt > 0)
+                            {
+                                float bestDist = float.MaxValue;
+                                Transform? bestTr = null;
+                                var pinnedRT = pinnedCtnr.TryCast<RectTransform>() ?? pinnedCtnr.GetComponent<RectTransform>();
+                                for (int i = 0; i < cnt; i++)
+                                {
+                                    var tr = pinnedCtnr.GetChild(i);
+                                    if (tr == null || !tr.gameObject.activeSelf) continue;
+                                    if (tr.GetComponent<RectTransform>() == null) continue;
+                                    Vector3 pW = GetPinVisualWorldPos(tr);
+                                    float t = Mathf.Max(0f, Vector3.Dot(pW - rPos, rFwd));
+                                    float wd = Vector3.Distance(rPos + rFwd * t, pW);
+                                    if (wd < bestDist) { bestDist = wd; bestTr = tr; }
+                                }
+                                float lossy = (pinnedRT != null) ? Mathf.Abs(pinnedRT.lossyScale.x) : 0.001f;
+                                float threshold = 400f * Mathf.Max(lossy, 0.0001f);
+                                if (bestTr != null && bestDist < threshold)
+                                {
+                                    var pic = bestTr.GetComponent<PinnedItemController>();
+                                    if (pic != null && pic != _stringDragSourcePin)
+                                        targetPin = pic;
+                                }
+                            }
+                        }
+
+                        var cpc = CasePanelController.Instance;
+                        if (cpc != null && targetPin != null)
+                        {
+                            Log.LogInfo($"[VRCamera] StringDrag finish: '{_stringDragSourcePin?.name}' → '{targetPin.name}'");
+                            cpc.FinishCustomStringLinkSelection(targetPin);
+                        }
+                        else
+                        {
+                            Log.LogInfo($"[VRCamera] StringDrag cancel (no target pin)");
+                            if (cpc != null) cpc.CancelCustomStringLinkSelection();
+                            // Clean up preview if game didn't destroy it
+                            if (_stringDragPreviewRT != null)
+                            {
+                                UnityEngine.Object.Destroy(_stringDragPreviewRT.gameObject);
+                                _stringDragPreviewRT = null;
+                            }
+                        }
+                    }
+                    catch (Exception ex) { Log.LogWarning($"[VRCamera] StringDrag end: {ex.Message}"); }
+                    _stringDragActive = false;
+                    _stringDragSourcePin = null;
+                    _stringDragFromRect = null;
+                    _stringDragPreviewRT = null;
+                    _cbBNeedsRelease = true;
+                    _cbBCooldownUntil = Time.realtimeSinceStartup + 0.3f;
+                }
+                else
+                {
+                    // ── B held: update preview string each frame ──
+                    try
+                    {
+                        if (_stringDragPreviewRT != null && _stringDragFromRect != null && _cbContentContainerRT != null)
+                        {
+                            // Raycast to case board plane → local coords
+                            var planeN = -_cbContentContainerRT.transform.forward;
+                            var planeO = _cbContentContainerRT.transform.position;
+                            var cbPlane = new Plane(planeN, planeO);
+                            if (cbPlane.Raycast(new Ray(rPos, rFwd), out float cbDist) && cbDist > 0f)
+                            {
+                                Vector3 worldHit = rPos + rFwd * cbDist;
+                                Vector3 localHit = _cbContentContainerRT.InverseTransformPoint(worldHit);
+                                // 2D vector from source pin to cursor in canvas-local space
+                                Vector2 from2D = new Vector2(_stringDragFromRect.localPosition.x, _stringDragFromRect.localPosition.y);
+                                Vector2 to2D = new Vector2(localHit.x, localHit.y);
+                                Vector2 delta = to2D - from2D;
+                                float mag = delta.magnitude;
+                                float angle = Mathf.Atan2(delta.y, delta.x) * Mathf.Rad2Deg;
+                                _stringDragPreviewRT.sizeDelta = new Vector2(mag, _stringDragPreviewRT.sizeDelta.y);
+                                _stringDragPreviewRT.localRotation = Quaternion.Euler(0f, 0f, angle);
+                                _stringDragPreviewRT.localPosition = new Vector2(from2D.x, from2D.y);
+
+                                // Also update caseBoardCursorRBContainer so game code stays in sync
+                                try
+                                {
+                                    var cursorRB = InterfaceControls.Instance?.caseBoardCursorRBContainer;
+                                    if (cursorRB != null)
+                                        cursorRB.localPosition = new Vector2(localHit.x, localHit.y);
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
             else if (_cbMidDragActive)
             {
-                // Mid-drag in progress: read button directly (no debounce, need release detection)
+                // Non-case-board mid-drag in progress (generic middle-click on other canvases)
                 OpenXRManager.GetButtonBState(out bool bNow);
-                // Use CaseCanvas plane if drag started on board, otherwise aimed canvas
                 var midDragCanvas = _cbMidDragCaseBoard ? _casePanelCanvas : mmbTarget;
                 if (!bNow)
                 {
                     if (midDragCanvas != null)
                         GetCaseBoardScreenPos(rPos, rFwd, midDragCanvas, moveCursor: true);
-                    // Fire pointerUp + drop on the target GO at release position
                     try
                     {
                         if (_cbMidDragGO != null && _cbMidDragPED != null)
@@ -5404,12 +5517,10 @@ public class VRCamera : MonoBehaviour
                             ExecuteEvents.ExecuteHierarchy(dropTarget, dropPed, ExecuteEvents.pointerUpHandler);
                             ExecuteEvents.ExecuteHierarchy(dropTarget, dropPed, ExecuteEvents.dropHandler);
                             ExecuteEvents.ExecuteHierarchy(_cbMidDragGO, _cbMidDragPED, ExecuteEvents.endDragHandler);
-                            Log.LogInfo($"[VRCamera] Mid-drag end ExecuteEvents: start='{_cbMidDragGO.name}' drop='{dropTarget.name}'");
                         }
                         else
                         {
                             mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
-                            Log.LogInfo($"[VRCamera] Mid-drag end mouse_event fallback");
                         }
                     }
                     catch (Exception ex) { Log.LogWarning($"[VRCamera] Mid-drag end: {ex.Message}"); }
@@ -5422,7 +5533,6 @@ public class VRCamera : MonoBehaviour
                 {
                     if (midDragCanvas != null)
                         GetCaseBoardScreenPos(rPos, rFwd, midDragCanvas, moveCursor: true);
-                    // Fire pointer drag each frame
                     if (_cbMidDragGO != null && _cbMidDragPED != null)
                     {
                         try
@@ -5470,93 +5580,130 @@ public class VRCamera : MonoBehaviour
                         }
                         catch (Exception ex) { Log.LogWarning($"[VRCamera] MinimapPan start: {ex.Message}"); }
                     }
+                    else if (mmbAimingAtCaseBoard)
+                    {
+                        // ── Case board: start VR string drag (direct API, bypass game coroutine) ──
+                        try
+                        {
+                            PinnedItemController? sourcePin = null;
+                            if (_cbContentContainerRT != null && _casePanelCanvas != null)
+                            {
+                                var pinnedCtnr = _cbContentContainerRT.transform.Find("Pinned");
+                                int cnt = pinnedCtnr?.childCount ?? 0;
+                                if (cnt > 0)
+                                {
+                                    float bestDist = float.MaxValue;
+                                    Transform? bestTr = null;
+                                    var pinnedRT = pinnedCtnr.TryCast<RectTransform>() ?? pinnedCtnr.GetComponent<RectTransform>();
+                                    for (int i = 0; i < cnt; i++)
+                                    {
+                                        var tr = pinnedCtnr.GetChild(i);
+                                        if (tr == null || !tr.gameObject.activeSelf) continue;
+                                        if (tr.GetComponent<RectTransform>() == null) continue;
+                                        Vector3 pW = GetPinVisualWorldPos(tr);
+                                        float t = Mathf.Max(0f, Vector3.Dot(pW - rPos, rFwd));
+                                        float wd = Vector3.Distance(rPos + rFwd * t, pW);
+                                        if (wd < bestDist) { bestDist = wd; bestTr = tr; }
+                                    }
+                                    float lossy = (pinnedRT != null) ? Mathf.Abs(pinnedRT.lossyScale.x) : 0.001f;
+                                    float threshold = 400f * Mathf.Max(lossy, 0.0001f);
+                                    if (bestTr != null && bestDist < threshold)
+                                        sourcePin = bestTr.GetComponent<PinnedItemController>();
+                                }
+                            }
+
+                            if (sourcePin != null)
+                            {
+                                // Set game fields so FinishCustomStringLinkSelection can read them
+                                var cpc = CasePanelController.Instance;
+                                if (cpc != null)
+                                {
+                                    cpc.customStringLinkSelection = sourcePin;
+                                    cpc.customLinkSelectionMode = true;
+
+                                    // Instantiate preview string
+                                    var prefab = PrefabControls.Instance?.customStringLinkSelect;
+                                    if (prefab != null && cpc.stringContainer != null)
+                                    {
+                                        var previewGO = UnityEngine.Object.Instantiate(prefab, cpc.stringContainer);
+                                        _stringDragPreviewRT = previewGO?.GetComponent<RectTransform>();
+                                        cpc.customString = _stringDragPreviewRT;
+                                    }
+
+                                    _stringDragSourcePin = sourcePin;
+                                    _stringDragFromRect = sourcePin.pinButtonController?.rect;
+                                    _stringDragActive = true;
+                                    Log.LogInfo($"[VRCamera] StringDrag start: '{sourcePin.name}' fromRect={_stringDragFromRect != null}");
+                                }
+                            }
+                            else
+                            {
+                                Log.LogInfo("[VRCamera] StringDrag: no pin found near aim");
+                            }
+                        }
+                        catch (Exception ex) { Log.LogWarning($"[VRCamera] StringDrag start: {ex.Message}"); }
+                    }
                     else
                     {
-                        // When aimed at case board (dot visible), always use CaseCanvas for cursor
-                        var pressCanvas = (mmbAimingAtCaseBoard && _casePanelCanvas != null)
-                            ? _casePanelCanvas : mmbTarget;
+                        // Non-case-board: generic middle-click drag (ExecuteEvents fallback)
+                        var pressCanvas = mmbTarget;
                         GetCaseBoardScreenPos(rPos, rFwd, pressCanvas, moveCursor: true);
-                        // Pins use 2D physics — GR only finds BG/ContentContainer.
-                        // Use Pinned-container scan (same as trigger-click drag) to find the nearest
-                        // PlayerStickyNote, then fire ExecuteEvents middle-click drag on it.
                         try
                         {
                             var es = EventSystem.current;
                             if (es != null)
                             {
-                                GameObject? pinTargetMMB = null;
-                                if (mmbAimingAtCaseBoard && _cbContentContainerRT != null && _casePanelCanvas != null)
+                                var mmbPed = new PointerEventData(es);
+                                mmbPed.button = PointerEventData.InputButton.Middle;
+                                _cbMidDragGO = mmbTarget?.gameObject;
+                                _cbMidDragPED = mmbPed;
+                                if (_cbMidDragGO != null)
                                 {
-                                    var pinnedCtnrMMB = _cbContentContainerRT.transform.Find("Pinned");
-                                    int pinnedCntMMB = pinnedCtnrMMB?.childCount ?? 0;
-                                    if (pinnedCntMMB > 0)
-                                    {
-                                        // Corrected visual proximity
-                                        float mmbBest = float.MaxValue;
-                                        Transform? mmbBestTr = null;
-                                        var mmbPinnedRT = pinnedCtnrMMB.TryCast<RectTransform>() ?? pinnedCtnrMMB.GetComponent<RectTransform>();
-                                        for (int mpi = 0; mpi < pinnedCntMMB; mpi++)
-                                        {
-                                            var mpTr = pinnedCtnrMMB.GetChild(mpi);
-                                            if (mpTr == null || !mpTr.gameObject.activeSelf) continue;
-                                            if (mpTr.GetComponent<RectTransform>() == null) continue;
-                                            Vector3 mpWorld = GetPinVisualWorldPos(mpTr);
-                                            float mpT = Mathf.Max(0f, Vector3.Dot(mpWorld - rPos, rFwd));
-                                            float mpWd = Vector3.Distance(rPos + rFwd * mpT, mpWorld);
-                                            if (mpWd < mmbBest) { mmbBest = mpWd; mmbBestTr = mpTr; }
-                                        }
-                                        float mmbLossy = (mmbPinnedRT != null) ? Mathf.Abs(mmbPinnedRT.lossyScale.x) : 0.001f;
-                                        float mmbThreshold = 400f * Mathf.Max(mmbLossy, 0.0001f);
-                                        if (mmbBestTr != null && mmbBest < mmbThreshold)
-                                        {
-                                            pinTargetMMB = mmbBestTr.gameObject;
-                                            Log.LogInfo($"[VRCamera] Mid-press Pinned scan: '{pinTargetMMB.name}' worldDist={mmbBest:F4}");
-                                        }
-                                        else Log.LogInfo($"[VRCamera] Mid-press Pinned scan: no pin (count={pinnedCntMMB} best={mmbBest:F4})");
-                                    }
-                                }
-
-                                if (pinTargetMMB != null)
-                                {
-                                    var mmbPed = new PointerEventData(es);
-                                    mmbPed.button = PointerEventData.InputButton.Middle;
-                                    _cbMidDragGO = pinTargetMMB;
-                                    _cbMidDragPED = mmbPed;
-                                    ExecuteEvents.ExecuteHierarchy(pinTargetMMB, mmbPed, ExecuteEvents.pointerEnterHandler);
-                                    ExecuteEvents.ExecuteHierarchy(pinTargetMMB, mmbPed, ExecuteEvents.pointerDownHandler);
-                                    try { ExecuteEvents.ExecuteHierarchy(pinTargetMMB, mmbPed, ExecuteEvents.beginDragHandler); } catch { }
-                                    Log.LogInfo($"[VRCamera] Mid-press ExecuteEvents on '{pinTargetMMB.name}' canvas='{pressCanvas.gameObject.name}'");
-                                }
-                                else
-                                {
-                                    // No pin found via scan — fallback mouse_event
-                                    mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, UIntPtr.Zero);
-                                    _cbMidDragGO = null; _cbMidDragPED = null;
-                                    Log.LogInfo($"[VRCamera] Mid-press mouse_event fallback on '{pressCanvas.gameObject.name}'");
+                                    ExecuteEvents.ExecuteHierarchy(_cbMidDragGO, mmbPed, ExecuteEvents.pointerEnterHandler);
+                                    ExecuteEvents.ExecuteHierarchy(_cbMidDragGO, mmbPed, ExecuteEvents.pointerDownHandler);
+                                    try { ExecuteEvents.ExecuteHierarchy(_cbMidDragGO, mmbPed, ExecuteEvents.beginDragHandler); } catch { }
                                 }
                             }
                         }
                         catch (Exception ex) { Log.LogWarning($"[VRCamera] Mid-press: {ex.Message}"); }
                         _cbMidDragActive = true;
                         _cbMidDragStarted = false;
-                        _cbMidDragCaseBoard = mmbAimingAtCaseBoard;
+                        _cbMidDragCaseBoard = false;
                     }
                 }
             }
         }
         else
         {
-            // No target — clean up any stale drag state
+            // No target — clean up any stale drag/string state
+            if (_stringDragActive)
+            {
+                try
+                {
+                    var cpc = CasePanelController.Instance;
+                    if (cpc != null) cpc.CancelCustomStringLinkSelection();
+                    if (_stringDragPreviewRT != null)
+                    {
+                        UnityEngine.Object.Destroy(_stringDragPreviewRT.gameObject);
+                        _stringDragPreviewRT = null;
+                    }
+                }
+                catch { }
+                _stringDragActive = false;
+                _stringDragSourcePin = null;
+                _stringDragFromRect = null;
+                _stringDragPreviewRT = null;
+            }
             if (_cbMidDragActive)
             {
-                const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
+                const uint MOUSEEVENTF_MIDDLEUP_C = 0x0040;
                 if (_cbMidDragGO != null && _cbMidDragPED != null)
                 {
                     try { ExecuteEvents.ExecuteHierarchy(_cbMidDragGO, _cbMidDragPED, ExecuteEvents.pointerUpHandler); } catch { }
                 }
                 else
                 {
-                    mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
+                    mouse_event(MOUSEEVENTF_MIDDLEUP_C, 0, 0, 0, UIntPtr.Zero);
                 }
                 _cbMidDragActive = false; _cbMidDragStarted = false; _cbMidDragCaseBoard = false;
                 _cbMidDragGO = null; _cbMidDragPED = null;
@@ -7104,6 +7251,38 @@ public class VRCamera : MonoBehaviour
             var apT = _actionPanelCanvas.transform;
             _casePanelCanvas.transform.position = apT.position + apT.forward * 0.15f;
             _casePanelCanvas.transform.rotation = apT.rotation;
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Fixes string rotation for all spawned case board strings.
+    /// The game's StringController.UpdatePosition() sets rect.rotation (world space),
+    /// which is wrong in WorldSpace canvases — the string rotates off the canvas plane.
+    /// We recalculate the angle and apply it as localRotation (canvas-local XY plane).
+    /// Also fixes the preview string during VR string drag.
+    /// </summary>
+    private void FixStringRotations()
+    {
+        try
+        {
+            var cpc = CasePanelController.Instance;
+            if (cpc == null) return;
+            var strings = cpc.spawnedStrings;
+            if (strings != null)
+            {
+                for (int i = 0; i < strings.Count; i++)
+                {
+                    var sc = strings[i];
+                    if (sc == null || sc.rect == null || sc.fromRect == null || sc.toRect == null) continue;
+                    Vector3 delta = sc.toRect.localPosition - sc.fromRect.localPosition;
+                    float angle = Mathf.Atan2(delta.y, delta.x) * Mathf.Rad2Deg;
+                    sc.rect.localRotation = Quaternion.Euler(0f, 0f, angle);
+                }
+            }
+            // Also fix preview string during VR string drag
+            if (_stringDragActive && _stringDragPreviewRT != null)
+                _stringDragPreviewRT.localRotation = Quaternion.Euler(0f, 0f, _stringDragPreviewRT.localEulerAngles.z);
         }
         catch { }
     }
