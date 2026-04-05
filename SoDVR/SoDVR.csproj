@@ -14,8 +14,9 @@
   </ItemGroup>
 
   <!-- Game interop assemblies (unhollowed by BepInEx) -->
+  <!-- GameDir is set via Directory.Build.props (not committed); see Directory.Build.props.example -->
   <PropertyGroup>
-    <GameDir>E:\SteamLibrary\steamapps\common\Shadows of Doubt</GameDir>
+    <GameDir Condition="'$(GameDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Shadows of Doubt</GameDir>
     <InteropDir>$(GameDir)\BepInEx\interop</InteropDir>
   </PropertyGroup>
 
@@ -99,8 +100,9 @@
        XRDisplaySubsystem / XRSettings are accessed through the game's own UnityEngine.XRModule. -->
 
   <!-- Post-build: copy to BepInEx plugins (flat layout — subdirectory layout causes
-       BepInEx to load two copies and silently run the wrong one). -->
-  <Target Name="DeployPlugin" AfterTargets="Build">
+       BepInEx to load two copies and silently run the wrong one).
+       Skipped automatically when GameDir does not exist (e.g. CI). -->
+  <Target Name="DeployPlugin" AfterTargets="Build" Condition="Exists('$(GameDir)\BepInEx')">
     <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll"
           DestinationFiles="$(GameDir)\BepInEx\plugins\$(AssemblyName).dll" />
   </Target>

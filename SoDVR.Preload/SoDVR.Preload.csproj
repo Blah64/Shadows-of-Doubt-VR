@@ -7,8 +7,9 @@
     <LangVersion>latest</LangVersion>
   </PropertyGroup>
 
+  <!-- GameDir is set via Directory.Build.props (not committed); see Directory.Build.props.example -->
   <PropertyGroup>
-    <GameDir>E:\SteamLibrary\steamapps\common\Shadows of Doubt</GameDir>
+    <GameDir Condition="'$(GameDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Shadows of Doubt</GameDir>
   </PropertyGroup>
 
   <ItemGroup>
@@ -22,14 +23,14 @@
     </Reference>
   </ItemGroup>
 
-  <!-- Post-build: copy to BepInEx patchers -->
-  <Target Name="DeployPatcher" AfterTargets="Build">
+  <!-- Post-build: copy to BepInEx patchers.
+       Skipped automatically when GameDir does not exist (e.g. CI). -->
+  <Target Name="DeployPatcher" AfterTargets="Build" Condition="Exists('$(GameDir)\BepInEx')">
     <PropertyGroup>
       <PatcherDir>$(GameDir)\BepInEx\patchers\SoDVR</PatcherDir>
     </PropertyGroup>
     <MakeDir Directories="$(PatcherDir)\RuntimeDeps\Native" />
     <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="$(PatcherDir)" />
-    <Copy SourceFiles="..\RuntimeDeps\Native\UnityOpenXR.dll" DestinationFolder="$(PatcherDir)\RuntimeDeps\Native" />
     <Copy SourceFiles="..\RuntimeDeps\Native\openxr_loader.dll" DestinationFolder="$(PatcherDir)\RuntimeDeps\Native" />
   </Target>
 </Project>
