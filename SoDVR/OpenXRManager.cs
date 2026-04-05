@@ -58,7 +58,7 @@ public static class OpenXRManager
     private static IntPtr _pfnSuggestInteractionProfileBindings;
     private static IntPtr _pfnCreateActionSpace, _pfnAttachSessionActionSets;
     private static IntPtr _pfnSyncActions, _pfnLocateSpace, _pfnGetActionStateBoolean;
-    private static IntPtr _pfnGetActionStateVector2f;
+    private static IntPtr _pfnGetActionStateVector2f, _pfnGetActionStateFloat;
     private static ulong  _actionSet, _poseAction, _triggerAction, _thumbAction, _menuButtonAction, _gripAction;
     private static ulong  _buttonAAction, _buttonBAction, _buttonXAction, _thumbClickAction, _yButtonAction;
     private static ulong  _rightAimSpace, _leftAimSpace;
@@ -91,6 +91,7 @@ public static class OpenXRManager
     private static XrLocateSpaceDelegate?            _dLocateSpace;
     private static XrGetActionStateBooleanDelegate?  _dGetActionStateBool;
     private static XrGetActionStateVector2fDelegate? _dGetActionStateVec2;
+    private static XrGetActionStateFloatDelegate?    _dGetActionStateFloat;
 
     // ── Pre-allocated unmanaged struct buffers (never freed) ─────────────────
     // Eliminates AllocHGlobal/FreeHGlobal overhead from the per-frame hot path.
@@ -116,6 +117,7 @@ public static class OpenXRManager
     private static IntPtr _bActionGi;         // XrActionStateGetInfo (32 b) — trigger/thumb
     private static IntPtr _bActionStateBool;  // XrActionStateBoolean (40 b) — output
     private static IntPtr _bActionStateVec2;  // XrActionStateVector2f (48 b) — output
+    private static IntPtr _bActionStateFloat; // XrActionStateFloat (32 b) — output
 
     // ── Delegate types ────────────────────────────────────────────────────────
 
@@ -201,6 +203,8 @@ public static class OpenXRManager
     private delegate int XrGetActionStateBooleanDelegate(ulong session, IntPtr getInfo, IntPtr state);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int XrGetActionStateVector2fDelegate(ulong session, IntPtr getInfo, IntPtr state);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrGetActionStateFloatDelegate(ulong session, IntPtr getInfo, IntPtr state);
     // D3D11 vtable helpers
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void D3D11GetImmediateContextDelegate(IntPtr device, out IntPtr context);
@@ -420,6 +424,7 @@ public static class OpenXRManager
             GetFn("xrLocateSpace",                       out _pfnLocateSpace);
             GetFn("xrGetActionStateBoolean",             out _pfnGetActionStateBoolean);
             GetFn("xrGetActionStateVector2f",            out _pfnGetActionStateVector2f);
+            GetFn("xrGetActionStateFloat",              out _pfnGetActionStateFloat);
 
             // Cache per-frame delegates and pre-allocate struct buffers (eliminates per-frame
             // GetDelegateForFunctionPointer and AllocHGlobal overhead in hot render path).
@@ -1304,11 +1309,11 @@ public static class OpenXRManager
             { Log.LogWarning("  SetupActionSetsInstance: hand paths = 0 — skipping"); return; }
 
             // 3. Create actions
-            // actionType: 4=POSE_INPUT, 1=BOOLEAN_INPUT, 3=VECTOR2F_INPUT
+            // actionType: 4=POSE_INPUT, 1=BOOLEAN_INPUT, 2=FLOAT_INPUT, 3=VECTOR2F_INPUT
             _poseAction        = CreateAction("hand_pose",    "Hand Pose",    4, _leftHandPath, _rightHandPath);
-            _triggerAction     = CreateAction("trigger",      "Trigger",      1, _leftHandPath, _rightHandPath);
+            _triggerAction     = CreateAction("trigger",      "Trigger",      2, _leftHandPath, _rightHandPath);
             _thumbAction       = CreateAction("thumbstick",   "Thumbstick",   3, _leftHandPath, _rightHandPath);
-            _gripAction        = CreateAction("grip",         "Grip",         1, _leftHandPath, _rightHandPath);
+            _gripAction        = CreateAction("grip",         "Grip",         2, _leftHandPath, _rightHandPath);
             // Menu button: left controller menu button only → ESC (pause menu).
             // Y button has its own separate action → Alternate (F key).
             _menuButtonAction  = CreateAction("menu_button",  "Menu Button",  1, _leftHandPath);
@@ -1320,73 +1325,151 @@ public static class OpenXRManager
             if (_poseAction == 0 || _triggerAction == 0)
             { Log.LogWarning("  SetupActionSetsInstance: action creation failed"); return; }
 
-            // 4. Suggest Oculus Touch bindings (instance-level, no session needed)
-            ulong profile    = XrStringToPath("/interaction_profiles/oculus/touch_controller");
-            ulong aimRight   = XrStringToPath("/user/hand/right/input/aim/pose");
-            ulong aimLeft    = XrStringToPath("/user/hand/left/input/aim/pose");
-            ulong trigRight  = XrStringToPath("/user/hand/right/input/trigger/value");
-            ulong trigLeft   = XrStringToPath("/user/hand/left/input/trigger/value");
-            ulong stickR     = XrStringToPath("/user/hand/right/input/thumbstick");
-            ulong stickL     = XrStringToPath("/user/hand/left/input/thumbstick");
-            ulong menuBtnY   = XrStringToPath("/user/hand/left/input/y/click");
-            ulong menuBtnM   = XrStringToPath("/user/hand/left/input/menu/click");
-            ulong gripRight      = XrStringToPath("/user/hand/right/input/squeeze/value");
-            ulong gripLeft       = XrStringToPath("/user/hand/left/input/squeeze/value");
-            ulong btnA           = XrStringToPath("/user/hand/right/input/a/click");
-            ulong btnB           = XrStringToPath("/user/hand/right/input/b/click");
-            ulong btnX           = XrStringToPath("/user/hand/left/input/x/click");
-            ulong thumbClickR    = XrStringToPath("/user/hand/right/input/thumbstick/click");
-            ulong thumbClickL    = XrStringToPath("/user/hand/left/input/thumbstick/click");
-
-            // XrActionSuggestedBinding = action(8) + binding(8) = 16 bytes
-            // Y button and menu button are separate actions:
-            //   y/click    → _yButtonAction    (Alternate / F key)
-            //   menu/click → _menuButtonAction (ESC)
-            int bindCount = 15;
-            IntPtr bindings = Marshal.AllocHGlobal(bindCount * 16);
-            try
-            {
-                void WriteBinding(int idx, ulong act, ulong path)
-                {
-                    Marshal.WriteInt64(bindings, idx * 16 + 0, (long)act);
-                    Marshal.WriteInt64(bindings, idx * 16 + 8, (long)path);
-                }
-                WriteBinding(0,  _poseAction,       aimRight);
-                WriteBinding(1,  _poseAction,       aimLeft);
-                WriteBinding(2,  _triggerAction,    trigRight);
-                WriteBinding(3,  _triggerAction,    trigLeft);
-                WriteBinding(4,  _thumbAction,      stickR);
-                WriteBinding(5,  _thumbAction,      stickL);
-                WriteBinding(6,  _yButtonAction,    menuBtnY);
-                WriteBinding(7,  _menuButtonAction, menuBtnM);
-                WriteBinding(8,  _gripAction,       gripRight);
-                WriteBinding(9,  _gripAction,       gripLeft);
-                WriteBinding(10, _buttonAAction,    btnA);
-                WriteBinding(11, _buttonBAction,    btnB);
-                WriteBinding(12, _buttonXAction,    btnX);
-                WriteBinding(13, _thumbClickAction, thumbClickR);
-                WriteBinding(14, _thumbClickAction, thumbClickL);
-
-                // XrInteractionProfileSuggestedBinding: type(24)+pad(4)+next(8)+profile(8)+count(4)+pad(4)+bindings*(8) = 40
-                IntPtr sugInfo = Marshal.AllocHGlobal(40);
-                try
-                {
-                    for (int i = 0; i < 40; i++) Marshal.WriteByte(sugInfo, i, 0);
-                    Marshal.WriteInt32(sugInfo,  0, 51);        // XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING
-                    Marshal.WriteInt64(sugInfo, 16, (long)profile);
-                    Marshal.WriteInt32(sugInfo, 24, bindCount);
-                    Marshal.WriteIntPtr(sugInfo, 32, bindings);
-                    int rc = Marshal.GetDelegateForFunctionPointer<XrSuggestInteractionProfileBindingsDelegate>
-                        (_pfnSuggestInteractionProfileBindings)(_instance, sugInfo);
-                    Log.LogInfo($"  xrSuggestInteractionProfileBindings rc={rc}");
-                }
-                finally { Marshal.FreeHGlobal(sugInfo); }
-            }
-            finally { Marshal.FreeHGlobal(bindings); }
+            // 4. Suggest interaction profile bindings for multiple controller types
+            SuggestAllProfileBindings();
 
             Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X} thumb=0x{_thumbAction:X} menu=0x{_menuButtonAction:X} grip=0x{_gripAction:X} btnA=0x{_buttonAAction:X} btnB=0x{_buttonBAction:X} btnX=0x{_buttonXAction:X} btnY=0x{_yButtonAction:X} thumbClick=0x{_thumbClickAction:X}");
         }
         catch (Exception ex) { Log.LogWarning($"  SetupActionSetsInstance: {ex}"); }
+    }
+
+    /// <summary>
+    /// Suggests interaction profile bindings for all supported controller types.
+    /// Each profile is a separate xrSuggestInteractionProfileBindings call.
+    /// Failures for unavailable profiles are logged but don't stop initialization.
+    /// </summary>
+    private static void SuggestAllProfileBindings()
+    {
+        // ── Oculus Touch ──────────────────────────────────────────────────────
+        SuggestBindings("/interaction_profiles/oculus/touch_controller", new[]
+        {
+            (_poseAction,       "/user/hand/right/input/aim/pose"),
+            (_poseAction,       "/user/hand/left/input/aim/pose"),
+            (_triggerAction,    "/user/hand/right/input/trigger/value"),
+            (_triggerAction,    "/user/hand/left/input/trigger/value"),
+            (_thumbAction,      "/user/hand/right/input/thumbstick"),
+            (_thumbAction,      "/user/hand/left/input/thumbstick"),
+            (_gripAction,       "/user/hand/right/input/squeeze/value"),
+            (_gripAction,       "/user/hand/left/input/squeeze/value"),
+            (_yButtonAction,    "/user/hand/left/input/y/click"),
+            (_menuButtonAction, "/user/hand/left/input/menu/click"),
+            (_buttonAAction,    "/user/hand/right/input/a/click"),
+            (_buttonBAction,    "/user/hand/right/input/b/click"),
+            (_buttonXAction,    "/user/hand/left/input/x/click"),
+            (_thumbClickAction, "/user/hand/right/input/thumbstick/click"),
+            (_thumbClickAction, "/user/hand/left/input/thumbstick/click"),
+        });
+
+        // ── Valve Index ───────────────────────────────────────────────────────
+        SuggestBindings("/interaction_profiles/valve/index_controller", new[]
+        {
+            (_poseAction,       "/user/hand/right/input/aim/pose"),
+            (_poseAction,       "/user/hand/left/input/aim/pose"),
+            (_triggerAction,    "/user/hand/right/input/trigger/value"),
+            (_triggerAction,    "/user/hand/left/input/trigger/value"),
+            (_thumbAction,      "/user/hand/right/input/thumbstick"),
+            (_thumbAction,      "/user/hand/left/input/thumbstick"),
+            (_gripAction,       "/user/hand/right/input/squeeze/value"),
+            (_gripAction,       "/user/hand/left/input/squeeze/value"),
+            (_buttonAAction,    "/user/hand/right/input/a/click"),
+            (_buttonBAction,    "/user/hand/right/input/b/click"),
+            (_buttonXAction,    "/user/hand/left/input/a/click"),
+            (_yButtonAction,    "/user/hand/left/input/b/click"),
+            (_thumbClickAction, "/user/hand/right/input/thumbstick/click"),
+            (_thumbClickAction, "/user/hand/left/input/thumbstick/click"),
+        });
+
+        // ── HTC Vive wand ─────────────────────────────────────────────────────
+        // Vive has trackpad instead of thumbstick; no face buttons (A/B/X/Y)
+        SuggestBindings("/interaction_profiles/htc/vive_controller", new[]
+        {
+            (_poseAction,       "/user/hand/right/input/aim/pose"),
+            (_poseAction,       "/user/hand/left/input/aim/pose"),
+            (_triggerAction,    "/user/hand/right/input/trigger/value"),
+            (_triggerAction,    "/user/hand/left/input/trigger/value"),
+            (_thumbAction,      "/user/hand/right/input/trackpad"),
+            (_thumbAction,      "/user/hand/left/input/trackpad"),
+            (_gripAction,       "/user/hand/right/input/squeeze/click"),
+            (_gripAction,       "/user/hand/left/input/squeeze/click"),
+            (_menuButtonAction, "/user/hand/left/input/menu/click"),
+        });
+
+        // ── Microsoft WMR ─────────────────────────────────────────────────────
+        SuggestBindings("/interaction_profiles/microsoft/motion_controller", new[]
+        {
+            (_poseAction,       "/user/hand/right/input/aim/pose"),
+            (_poseAction,       "/user/hand/left/input/aim/pose"),
+            (_triggerAction,    "/user/hand/right/input/trigger/value"),
+            (_triggerAction,    "/user/hand/left/input/trigger/value"),
+            (_thumbAction,      "/user/hand/right/input/thumbstick"),
+            (_thumbAction,      "/user/hand/left/input/thumbstick"),
+            (_gripAction,       "/user/hand/right/input/squeeze/click"),
+            (_gripAction,       "/user/hand/left/input/squeeze/click"),
+            (_menuButtonAction, "/user/hand/left/input/menu/click"),
+            (_thumbClickAction, "/user/hand/right/input/thumbstick/click"),
+            (_thumbClickAction, "/user/hand/left/input/thumbstick/click"),
+        });
+
+        // ── KHR Simple (fallback for any controller) ──────────────────────────
+        SuggestBindings("/interaction_profiles/khr/simple_controller", new[]
+        {
+            (_poseAction,       "/user/hand/right/input/aim/pose"),
+            (_poseAction,       "/user/hand/left/input/aim/pose"),
+            (_triggerAction,    "/user/hand/right/input/select/click"),
+            (_triggerAction,    "/user/hand/left/input/select/click"),
+            (_menuButtonAction, "/user/hand/left/input/menu/click"),
+        });
+    }
+
+    /// <summary>
+    /// Resolves the profile path and all binding paths, then calls xrSuggestInteractionProfileBindings.
+    /// Logs the result; failures are non-fatal (runtime may not support the profile).
+    /// </summary>
+    private static void SuggestBindings(string profilePath, (ulong action, string path)[] bindingDefs)
+    {
+        if (_pfnSuggestInteractionProfileBindings == IntPtr.Zero) return;
+        try
+        {
+            ulong profile = XrStringToPath(profilePath);
+            if (profile == 0) { Log.LogWarning($"  SuggestBindings: failed to resolve profile '{profilePath}'"); return; }
+
+            // Resolve all binding paths and filter out any that fail
+            var resolved = new System.Collections.Generic.List<(ulong action, ulong path)>();
+            foreach (var (action, path) in bindingDefs)
+            {
+                if (action == 0) continue; // action not created (e.g. face buttons for Vive)
+                ulong p = XrStringToPath(path);
+                if (p != 0) resolved.Add((action, p));
+            }
+            if (resolved.Count == 0) { Log.LogWarning($"  SuggestBindings: no valid bindings for '{profilePath}'"); return; }
+
+            int count = resolved.Count;
+            IntPtr bindings = Marshal.AllocHGlobal(count * 16);
+            try
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    Marshal.WriteInt64(bindings, i * 16 + 0, (long)resolved[i].action);
+                    Marshal.WriteInt64(bindings, i * 16 + 8, (long)resolved[i].path);
+                }
+
+                IntPtr sugInfo = Marshal.AllocHGlobal(40);
+                try
+                {
+                    for (int i = 0; i < 40; i++) Marshal.WriteByte(sugInfo, i, 0);
+                    Marshal.WriteInt32(sugInfo,  0, 51); // XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING
+                    Marshal.WriteInt64(sugInfo, 16, (long)profile);
+                    Marshal.WriteInt32(sugInfo, 24, count);
+                    Marshal.WriteIntPtr(sugInfo, 32, bindings);
+                    int rc = Marshal.GetDelegateForFunctionPointer<XrSuggestInteractionProfileBindingsDelegate>
+                        (_pfnSuggestInteractionProfileBindings)(_instance, sugInfo);
+                    Log.LogInfo($"  SuggestBindings '{profilePath}': {count} bindings, rc={rc}");
+                }
+                finally { Marshal.FreeHGlobal(sugInfo); }
+            }
+            finally { Marshal.FreeHGlobal(bindings); }
+        }
+        catch (Exception ex) { Log.LogWarning($"  SuggestBindings '{profilePath}': {ex.Message}"); }
     }
 
     /// <summary>
@@ -1489,45 +1572,44 @@ public static class OpenXRManager
     }
 
     /// <summary>
-    /// Returns whether the trigger button is pressed this frame.
+    /// Returns whether the trigger is pressed this frame (float action thresholded at 0.5).
     /// Returns false (with pressed=false) if action sets aren't ready.
     /// </summary>
     public static bool GetTriggerState(bool right, out bool pressed)
     {
         pressed = false;
-        if (!ActionSetsReady || _dGetActionStateBool == null || _triggerAction == 0) return false;
-        try
-        {
-            // _bActionGi shared for trigger+thumbstick (sequential main-thread calls only).
-            // Only dynamic fields: action handle and subaction path.
-            Marshal.WriteInt64(_bActionGi, 16, (long)_triggerAction);
-            Marshal.WriteInt64(_bActionGi, 24, (long)(right ? _rightHandPath : _leftHandPath));
-            int rc = _dGetActionStateBool(_session, _bActionGi, _bActionStateBool);
-            if (rc == 0)
-                pressed = Marshal.ReadInt32(_bActionStateBool, 16) != 0; // currentState at +16
-            return rc == 0;
-        }
-        catch (Exception ex) { Log.LogWarning($"  GetTriggerState: {ex.Message}"); return false; }
+        if (!GetActionFloat(_triggerAction, right ? _rightHandPath : _leftHandPath, out float val)) return false;
+        pressed = val > 0.5f;
+        return true;
     }
 
     /// <summary>
-    /// Returns whether the grip/squeeze button is pressed this frame.
+    /// Returns whether the grip/squeeze is pressed this frame (float action thresholded at 0.5).
     /// Returns false (with pressed=false) if action sets aren't ready.
     /// </summary>
     public static bool GetGripState(bool right, out bool pressed)
     {
         pressed = false;
-        if (!ActionSetsReady || _dGetActionStateBool == null || _gripAction == 0) return false;
+        if (!GetActionFloat(_gripAction, right ? _rightHandPath : _leftHandPath, out float val)) return false;
+        pressed = val > 0.5f;
+        return true;
+    }
+
+    /// <summary>Reads a FLOAT_INPUT action's currentState. Returns false on failure.</summary>
+    private static bool GetActionFloat(ulong action, ulong subPath, out float value)
+    {
+        value = 0f;
+        if (!ActionSetsReady || _dGetActionStateFloat == null || action == 0) return false;
         try
         {
-            Marshal.WriteInt64(_bActionGi, 16, (long)_gripAction);
-            Marshal.WriteInt64(_bActionGi, 24, (long)(right ? _rightHandPath : _leftHandPath));
-            int rc = _dGetActionStateBool(_session, _bActionGi, _bActionStateBool);
+            Marshal.WriteInt64(_bActionGi, 16, (long)action);
+            Marshal.WriteInt64(_bActionGi, 24, (long)subPath);
+            int rc = _dGetActionStateFloat(_session, _bActionGi, _bActionStateFloat);
             if (rc == 0)
-                pressed = Marshal.ReadInt32(_bActionStateBool, 16) != 0; // currentState at +16
+                value = ReadFloat(_bActionStateFloat, 16); // currentState at +16
             return rc == 0;
         }
-        catch (Exception ex) { Log.LogWarning($"  GetGripState: {ex.Message}"); return false; }
+        catch (Exception ex) { Log.LogWarning($"  GetActionFloat: {ex.Message}"); return false; }
     }
 
     /// <summary>
@@ -1694,6 +1776,8 @@ public static class OpenXRManager
             _dGetActionStateBool = Marshal.GetDelegateForFunctionPointer<XrGetActionStateBooleanDelegate>(_pfnGetActionStateBoolean);
         if (_pfnGetActionStateVector2f != IntPtr.Zero)
             _dGetActionStateVec2 = Marshal.GetDelegateForFunctionPointer<XrGetActionStateVector2fDelegate>(_pfnGetActionStateVector2f);
+        if (_pfnGetActionStateFloat != IntPtr.Zero)
+            _dGetActionStateFloat = Marshal.GetDelegateForFunctionPointer<XrGetActionStateFloatDelegate>(_pfnGetActionStateFloat);
 
         Log.LogInfo("[OpenXR] InitPerFrameResources: delegates cached.");
 
@@ -1719,6 +1803,7 @@ public static class OpenXRManager
         _bActionGi       = Marshal.AllocHGlobal(32);  Zero(_bActionGi,       32);
         _bActionStateBool = Marshal.AllocHGlobal(40); Zero(_bActionStateBool,40);
         _bActionStateVec2 = Marshal.AllocHGlobal(48); Zero(_bActionStateVec2,48);
+        _bActionStateFloat = Marshal.AllocHGlobal(32); Zero(_bActionStateFloat,32);
         _bLocSpaceInfo   = Marshal.AllocHGlobal(40);  Zero(_bLocSpaceInfo,   40);
         _bSpaceLocation  = Marshal.AllocHGlobal(48);  Zero(_bSpaceLocation,  48);
 
@@ -1751,6 +1836,7 @@ public static class OpenXRManager
         Marshal.WriteInt32(_bActionGi,       0, 58); // XR_TYPE_ACTION_STATE_GET_INFO
         Marshal.WriteInt32(_bActionStateBool,0, 23); // XR_TYPE_ACTION_STATE_BOOLEAN
         Marshal.WriteInt32(_bActionStateVec2,0, 25); // XR_TYPE_ACTION_STATE_VECTOR2F
+        Marshal.WriteInt32(_bActionStateFloat,0,24); // XR_TYPE_ACTION_STATE_FLOAT
         Marshal.WriteInt32(_bLocSpaceInfo,   0, 42); // XR_TYPE_SPACE_LOCATION (reuse for output)
         Marshal.WriteInt32(_bSpaceLocation,  0, 42); // XR_TYPE_SPACE_LOCATION
 
