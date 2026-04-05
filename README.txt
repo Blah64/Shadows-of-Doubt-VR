@@ -6,6 +6,7 @@ RIGHT CONTROLLER
 Trigger              UI click (point at a menu canvas and pull)
 A button             Jump (Space), or Right-click when aiming at a canvas
 B button             Notebook / Map (hold to show — Tab held while B held)
+                     Inventory / Backpack (press with controller behind right shoulder)
                      Middle-click drag when aiming at a canvas
 Grip                 Drag canvas panels (notes, map, location details, bio display)
 Thumbstick left/right  Rotate (snap or smooth — configurable in VR Settings)
@@ -46,6 +47,9 @@ NOTES
   trigger for reliable world interaction.
 - B button: hold to keep the map/notebook open; release B to close.
   Right stick B-drag pans the map; trigger click opens evidence notes.
+- Backpack gesture: press B while the right controller is held behind
+  your right shoulder (like grabbing from a backpack) to open inventory.
+  The controller must be behind the head and at roughly shoulder height.
 - A button right-click opens context menus on the case board and map.
 - Right grip drag repositions floating canvases in 6DOF. Positions are
   saved and restored when the case board is reopened.
