@@ -2,7 +2,7 @@
 
 ## What this is
 A BepInEx 6 IL2CPP plugin adding full 6DOF VR support to **Shadows of Doubt** (Unity 2021.3.45f2, HDRP).
-Target runtime: **VDXR** (`virtualdesktop-openxr.dll`) via Samsung Galaxy XR headset.
+Works with any OpenXR runtime. Tested with **VDXR** (`virtualdesktop-openxr.dll`) via Samsung Galaxy XR headset.
 
 ## Key constraints
 - **IL2CPP** — no managed game assembly, all game interaction via Il2CppInterop
@@ -44,12 +44,12 @@ Log output: `E:\SteamLibrary\steamapps\common\Shadows of Doubt\BepInEx\LogOutput
 ## Standard OpenXR init sequence (WORKING)
 ```
 xrGetInstanceProcAddr (from openxr_loader.dll, loaded directly)
-  → disable all implicit API layers (openxr-oculus-compatibility via env var)
+  → disable Unity API layers only (selective — skips openxr-oculus-compatibility)
   → xrCreateInstance          (extensions: XR_KHR_D3D11_enable)
   → xrGetSystem               (HEAD_MOUNTED_DISPLAY)
   → xrGetD3D11GraphicsRequirementsKHR  (instance, systemId, &reqs)
   → [get Unity D3D11 device via Texture2D.whiteTexture.GetNativeTexturePtr() + vtable[3]]
-  → xrCreateSession           (XrGraphicsBindingD3D11KHR{type=0x3B9B3378, device=unityDev})
+  → xrCreateSession           (XrGraphicsBindingD3D11KHR{type=1000027000, device=unityDev})
   → xrBeginSession
   → xrCreateSwapchain × 2    (per-eye, format 28 = DXGI_FORMAT_R8G8B8A8_UNORM)
   → xrEnumerateSwapchainImages → ID3D11Texture2D* array (non-null)
@@ -64,28 +64,27 @@ ReleaseSwapchainImage
 xrEndFrame with XrCompositionLayerProjection
 ```
 
-## CRITICAL: VDXR uses non-spec OpenXR type constants
-VDXR's type constants are offset by **+0x5DC0** from the OpenXR spec values.
-Always use these VDXR values, not the spec values:
+## OpenXR D3D11 extension type constants (standard spec values — verified working with VDXR)
 
-| Struct | Spec value | **VDXR value (use this)** |
+| Constant | Value | Used in |
 |---|---|---|
-| XrGraphicsBindingD3D11KHR | 1000003000 | `unchecked((int)0x3B9B3378)` |
-| XrSwapchainImageD3D11KHR | 1000003001 | `unchecked((int)0x3B9B3379)` |
-| XrGraphicsRequirementsD3D11KHR | 1000003002 | `unchecked((int)0x3B9B337A)` |
+| `XR_TYPE_GRAPHICS_BINDING_D3D11_KHR` | `1000027000` | `XrGraphicsBindingD3D11KHR.type` |
+| `XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR` | `1000027001` | swapchain image struct type |
+| `XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR` | `1000027002` | requirements struct type |
 
-Base OpenXR types (XR_TYPE_SESSION_CREATE_INFO=8, etc.) use spec values unchanged.
+Note: VDXR was previously believed to require non-spec offset values (+0x5DC0). This was incorrect — standard spec values work fine and are what OpenXRManager.cs now uses.
 
 ## CRITICAL: Swapchain format must match Unity RenderTexture format
 - Unity `RenderTextureFormat.ARGB32` → `DXGI_FORMAT_R8G8B8A8_UNORM` = **format 28**
 - Swapchain must be created with format 28 so `CopyResource` succeeds
 - `_preferredFormats = { 28, 29, 87, 91 }` — format 28 is first
 
-## CRITICAL: openxr-oculus-compatibility API layer
-Virtual Desktop installs an Oculus compatibility layer that intercepts OpenXR calls.
-It must be disabled before `xrCreateInstance` by setting its `disable_environment` env var.
-See `DisableUnityOpenXRLayer()` in OpenXRManager.cs — reads all layer JSONs from registry
-and sets their `disable_environment` variables.
+## CRITICAL: OpenXR API layer disabling — selective (Unity layers only)
+`DisableUnityOpenXRLayer()` in OpenXRManager.cs reads all implicit API layer JSONs from the registry
+and disables only layers whose JSON content mentions "unity" (case-insensitive).
+- Virtual Desktop's `openxr-oculus-compatibility` layer is **NOT** disabled (no "unity" in its JSON)
+- Only Unity's own OpenXR layers (e.g. from the Unity Editor) are disabled
+- This prevents interfering with SteamVR or other runtime-owned layers on non-VDXR setups
 
 ## CRITICAL: IL2CPP interop pitfalls
 - `GetComponentInParent<Button>()` always returns null in IL2CPP context — do not use for Button detection
@@ -297,6 +296,15 @@ When the player loads a save from the main menu (same Unity scene reused):
 - `_cursorTargetCanvas` field tracks nearest aimed-at canvas ✓
 - HUD settings plan written (plan file at `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`) — NOT YET IMPLEMENTED
 
+## OpenXR refactor status (COMPLETE — 2026-04-05, branch `openxr-refactor` merged to master)
+- Standard spec D3D11 type constants (`1000027000/01/02`) — VDXR accepts them ✓
+- All VDXR vtable hack code deleted (`GetVDXRRuntimeObject`, `TrySetGraphicsRequirementsDirectly`, `DumpVtableFunctions`) ✓
+- Selective API layer disabling (Unity layers only, `openxr-oculus-compatibility` left alone) ✓
+- Session state machine: STOPPING/LOSS_PENDING/EXITING handlers + `xrEndSession` ✓
+- Trigger + grip: `FLOAT_INPUT` (type 2), thresholded at 0.5 in accessors ✓
+- Multi-controller bindings: Oculus Touch, Valve Index, HTC Vive, WMR, KHR Simple (all `rc=0`) ✓
+- `RuntimeName` property added ✓
+
 ## Phase 20 status (IN PROGRESS — 2026-04-04)
 Tutorial/popup hang prevention + case board aim dot investigation:
 
@@ -495,3 +503,4 @@ The `UpdateInventory()` grip-camera-redirect was removed as the TDR source (2026
 - **Phase 18 complete** (2026-04-04): Grip-drag generalized to all nested canvases, map position persistence, diagnostic log cleanup (`8338fba`, `92caaec`)
 - **Phase 19 complete** (2026-04-04): B button hold-to-show for map/notebook, fresh placement on each open (`92f92f5`)
 - **Phase 20 in progress** (2026-04-04): Tutorial hang prevention (done), desktopMode watchdog (done), case board string connections (untested `0211e61`), aim dot edge-blocking diagnostic (deployed, awaiting log)
+- **OpenXR refactor complete** (2026-04-05): Standard spec type constants, remove VDXR hacks, multi-controller bindings, float trigger/grip, selective layer disabling, session state machine (`6fed6e4` merge)

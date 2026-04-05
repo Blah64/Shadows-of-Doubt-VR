@@ -17,13 +17,14 @@ Then read the main source files:
 Also read the parked case board investigation notes:
 - `E:\SteamLibrary\steamapps\common\Shadows of Doubt\VRMod\NotesWork.md`
 
-## What is working (Phase 19 complete — last commit 92f92f5)
+## What is working (Phase 20 + OpenXR refactor — last commit 6fed6e4)
 
 - Stereo rendering in headset ✓
 - Head tracking ✓
 - World graphics — walls, floors, lighting all correct ✓
 - All game UI canvases visible in VR (WorldSpace conversion pipeline) ✓
 - VR Settings panel (F10 or main menu Settings button): 4 tabs, all settings wired ✓
+- **Standard OpenXR** — works on any OpenXR runtime (Oculus Touch, Valve Index, HTC Vive, WMR, KHR Simple all bound); tested with VDXR ✓
 - **Full controller bindings** — all buttons mapped:
 
 | Button | Action |
@@ -56,6 +57,10 @@ Also read the parked case board investigation notes:
 ## Active work: Polish (Phase 20)
 
 The following issues are known and ready to work on:
+
+### Pending investigation
+- **Case board aim dot edge-blocking** — diagnostic deployed (`[AimDiag]` log prefix), user reports "invisible sphere" blocking aim dot at board edges intermittently. Need log from user aiming at blocked edges to identify blocker canvas.
+- **Case board string connections** (commit `0211e61`) — B-button drag between pins, implemented but **UNTESTED**. Bypasses game's `CustomStringLink` coroutine (which checks `!desktopMode`).
 
 ### Other polish items
 - **Comfort options** — vignette on snap-turn, configurable snap-turn degrees, IPD adjustment

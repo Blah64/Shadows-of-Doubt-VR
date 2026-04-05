@@ -1,7 +1,71 @@
 # SoDVR — Technical Handover
 
-**Date**: 2026-04-04 (updated mid-Phase 20)
-**Phase**: 20 — hang prevention, string connections, aim dot investigation
+**Date**: 2026-04-05 (updated after OpenXR refactor)
+**Phase**: 20 — hang prevention, string connections, aim dot investigation (OpenXR refactor also complete)
+
+---
+
+## OpenXR Refactor (2026-04-05) — COMPLETE ✓
+
+Branch `openxr-refactor` merged to `master` (commit `6fed6e4`).
+
+### What changed in OpenXRManager.cs
+
+**Standard spec type constants** — replaced all 4 VDXR offset values with named constants:
+```csharp
+private const int XR_TYPE_GRAPHICS_BINDING_D3D11_KHR      = 1000027000;
+private const int XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR       = 1000027001;
+private const int XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR = 1000027002;
+```
+VDXR accepts standard spec values — the `+0x5DC0` offset assumption was wrong.
+
+**Deleted VDXR-specific code:**
+- `GetVDXRRuntimeObject()` — read VDXR internal memory layout
+- `TrySetGraphicsRequirementsDirectly()` — wrote into VDXR private fields
+- `VDXRGetSingletonDelegate` — delegate for above
+- `DumpVtableFunctions()` / `DumpFunctionBytes()` — vtable dumper
+- `TryNegotiateRuntime()` / `XrNegotiateLoaderRuntimeDelegate` — dead negotiation code
+- Call site in `TryDirectPath()` removed
+
+**Selective API layer disabling** — `DisableUnityOpenXRLayer()` now only disables layers whose JSON mentions "unity". `openxr-oculus-compatibility` is left alone (no "unity" in JSON). Prevents breaking SteamVR or other runtime layers on non-VDXR setups.
+
+**Session state machine** — added `xrEndSession` function pointer and handlers for:
+- State 6 (STOPPING) → calls `xrEndSession`
+- State 7 (LOSS_PENDING) → logged, prepared for session recreation
+- State 8 (EXITING) → logged, clean shutdown
+
+**Float trigger/grip (Step 5):**
+- `_triggerAction` and `_gripAction` changed from `BOOLEAN_INPUT (1)` to `FLOAT_INPUT (2)`
+- Added `xrGetActionStateFloat` fn ptr, `XrGetActionStateFloatDelegate`, `_dGetActionStateFloat` cached delegate, `_bActionStateFloat` pre-alloc buffer
+- `GetTriggerState()` / `GetGripState()` now call `GetActionFloat()` and threshold at `> 0.5f`
+- Public API signatures **unchanged** — VRCamera.cs needs zero changes
+
+**Multi-controller bindings (Step 6):**
+- `SuggestBindings(profilePath, bindings[])` helper — resolves paths, filters nulls, calls `xrSuggestInteractionProfileBindings`, logs result
+- `SuggestAllProfileBindings()` calls it for 5 profiles (all `rc=0` on VDXR):
+  - Oculus Touch — 15 bindings (full: pose, trigger, grip, stick, A/B/X/Y, menu, thumb-click)
+  - Valve Index — 14 bindings (A/B on both hands)
+  - HTC Vive — 9 bindings (trackpad for stick, squeeze/click for grip, no face buttons)
+  - Microsoft WMR — 11 bindings (thumbstick, squeeze/click, menu, no face buttons)
+  - KHR Simple — 5 bindings (select/click fallback)
+
+**RuntimeName property:**
+```csharp
+public static string RuntimeName { get; private set; } = "Unknown";
+```
+Set from the active runtime JSON filename (e.g. `"virtualdesktop-openxr"`).
+
+### Verification (VDXR log)
+```
+xrGetD3D11GraphicsRequirementsKHR rc=0          ← spec constant 1000027002 accepted
+xrSession=0x1                                    ← session created with spec binding type 1000027000
+trigger type=2, grip type=2                      ← float actions created
+SuggestBindings '.../oculus/touch_controller': 15 bindings, rc=0
+SuggestBindings '.../valve/index_controller': 14 bindings, rc=0
+SuggestBindings '.../htc/vive_controller': 9 bindings, rc=0
+SuggestBindings '.../microsoft/motion_controller': 11 bindings, rc=0
+SuggestBindings '.../khr/simple_controller': 5 bindings, rc=0
+```
 
 ---
 
