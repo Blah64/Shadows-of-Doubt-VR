@@ -19,6 +19,12 @@ public static class OpenXRManager
 {
     private static ManualLogSource Log => Plugin.Log;
     public static bool IsRunning { get; private set; }
+    public static string RuntimeName { get; private set; } = "Unknown";
+
+    // ── OpenXR D3D11 extension type constants (standard spec values) ─────────
+    private const int XR_TYPE_GRAPHICS_BINDING_D3D11_KHR     = 1000027000;
+    private const int XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR      = 1000027001;
+    private const int XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR = 1000027002;
 
     // ── State ─────────────────────────────────────────────────────────────────
 
@@ -26,7 +32,7 @@ public static class OpenXRManager
     private static ulong _instance, _systemId, _session;
     private static IntPtr _pfnGetSystem, _pfnCreateSession, _pfnBeginSession,
                           _pfnDestroySession, _pfnDestroyInstance, _pfnPollEvent,
-                          _pfnGetD3D11GfxReqs;
+                          _pfnGetD3D11GfxReqs, _pfnEndSession;
     private static XrGetProcAddrDelegate? _gpa;
     private static bool _directReady;        // SetupDirect() completed
     private static bool _setupFailed;        // TryInitializeProvider or SetupDirect gave up — stop retrying
@@ -52,7 +58,7 @@ public static class OpenXRManager
     private static IntPtr _pfnSuggestInteractionProfileBindings;
     private static IntPtr _pfnCreateActionSpace, _pfnAttachSessionActionSets;
     private static IntPtr _pfnSyncActions, _pfnLocateSpace, _pfnGetActionStateBoolean;
-    private static IntPtr _pfnGetActionStateVector2f;
+    private static IntPtr _pfnGetActionStateVector2f, _pfnGetActionStateFloat;
     private static ulong  _actionSet, _poseAction, _triggerAction, _thumbAction, _menuButtonAction, _gripAction;
     private static ulong  _buttonAAction, _buttonBAction, _buttonXAction, _thumbClickAction, _yButtonAction;
     private static ulong  _rightAimSpace, _leftAimSpace;
@@ -85,6 +91,7 @@ public static class OpenXRManager
     private static XrLocateSpaceDelegate?            _dLocateSpace;
     private static XrGetActionStateBooleanDelegate?  _dGetActionStateBool;
     private static XrGetActionStateVector2fDelegate? _dGetActionStateVec2;
+    private static XrGetActionStateFloatDelegate?    _dGetActionStateFloat;
 
     // ── Pre-allocated unmanaged struct buffers (never freed) ─────────────────
     // Eliminates AllocHGlobal/FreeHGlobal overhead from the per-frame hot path.
@@ -110,12 +117,9 @@ public static class OpenXRManager
     private static IntPtr _bActionGi;         // XrActionStateGetInfo (32 b) — trigger/thumb
     private static IntPtr _bActionStateBool;  // XrActionStateBoolean (40 b) — output
     private static IntPtr _bActionStateVec2;  // XrActionStateVector2f (48 b) — output
+    private static IntPtr _bActionStateFloat; // XrActionStateFloat (32 b) — output
 
     // ── Delegate types ────────────────────────────────────────────────────────
-
-    // OpenXR runtime negotiation (bypasses Khronos loader + all implicit API layers)
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate int XrNegotiateLoaderRuntimeDelegate(IntPtr loaderInfo, IntPtr runtimeReq);
 
     // OpenXR
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -131,6 +135,8 @@ public static class OpenXRManager
     private delegate int XrCreateSessionDelegate(ulong instance, IntPtr createInfo, out ulong session);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int XrBeginSessionDelegate(ulong session, IntPtr beginInfo);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrEndSessionDelegate(ulong session);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int XrDestroySessionDelegate(ulong session);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -197,6 +203,8 @@ public static class OpenXRManager
     private delegate int XrGetActionStateBooleanDelegate(ulong session, IntPtr getInfo, IntPtr state);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int XrGetActionStateVector2fDelegate(ulong session, IntPtr getInfo, IntPtr state);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int XrGetActionStateFloatDelegate(ulong session, IntPtr getInfo, IntPtr state);
     // D3D11 vtable helpers
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void D3D11GetImmediateContextDelegate(IntPtr device, out IntPtr context);
@@ -215,10 +223,8 @@ public static class OpenXRManager
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /// <summary>Called in Initializer.Start() — loads the active OpenXR runtime DLL directly and grabs xrGetInstanceProcAddr.
-    /// We bypass openxr_loader.dll intentionally: the Khronos loader picks up implicit API layers from the Windows
-    /// registry (e.g. UnityOpenXR), which intercept xrCreateSession and enforce their own GfxReqs-called check
-    /// independently of VDXR's state.  Loading the runtime DLL directly skips the entire layer chain.</summary>
+    /// <summary>Called in Initializer.Start() — loads the Khronos openxr_loader.dll and grabs xrGetInstanceProcAddr.
+    /// Unity's implicit API layer is disabled before xrCreateInstance to prevent it from intercepting our session.</summary>
     public static bool TryInitializeProvider()
     {
         try
@@ -228,13 +234,13 @@ public static class OpenXRManager
             // Resolve the active runtime DLL path from the registry JSON manifest.
             string? runtimeDll = GetRuntimeDllPath();
             if (runtimeDll == null) { Log.LogError("  Could not determine active OpenXR runtime DLL path"); _setupFailed = true; return false; }
-            Log.LogInfo($"  Loading runtime directly: {runtimeDll}");
+            RuntimeName = System.IO.Path.GetFileNameWithoutExtension(runtimeDll);
+            Log.LogInfo($"  Active runtime: {RuntimeName} ({runtimeDll})");
 
-            // VDXR does not export xrGetInstanceProcAddr and rejects direct negotiation.
-            // We must go through the Khronos openxr_loader.dll, but we disable the Unity
-            // implicit API layer (registered in the Windows registry) before xrCreateInstance
-            // so it does not intercept xrCreateSession with its own GfxReqs-called check.
-            _ = runtimeDll; // path resolved but we use the loader, not the runtime DLL directly
+            // We go through the Khronos openxr_loader.dll and disable Unity's implicit API
+            // layer (registered in the Windows registry) before xrCreateInstance so it does
+            // not intercept xrCreateSession.
+            _ = runtimeDll; // path resolved for logging; we use the loader
 
             string plugins = System.IO.Path.Combine(Application.dataPath, "Plugins/x86_64");
             IntPtr hLoader = GetModuleHandle("openxr_loader");
@@ -298,6 +304,13 @@ public static class OpenXRManager
                     Log.LogInfo($"    Layer JSON: {jsonPath} (exists={exists})");
                     if (!exists) continue;
                     string json = System.IO.File.ReadAllText(jsonPath);
+                    // Only disable Unity-related layers — preserve other runtimes' layers (e.g. SteamVR overlay)
+                    if (json.IndexOf("unity", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        json.IndexOf("UnityOpenXR", StringComparison.Ordinal) < 0)
+                    {
+                        Log.LogInfo($"      → skipping (not a Unity layer)");
+                        continue;
+                    }
                     var m = System.Text.RegularExpressions.Regex.Match(json,
                         "\"disable_environment\"\\s*:\\s*\"([^\"]+)\"",
                         System.Text.RegularExpressions.RegexOptions.IgnoreCase);
@@ -305,64 +318,16 @@ public static class OpenXRManager
                     {
                         string envVar = m.Groups[1].Value;
                         Environment.SetEnvironmentVariable(envVar, "1");
-                        Log.LogInfo($"      → disabled: set {envVar}=1");
+                        Log.LogInfo($"      → disabled Unity layer: set {envVar}=1");
                         disabled++;
                     }
                     else
-                        Log.LogWarning($"      → no disable_environment, cannot disable");
+                        Log.LogWarning($"      → Unity layer found but no disable_environment, cannot disable");
                 }
             }
             if (total == 0) Log.LogInfo("  No implicit API layers registered in registry.");
         }
         catch (Exception ex) { Log.LogWarning($"  DisableUnityOpenXRLayer: {ex.Message}"); }
-    }
-
-    /// <summary>
-    /// Calls xrNegotiateLoaderRuntimeInterface on the loaded runtime DLL to obtain the runtime's
-    /// own xrGetInstanceProcAddr.  Struct layout (64-bit, both structs are 40 bytes):
-    ///   XrNegotiateLoaderInfo:    [0] structType(4) [4] structVersion(4) [8] structSize(8)
-    ///                             [16] minInterface(4) [20] maxInterface(4)
-    ///                             [24] minApiVersion(8) [32] maxApiVersion(8)
-    ///   XrNegotiateRuntimeRequest:[0] structType(4) [4] structVersion(4) [8] structSize(8)
-    ///                             [16] runtimeInterface(4) [20] pad(4)
-    ///                             [24] runtimeApiVersion(8) [32] getInstanceProcAddr(8)
-    /// </summary>
-    private static unsafe bool TryNegotiateRuntime(IntPtr hRuntime)
-    {
-        IntPtr pfn = GetProcAddress(hRuntime, "xrNegotiateLoaderRuntimeInterface");
-        if (pfn == IntPtr.Zero) { Log.LogError("  xrNegotiateLoaderRuntimeInterface not found"); return false; }
-        Log.LogInfo($"  xrNegotiateLoaderRuntimeInterface: 0x{pfn:X}");
-
-        const int sz = 40;
-        IntPtr info = Marshal.AllocHGlobal(sz);
-        IntPtr req  = Marshal.AllocHGlobal(sz);
-        try
-        {
-            for (int i = 0; i < sz; i++) { Marshal.WriteByte(info, i, 0); Marshal.WriteByte(req, i, 0); }
-
-            // XrNegotiateLoaderInfo
-            Marshal.WriteInt32(info,  0, 1);            // structType = LOADER_INFO
-            Marshal.WriteInt32(info,  4, 1);            // structVersion = 1
-            Marshal.WriteInt64(info,  8, sz);           // structSize
-            Marshal.WriteInt32(info, 16, 1);            // minInterfaceVersion
-            Marshal.WriteInt32(info, 20, 5);            // maxInterfaceVersion
-            Marshal.WriteInt64(info, 24, (long)(1UL << 48));   // minApiVersion = XR_MAKE_VERSION(1,0,0)
-            Marshal.WriteInt64(info, 32, unchecked((long)((1UL << 48) | 0xFFFFFFFFFFFFUL))); // maxApiVersion
-
-            // XrNegotiateRuntimeRequest
-            Marshal.WriteInt32(req,  0, 3);             // structType = RUNTIME_REQUEST
-            Marshal.WriteInt32(req,  4, 1);             // structVersion = 1
-            Marshal.WriteInt64(req,  8, sz);            // structSize
-
-            int rc = Marshal.GetDelegateForFunctionPointer<XrNegotiateLoaderRuntimeDelegate>(pfn)(info, req);
-            Log.LogInfo($"  xrNegotiateLoaderRuntimeInterface rc={rc}");
-            if (rc != 0) return false;
-
-            // getInstanceProcAddr is at offset 32 in XrNegotiateRuntimeRequest
-            _gpaAddr = Marshal.ReadIntPtr(req, 32);
-            return _gpaAddr != IntPtr.Zero;
-        }
-        finally { Marshal.FreeHGlobal(info); Marshal.FreeHGlobal(req); }
     }
 
     public static void TriggerLoad() { }
@@ -418,10 +383,9 @@ public static class OpenXRManager
             _gpa = Marshal.GetDelegateForFunctionPointer<XrGetProcAddrDelegate>(_gpaAddr);
 
             // Must run before EnumerateExtensions/CreateInstance — the Khronos loader reads
-            // implicit API layer manifests from the Windows registry at xrCreateInstance time.
-            // Unity's OpenXR layer intercepts xrCreateSession and enforces its own GfxReqs-called
-            // check independently of VDXR's state.  Disabling it via its own disable_environment
-            // variable prevents the -38 error.
+            // The Khronos loader reads implicit API layer manifests from the Windows registry
+            // at xrCreateInstance time. Unity's OpenXR layer intercepts xrCreateSession and
+            // enforces its own GfxReqs-called check. Disabling it prevents the -38 error.
             DisableUnityOpenXRLayer();
 
             EnumerateExtensions();
@@ -433,6 +397,7 @@ public static class OpenXRManager
             GetFn("xrGetSystem",                       out _pfnGetSystem);
             GetFn("xrCreateSession",                   out _pfnCreateSession);
             GetFn("xrBeginSession",                    out _pfnBeginSession);
+            GetFn("xrEndSession",                      out _pfnEndSession);
             GetFn("xrDestroySession",                  out _pfnDestroySession);
             GetFn("xrDestroyInstance",                 out _pfnDestroyInstance);
             GetFn("xrPollEvent",                       out _pfnPollEvent);
@@ -459,6 +424,7 @@ public static class OpenXRManager
             GetFn("xrLocateSpace",                       out _pfnLocateSpace);
             GetFn("xrGetActionStateBoolean",             out _pfnGetActionStateBoolean);
             GetFn("xrGetActionStateVector2f",            out _pfnGetActionStateVector2f);
+            GetFn("xrGetActionStateFloat",              out _pfnGetActionStateFloat);
 
             // Cache per-frame delegates and pre-allocate struct buffers (eliminates per-frame
             // GetDelegateForFunctionPointer and AllocHGlobal overhead in hot render path).
@@ -473,8 +439,8 @@ public static class OpenXRManager
             if (rc != 0 || _systemId == 0) { Log.LogError($"  xrGetSystem rc={rc}"); return; }
             Log.LogInfo($"  xrSystemId=0x{_systemId:X}");
 
-            // Instance-level action setup must happen before xrCreateSession on VDXR.
-            // Only creates the action set, actions, and suggests bindings — no session needed.
+            // Instance-level action setup (action set, actions, bindings) before session creation.
+            // Some runtimes require this ordering.
             SetupActionSetsInstance();
 
             _directReady = true;
@@ -499,9 +465,7 @@ public static class OpenXRManager
                 }
                 else if (_sessionRetries == 0)
                 {
-                    // First attempt failed — log and do robj write, keep retrying gfxReqs each frame
-                    Log.LogWarning($"  xrGetD3D11GraphicsRequirementsKHR rc={gfxRc} — writing robj directly.");
-                    TrySetGraphicsRequirementsDirectly(dev);
+                    Log.LogWarning($"  xrGetD3D11GraphicsRequirementsKHR rc={gfxRc}");
                 }
             }
 
@@ -614,7 +578,7 @@ public static class OpenXRManager
         try
         {
             for (int i = 0; i < sz; i++) Marshal.WriteByte(p, i, 0);
-            Marshal.WriteInt32(p, 0, unchecked((int)0x3B9B337A)); // VDXR expects 0x3B9B337A, not spec 1000003002
+            Marshal.WriteInt32(p, 0, XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR);
             int rc = Marshal.GetDelegateForFunctionPointer<XrGetD3D11GfxReqsDelegate>(
                          _pfnGetD3D11GfxReqs)(_instance, _systemId, p);
             if (rc == 0)
@@ -630,83 +594,12 @@ public static class OpenXRManager
         finally { Marshal.FreeHGlobal(p); }
     }
 
-    /// <summary>
-    /// Reads the CALL at xrGetD3D11GraphicsRequirementsKHR+0x143 to find the VDXR
-    /// singleton getter, calls it, and returns the OpenXrRuntime* (the real XrInstance
-    /// handle that VDXR's own functions expect).
-    /// </summary>
-    private static unsafe IntPtr GetVDXRRuntimeObject()
-    {
-        if (_pfnGetD3D11GfxReqs == IntPtr.Zero) return IntPtr.Zero;
-        try
-        {
-            byte* fn = (byte*)_pfnGetD3D11GfxReqs;
-            if (fn[0x143] != 0xE8) return IntPtr.Zero;
-            int disp = *(int*)(fn + 0x144);
-            IntPtr getter = (IntPtr)((long)_pfnGetD3D11GfxReqs + 0x148 + disp);
-            var robj = Marshal.GetDelegateForFunctionPointer<VDXRGetSingletonDelegate>(getter)();
-            Log.LogInfo($"  GetVDXRRuntimeObject: robj=0x{robj:X}");
-            return robj;
-        }
-        catch (Exception ex) { Log.LogWarning($"  GetVDXRRuntimeObject: {ex.Message}"); return IntPtr.Zero; }
-    }
-
-    /// <summary>
-    /// Writes m_graphicsRequirementQueried=true and m_adapterLuid directly into the VDXR
-    /// runtime object so that VDXR's own xrCreateSession check passes.
-    /// Pattern: scan robj for (0x01, 0x01, 0x00×6) = (m_instanceCreated, m_systemCreated, padding).
-    /// m_graphicsRequirementQueried is at pattern+32, m_adapterLuid at pattern+40.
-    /// </summary>
-    private static unsafe bool TrySetGraphicsRequirementsDirectly(IntPtr d3dDevice)
-    {
-        // Scan xrCreateSession for the -38 (0xFFFFFFDA) constant and dump context bytes.
-        // This reveals exactly where the gfxReqs check is and what instruction pattern surrounds it.
-        if (_pfnCreateSession != IntPtr.Zero)
-        {
-            byte* fn = (byte*)_pfnCreateSession;
-            for (int i = 4; i < 3000; i++)
-            {
-                if (fn[i] == 0xDA && fn[i+1] == 0xFF && fn[i+2] == 0xFF && fn[i+3] == 0xFF)
-                {
-                    // Dump 16 bytes before and 8 bytes after the -38 constant
-                    var sb2 = new System.Text.StringBuilder();
-                    for (int j = i - 16; j < i + 8; j++) sb2.Append($"{fn[j]:X2} ");
-                    Log.LogInfo($"  createSession+0x{i:X}: -38 const → [{sb2}]");
-                }
-            }
-        }
-
-        IntPtr robj = GetVDXRRuntimeObject();
-        if (robj == IntPtr.Zero) { Log.LogWarning("  TrySetGfxReqsDirect: robj not found"); return false; }
-
-        byte* p = (byte*)robj;
-        int off = -1;
-        try
-        {
-            for (int i = 0; i <= 4088; i++)
-                if (p[i]==1 && p[i+1]==1 && p[i+2]==0 && p[i+3]==0 &&
-                    p[i+4]==0 && p[i+5]==0 && p[i+6]==0 && p[i+7]==0)
-                    { off = i; break; }
-        }
-        catch (Exception ex) { Log.LogWarning($"  TrySetGfxReqsDirect: scan fault: {ex.Message}"); return false; }
-
-        if (off < 0) { Log.LogWarning("  TrySetGfxReqsDirect: pattern not found"); return false; }
-
-        Log.LogInfo($"  TrySetGfxReqsDirect: pattern@robj+0x{off:X} → writing gfxQueried@+0x{off+32:X}");
-        p[off + 32] = 0x01;                                   // m_graphicsRequirementQueried = true
-        *(long*)(p + off + 40) = GetAdapterLuid(d3dDevice);   // m_adapterLuid
-        return true;
-    }
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate IntPtr VDXRGetSingletonDelegate();
-
     private static int XrCreateSession(IntPtr device)
     {
         const int bindSz = 24;
         IntPtr bind = Marshal.AllocHGlobal(bindSz);
         for (int i = 0; i < bindSz; i++) Marshal.WriteByte(bind, i, 0);
-        Marshal.WriteInt32(bind, 0, unchecked((int)0x3B9B3378));  // VDXR: 0x3B9B3378 (spec 1000003000 + VDXR offset)
+        Marshal.WriteInt32(bind, 0, XR_TYPE_GRAPHICS_BINDING_D3D11_KHR);
         Marshal.WriteIntPtr(bind, 16, device);
 
         const int infoSz = 32;
@@ -740,6 +633,21 @@ public static class OpenXRManager
                 Log.LogInfo($"  XR session state → {state}");
                 lastState = state;
                 if (state > HighestSessionState) HighestSessionState = state;
+
+                if (state == 6 && _pfnEndSession != IntPtr.Zero) // STOPPING
+                {
+                    Log.LogInfo("  XR state STOPPING — calling xrEndSession");
+                    int endRc = Marshal.GetDelegateForFunctionPointer<XrEndSessionDelegate>(_pfnEndSession)(_session);
+                    Log.LogInfo($"  xrEndSession rc={endRc}");
+                }
+                else if (state == 7) // LOSS_PENDING
+                {
+                    Log.LogWarning("  XR state LOSS_PENDING — session will need recreation");
+                }
+                else if (state == 8) // EXITING
+                {
+                    Log.LogWarning("  XR state EXITING — runtime requests app exit");
+                }
             }
         }
         Marshal.FreeHGlobal(buf);
@@ -792,7 +700,7 @@ public static class OpenXRManager
             var del = Marshal.GetDelegateForFunctionPointer<XrEnumerateExtensionsDelegate>(fn);
 
             int rc = del(IntPtr.Zero, 0, out uint count, IntPtr.Zero);
-            Log.LogInfo($"  VDXR extensions (count={count}, rc={rc}):");
+            Log.LogInfo($"  OpenXR extensions (count={count}, rc={rc}):");
 
             // XrExtensionProperties: type(4)+pad(4)+next(8)+name(128)+version(4) = 148 bytes, aligned to 152
             const int propSz = 152;
@@ -898,15 +806,15 @@ public static class OpenXRManager
             if (_session == 0) { Log.LogError("SetupStereo: no session"); return false; }
 
             // ── 0. Re-try xrGetD3D11GraphicsRequirementsKHR ────────────────────
-            // This call initialises VDXR's D3D11 swapchain backend.  It may fail
-            // before the frame loop has ticked; without it xrEnumerateSwapchainFormats
-            // returns count=0 and xrCreateSwapchain returns -8.
+            // Some runtimes need this call post-session to initialise the D3D11
+            // swapchain backend. Without it xrEnumerateSwapchainFormats may return
+            // count=0 and xrCreateSwapchain may return -8.
             if (_pfnGetD3D11GfxReqs != IntPtr.Zero)
             {
                 const int reqSz = 32;
                 IntPtr reqp = Marshal.AllocHGlobal(reqSz);
                 for (int i = 0; i < reqSz; i++) Marshal.WriteByte(reqp, i, 0);
-                Marshal.WriteInt32(reqp, 0, unchecked((int)0x3B9B337A)); // VDXR expects 0x3B9B337A
+                Marshal.WriteInt32(reqp, 0, XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR);
                 int reqRc = Marshal.GetDelegateForFunctionPointer<XrGetD3D11GfxReqsDelegate>
                     (_pfnGetD3D11GfxReqs)(_instance, _systemId, reqp);
                 if (reqRc == 0)
@@ -918,7 +826,7 @@ public static class OpenXRManager
                 }
                 else
                 {
-                    Log.LogWarning($"  GfxReqs (post-session) rc={reqRc} — VDXR D3D11 backend may not be ready; swapchain creation will likely fail.");
+                    Log.LogWarning($"  GfxReqs (post-session) rc={reqRc} — D3D11 backend may not be ready; swapchain creation will likely fail.");
                 }
                 Marshal.FreeHGlobal(reqp);
             }
@@ -1084,7 +992,7 @@ public static class OpenXRManager
             IntPtr buf = Marshal.AllocHGlobal((int)(count * imgSz));
             for (int i = 0; i < (int)(count * imgSz); i++) Marshal.WriteByte(buf, i, 0);
             for (int i = 0; i < (int)count; i++)
-                Marshal.WriteInt32(buf + i * imgSz, 0, unchecked((int)0x3B9B3379)); // VDXR: 0x3B9B3379 (spec 1000003001 + VDXR offset)
+                Marshal.WriteInt32(buf + i * imgSz, 0, XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR);
             rc = Marshal.GetDelegateForFunctionPointer<XrEnumSwapchainImagesDelegate>
                 (_pfnEnumSwapchainImages)(sc, count, out uint countOut, buf);
             Log.LogInfo($"  ESI fill rc={rc} countOut={countOut}");
@@ -1353,7 +1261,7 @@ public static class OpenXRManager
     /// <summary>
     /// PHASE 1 (instance-level) — called in SetupDirect after xrCreateInstance.
     /// Creates the action set, individual actions, and suggests interaction profile bindings.
-    /// VDXR requires these calls to happen before xrCreateSession.
+    /// Some runtimes require these calls before xrCreateSession.
     /// </summary>
     private static void SetupActionSetsInstance()
     {
@@ -1401,11 +1309,11 @@ public static class OpenXRManager
             { Log.LogWarning("  SetupActionSetsInstance: hand paths = 0 — skipping"); return; }
 
             // 3. Create actions
-            // actionType: 4=POSE_INPUT, 1=BOOLEAN_INPUT, 3=VECTOR2F_INPUT
+            // actionType: 4=POSE_INPUT, 1=BOOLEAN_INPUT, 2=FLOAT_INPUT, 3=VECTOR2F_INPUT
             _poseAction        = CreateAction("hand_pose",    "Hand Pose",    4, _leftHandPath, _rightHandPath);
-            _triggerAction     = CreateAction("trigger",      "Trigger",      1, _leftHandPath, _rightHandPath);
+            _triggerAction     = CreateAction("trigger",      "Trigger",      2, _leftHandPath, _rightHandPath);
             _thumbAction       = CreateAction("thumbstick",   "Thumbstick",   3, _leftHandPath, _rightHandPath);
-            _gripAction        = CreateAction("grip",         "Grip",         1, _leftHandPath, _rightHandPath);
+            _gripAction        = CreateAction("grip",         "Grip",         2, _leftHandPath, _rightHandPath);
             // Menu button: left controller menu button only → ESC (pause menu).
             // Y button has its own separate action → Alternate (F key).
             _menuButtonAction  = CreateAction("menu_button",  "Menu Button",  1, _leftHandPath);
@@ -1417,69 +1325,8 @@ public static class OpenXRManager
             if (_poseAction == 0 || _triggerAction == 0)
             { Log.LogWarning("  SetupActionSetsInstance: action creation failed"); return; }
 
-            // 4. Suggest Oculus Touch bindings (instance-level, no session needed)
-            ulong profile    = XrStringToPath("/interaction_profiles/oculus/touch_controller");
-            ulong aimRight   = XrStringToPath("/user/hand/right/input/aim/pose");
-            ulong aimLeft    = XrStringToPath("/user/hand/left/input/aim/pose");
-            ulong trigRight  = XrStringToPath("/user/hand/right/input/trigger/value");
-            ulong trigLeft   = XrStringToPath("/user/hand/left/input/trigger/value");
-            ulong stickR     = XrStringToPath("/user/hand/right/input/thumbstick");
-            ulong stickL     = XrStringToPath("/user/hand/left/input/thumbstick");
-            ulong menuBtnY   = XrStringToPath("/user/hand/left/input/y/click");
-            ulong menuBtnM   = XrStringToPath("/user/hand/left/input/menu/click");
-            ulong gripRight      = XrStringToPath("/user/hand/right/input/squeeze/value");
-            ulong gripLeft       = XrStringToPath("/user/hand/left/input/squeeze/value");
-            ulong btnA           = XrStringToPath("/user/hand/right/input/a/click");
-            ulong btnB           = XrStringToPath("/user/hand/right/input/b/click");
-            ulong btnX           = XrStringToPath("/user/hand/left/input/x/click");
-            ulong thumbClickR    = XrStringToPath("/user/hand/right/input/thumbstick/click");
-            ulong thumbClickL    = XrStringToPath("/user/hand/left/input/thumbstick/click");
-
-            // XrActionSuggestedBinding = action(8) + binding(8) = 16 bytes
-            // Y button and menu button are separate actions:
-            //   y/click    → _yButtonAction    (Alternate / F key)
-            //   menu/click → _menuButtonAction (ESC)
-            int bindCount = 15;
-            IntPtr bindings = Marshal.AllocHGlobal(bindCount * 16);
-            try
-            {
-                void WriteBinding(int idx, ulong act, ulong path)
-                {
-                    Marshal.WriteInt64(bindings, idx * 16 + 0, (long)act);
-                    Marshal.WriteInt64(bindings, idx * 16 + 8, (long)path);
-                }
-                WriteBinding(0,  _poseAction,       aimRight);
-                WriteBinding(1,  _poseAction,       aimLeft);
-                WriteBinding(2,  _triggerAction,    trigRight);
-                WriteBinding(3,  _triggerAction,    trigLeft);
-                WriteBinding(4,  _thumbAction,      stickR);
-                WriteBinding(5,  _thumbAction,      stickL);
-                WriteBinding(6,  _yButtonAction,    menuBtnY);
-                WriteBinding(7,  _menuButtonAction, menuBtnM);
-                WriteBinding(8,  _gripAction,       gripRight);
-                WriteBinding(9,  _gripAction,       gripLeft);
-                WriteBinding(10, _buttonAAction,    btnA);
-                WriteBinding(11, _buttonBAction,    btnB);
-                WriteBinding(12, _buttonXAction,    btnX);
-                WriteBinding(13, _thumbClickAction, thumbClickR);
-                WriteBinding(14, _thumbClickAction, thumbClickL);
-
-                // XrInteractionProfileSuggestedBinding: type(24)+pad(4)+next(8)+profile(8)+count(4)+pad(4)+bindings*(8) = 40
-                IntPtr sugInfo = Marshal.AllocHGlobal(40);
-                try
-                {
-                    for (int i = 0; i < 40; i++) Marshal.WriteByte(sugInfo, i, 0);
-                    Marshal.WriteInt32(sugInfo,  0, 51);        // XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING
-                    Marshal.WriteInt64(sugInfo, 16, (long)profile);
-                    Marshal.WriteInt32(sugInfo, 24, bindCount);
-                    Marshal.WriteIntPtr(sugInfo, 32, bindings);
-                    int rc = Marshal.GetDelegateForFunctionPointer<XrSuggestInteractionProfileBindingsDelegate>
-                        (_pfnSuggestInteractionProfileBindings)(_instance, sugInfo);
-                    Log.LogInfo($"  xrSuggestInteractionProfileBindings rc={rc}");
-                }
-                finally { Marshal.FreeHGlobal(sugInfo); }
-            }
-            finally { Marshal.FreeHGlobal(bindings); }
+            // 4. Suggest interaction profile bindings for multiple controller types
+            SuggestAllProfileBindings();
 
             Log.LogInfo($"  SetupActionSetsInstance complete: actionSet=0x{_actionSet:X} pose=0x{_poseAction:X} trigger=0x{_triggerAction:X} thumb=0x{_thumbAction:X} menu=0x{_menuButtonAction:X} grip=0x{_gripAction:X} btnA=0x{_buttonAAction:X} btnB=0x{_buttonBAction:X} btnX=0x{_buttonXAction:X} btnY=0x{_yButtonAction:X} thumbClick=0x{_thumbClickAction:X}");
         }
@@ -1487,9 +1334,148 @@ public static class OpenXRManager
     }
 
     /// <summary>
+    /// Suggests interaction profile bindings for all supported controller types.
+    /// Each profile is a separate xrSuggestInteractionProfileBindings call.
+    /// Failures for unavailable profiles are logged but don't stop initialization.
+    /// </summary>
+    private static void SuggestAllProfileBindings()
+    {
+        // ── Oculus Touch ──────────────────────────────────────────────────────
+        SuggestBindings("/interaction_profiles/oculus/touch_controller", new[]
+        {
+            (_poseAction,       "/user/hand/right/input/aim/pose"),
+            (_poseAction,       "/user/hand/left/input/aim/pose"),
+            (_triggerAction,    "/user/hand/right/input/trigger/value"),
+            (_triggerAction,    "/user/hand/left/input/trigger/value"),
+            (_thumbAction,      "/user/hand/right/input/thumbstick"),
+            (_thumbAction,      "/user/hand/left/input/thumbstick"),
+            (_gripAction,       "/user/hand/right/input/squeeze/value"),
+            (_gripAction,       "/user/hand/left/input/squeeze/value"),
+            (_yButtonAction,    "/user/hand/left/input/y/click"),
+            (_menuButtonAction, "/user/hand/left/input/menu/click"),
+            (_buttonAAction,    "/user/hand/right/input/a/click"),
+            (_buttonBAction,    "/user/hand/right/input/b/click"),
+            (_buttonXAction,    "/user/hand/left/input/x/click"),
+            (_thumbClickAction, "/user/hand/right/input/thumbstick/click"),
+            (_thumbClickAction, "/user/hand/left/input/thumbstick/click"),
+        });
+
+        // ── Valve Index ───────────────────────────────────────────────────────
+        SuggestBindings("/interaction_profiles/valve/index_controller", new[]
+        {
+            (_poseAction,       "/user/hand/right/input/aim/pose"),
+            (_poseAction,       "/user/hand/left/input/aim/pose"),
+            (_triggerAction,    "/user/hand/right/input/trigger/value"),
+            (_triggerAction,    "/user/hand/left/input/trigger/value"),
+            (_thumbAction,      "/user/hand/right/input/thumbstick"),
+            (_thumbAction,      "/user/hand/left/input/thumbstick"),
+            (_gripAction,       "/user/hand/right/input/squeeze/value"),
+            (_gripAction,       "/user/hand/left/input/squeeze/value"),
+            (_buttonAAction,    "/user/hand/right/input/a/click"),
+            (_buttonBAction,    "/user/hand/right/input/b/click"),
+            (_buttonXAction,    "/user/hand/left/input/a/click"),
+            (_yButtonAction,    "/user/hand/left/input/b/click"),
+            (_thumbClickAction, "/user/hand/right/input/thumbstick/click"),
+            (_thumbClickAction, "/user/hand/left/input/thumbstick/click"),
+        });
+
+        // ── HTC Vive wand ─────────────────────────────────────────────────────
+        // Vive has trackpad instead of thumbstick; no face buttons (A/B/X/Y)
+        SuggestBindings("/interaction_profiles/htc/vive_controller", new[]
+        {
+            (_poseAction,       "/user/hand/right/input/aim/pose"),
+            (_poseAction,       "/user/hand/left/input/aim/pose"),
+            (_triggerAction,    "/user/hand/right/input/trigger/value"),
+            (_triggerAction,    "/user/hand/left/input/trigger/value"),
+            (_thumbAction,      "/user/hand/right/input/trackpad"),
+            (_thumbAction,      "/user/hand/left/input/trackpad"),
+            (_gripAction,       "/user/hand/right/input/squeeze/click"),
+            (_gripAction,       "/user/hand/left/input/squeeze/click"),
+            (_menuButtonAction, "/user/hand/left/input/menu/click"),
+        });
+
+        // ── Microsoft WMR ─────────────────────────────────────────────────────
+        SuggestBindings("/interaction_profiles/microsoft/motion_controller", new[]
+        {
+            (_poseAction,       "/user/hand/right/input/aim/pose"),
+            (_poseAction,       "/user/hand/left/input/aim/pose"),
+            (_triggerAction,    "/user/hand/right/input/trigger/value"),
+            (_triggerAction,    "/user/hand/left/input/trigger/value"),
+            (_thumbAction,      "/user/hand/right/input/thumbstick"),
+            (_thumbAction,      "/user/hand/left/input/thumbstick"),
+            (_gripAction,       "/user/hand/right/input/squeeze/click"),
+            (_gripAction,       "/user/hand/left/input/squeeze/click"),
+            (_menuButtonAction, "/user/hand/left/input/menu/click"),
+            (_thumbClickAction, "/user/hand/right/input/thumbstick/click"),
+            (_thumbClickAction, "/user/hand/left/input/thumbstick/click"),
+        });
+
+        // ── KHR Simple (fallback for any controller) ──────────────────────────
+        SuggestBindings("/interaction_profiles/khr/simple_controller", new[]
+        {
+            (_poseAction,       "/user/hand/right/input/aim/pose"),
+            (_poseAction,       "/user/hand/left/input/aim/pose"),
+            (_triggerAction,    "/user/hand/right/input/select/click"),
+            (_triggerAction,    "/user/hand/left/input/select/click"),
+            (_menuButtonAction, "/user/hand/left/input/menu/click"),
+        });
+    }
+
+    /// <summary>
+    /// Resolves the profile path and all binding paths, then calls xrSuggestInteractionProfileBindings.
+    /// Logs the result; failures are non-fatal (runtime may not support the profile).
+    /// </summary>
+    private static void SuggestBindings(string profilePath, (ulong action, string path)[] bindingDefs)
+    {
+        if (_pfnSuggestInteractionProfileBindings == IntPtr.Zero) return;
+        try
+        {
+            ulong profile = XrStringToPath(profilePath);
+            if (profile == 0) { Log.LogWarning($"  SuggestBindings: failed to resolve profile '{profilePath}'"); return; }
+
+            // Resolve all binding paths and filter out any that fail
+            var resolved = new System.Collections.Generic.List<(ulong action, ulong path)>();
+            foreach (var (action, path) in bindingDefs)
+            {
+                if (action == 0) continue; // action not created (e.g. face buttons for Vive)
+                ulong p = XrStringToPath(path);
+                if (p != 0) resolved.Add((action, p));
+            }
+            if (resolved.Count == 0) { Log.LogWarning($"  SuggestBindings: no valid bindings for '{profilePath}'"); return; }
+
+            int count = resolved.Count;
+            IntPtr bindings = Marshal.AllocHGlobal(count * 16);
+            try
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    Marshal.WriteInt64(bindings, i * 16 + 0, (long)resolved[i].action);
+                    Marshal.WriteInt64(bindings, i * 16 + 8, (long)resolved[i].path);
+                }
+
+                IntPtr sugInfo = Marshal.AllocHGlobal(40);
+                try
+                {
+                    for (int i = 0; i < 40; i++) Marshal.WriteByte(sugInfo, i, 0);
+                    Marshal.WriteInt32(sugInfo,  0, 51); // XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING
+                    Marshal.WriteInt64(sugInfo, 16, (long)profile);
+                    Marshal.WriteInt32(sugInfo, 24, count);
+                    Marshal.WriteIntPtr(sugInfo, 32, bindings);
+                    int rc = Marshal.GetDelegateForFunctionPointer<XrSuggestInteractionProfileBindingsDelegate>
+                        (_pfnSuggestInteractionProfileBindings)(_instance, sugInfo);
+                    Log.LogInfo($"  SuggestBindings '{profilePath}': {count} bindings, rc={rc}");
+                }
+                finally { Marshal.FreeHGlobal(sugInfo); }
+            }
+            finally { Marshal.FreeHGlobal(bindings); }
+        }
+        catch (Exception ex) { Log.LogWarning($"  SuggestBindings '{profilePath}': {ex.Message}"); }
+    }
+
+    /// <summary>
     /// PHASE 2 (session-level) — called in TryDirectPath after xrCreateSession.
     /// Creates action spaces and attaches the action set to the session.
-    /// Must happen before xrBeginSession (VDXR requirement) and before xrSyncActions (spec requirement).
+    /// Must happen before xrBeginSession and before xrSyncActions (spec requirement).
     /// </summary>
     private static void SetupActionSetsSession()
     {
@@ -1586,45 +1572,44 @@ public static class OpenXRManager
     }
 
     /// <summary>
-    /// Returns whether the trigger button is pressed this frame.
+    /// Returns whether the trigger is pressed this frame (float action thresholded at 0.5).
     /// Returns false (with pressed=false) if action sets aren't ready.
     /// </summary>
     public static bool GetTriggerState(bool right, out bool pressed)
     {
         pressed = false;
-        if (!ActionSetsReady || _dGetActionStateBool == null || _triggerAction == 0) return false;
-        try
-        {
-            // _bActionGi shared for trigger+thumbstick (sequential main-thread calls only).
-            // Only dynamic fields: action handle and subaction path.
-            Marshal.WriteInt64(_bActionGi, 16, (long)_triggerAction);
-            Marshal.WriteInt64(_bActionGi, 24, (long)(right ? _rightHandPath : _leftHandPath));
-            int rc = _dGetActionStateBool(_session, _bActionGi, _bActionStateBool);
-            if (rc == 0)
-                pressed = Marshal.ReadInt32(_bActionStateBool, 16) != 0; // currentState at +16
-            return rc == 0;
-        }
-        catch (Exception ex) { Log.LogWarning($"  GetTriggerState: {ex.Message}"); return false; }
+        if (!GetActionFloat(_triggerAction, right ? _rightHandPath : _leftHandPath, out float val)) return false;
+        pressed = val > 0.5f;
+        return true;
     }
 
     /// <summary>
-    /// Returns whether the grip/squeeze button is pressed this frame.
+    /// Returns whether the grip/squeeze is pressed this frame (float action thresholded at 0.5).
     /// Returns false (with pressed=false) if action sets aren't ready.
     /// </summary>
     public static bool GetGripState(bool right, out bool pressed)
     {
         pressed = false;
-        if (!ActionSetsReady || _dGetActionStateBool == null || _gripAction == 0) return false;
+        if (!GetActionFloat(_gripAction, right ? _rightHandPath : _leftHandPath, out float val)) return false;
+        pressed = val > 0.5f;
+        return true;
+    }
+
+    /// <summary>Reads a FLOAT_INPUT action's currentState. Returns false on failure.</summary>
+    private static bool GetActionFloat(ulong action, ulong subPath, out float value)
+    {
+        value = 0f;
+        if (!ActionSetsReady || _dGetActionStateFloat == null || action == 0) return false;
         try
         {
-            Marshal.WriteInt64(_bActionGi, 16, (long)_gripAction);
-            Marshal.WriteInt64(_bActionGi, 24, (long)(right ? _rightHandPath : _leftHandPath));
-            int rc = _dGetActionStateBool(_session, _bActionGi, _bActionStateBool);
+            Marshal.WriteInt64(_bActionGi, 16, (long)action);
+            Marshal.WriteInt64(_bActionGi, 24, (long)subPath);
+            int rc = _dGetActionStateFloat(_session, _bActionGi, _bActionStateFloat);
             if (rc == 0)
-                pressed = Marshal.ReadInt32(_bActionStateBool, 16) != 0; // currentState at +16
+                value = ReadFloat(_bActionStateFloat, 16); // currentState at +16
             return rc == 0;
         }
-        catch (Exception ex) { Log.LogWarning($"  GetGripState: {ex.Message}"); return false; }
+        catch (Exception ex) { Log.LogWarning($"  GetActionFloat: {ex.Message}"); return false; }
     }
 
     /// <summary>
@@ -1791,6 +1776,8 @@ public static class OpenXRManager
             _dGetActionStateBool = Marshal.GetDelegateForFunctionPointer<XrGetActionStateBooleanDelegate>(_pfnGetActionStateBoolean);
         if (_pfnGetActionStateVector2f != IntPtr.Zero)
             _dGetActionStateVec2 = Marshal.GetDelegateForFunctionPointer<XrGetActionStateVector2fDelegate>(_pfnGetActionStateVector2f);
+        if (_pfnGetActionStateFloat != IntPtr.Zero)
+            _dGetActionStateFloat = Marshal.GetDelegateForFunctionPointer<XrGetActionStateFloatDelegate>(_pfnGetActionStateFloat);
 
         Log.LogInfo("[OpenXR] InitPerFrameResources: delegates cached.");
 
@@ -1816,6 +1803,7 @@ public static class OpenXRManager
         _bActionGi       = Marshal.AllocHGlobal(32);  Zero(_bActionGi,       32);
         _bActionStateBool = Marshal.AllocHGlobal(40); Zero(_bActionStateBool,40);
         _bActionStateVec2 = Marshal.AllocHGlobal(48); Zero(_bActionStateVec2,48);
+        _bActionStateFloat = Marshal.AllocHGlobal(32); Zero(_bActionStateFloat,32);
         _bLocSpaceInfo   = Marshal.AllocHGlobal(40);  Zero(_bLocSpaceInfo,   40);
         _bSpaceLocation  = Marshal.AllocHGlobal(48);  Zero(_bSpaceLocation,  48);
 
@@ -1848,6 +1836,7 @@ public static class OpenXRManager
         Marshal.WriteInt32(_bActionGi,       0, 58); // XR_TYPE_ACTION_STATE_GET_INFO
         Marshal.WriteInt32(_bActionStateBool,0, 23); // XR_TYPE_ACTION_STATE_BOOLEAN
         Marshal.WriteInt32(_bActionStateVec2,0, 25); // XR_TYPE_ACTION_STATE_VECTOR2F
+        Marshal.WriteInt32(_bActionStateFloat,0,24); // XR_TYPE_ACTION_STATE_FLOAT
         Marshal.WriteInt32(_bLocSpaceInfo,   0, 42); // XR_TYPE_SPACE_LOCATION (reuse for output)
         Marshal.WriteInt32(_bSpaceLocation,  0, 42); // XR_TYPE_SPACE_LOCATION
 
@@ -1866,55 +1855,6 @@ public static class OpenXRManager
         Marshal.WriteInt64(_bProjLayer, 24, (long)ReferenceSpace);      // space at +24
         Marshal.WriteInt64(_bSyncAas, 0, (long)_actionSet);             // actionSet at +0
         Log.LogInfo($"[OpenXR] FinalizePerFrameBuffers: refSpace=0x{ReferenceSpace:X} actionSet=0x{_actionSet:X}");
-    }
-
-    private static unsafe void DumpVtableFunctions()
-    {
-        // Get robj via the singleton getter embedded in xrGetD3D11GfxReqs at +0x143
-        IntPtr robj = GetVDXRRuntimeObject();
-        if (robj == IntPtr.Zero) { Log.LogInfo("  DumpVtable: robj not found"); return; }
-        Log.LogInfo($"  DumpVtable: robj=0x{robj:X}");
-
-        // Dump robj[0..0x18] to read the vtable pointer
-        var sb = new System.Text.StringBuilder();
-        byte* p = (byte*)robj;
-        for (int i = 0; i < 0x20; i++) sb.Append($"{p[i]:X2} ");
-        Log.LogInfo($"  robj[0..0x20]: {sb}");
-
-        // vtable pointer is at [robj+0] (first 8 bytes)
-        IntPtr vtable = *(IntPtr*)p;
-        Log.LogInfo($"  vtable=0x{vtable:X}");
-
-        // Dump vtable slot 12 (offset 0x60) = xrCreateSession implementation
-        IntPtr cs_impl = *(IntPtr*)((byte*)vtable + 0x60);
-        Log.LogInfo($"  vtable[0x60] (createSession impl)=0x{cs_impl:X}");
-        DumpFunctionBytes("createSession_impl", cs_impl, 600);
-        // Scan for -38 constant (0xDA FF FF FF) in createSession_impl
-        byte* csfn = (byte*)cs_impl;
-        for (int i = 4; i < 600; i++)
-        {
-            if (csfn[i] == 0xDA && csfn[i+1] == 0xFF && csfn[i+2] == 0xFF && csfn[i+3] == 0xFF)
-            {
-                var sb2 = new System.Text.StringBuilder();
-                int start = Math.Max(0, i - 32);
-                for (int j = start; j < i + 8; j++) sb2.Append($"{csfn[j]:X2} ");
-                Log.LogInfo($"  createSession: -38 at +0x{i:X}: [{sb2}]");
-            }
-        }
-
-        // Dump vtable slot 60 (offset 0x1e0) = xrGetD3D11GfxReqs implementation
-        IntPtr gfx_impl = *(IntPtr*)((byte*)vtable + 0x1e0);
-        Log.LogInfo($"  vtable[0x1e0] (gfxReqs impl)=0x{gfx_impl:X}");
-        DumpFunctionBytes("gfxReqs_impl", gfx_impl, 200);
-    }
-
-    private static unsafe void DumpFunctionBytes(string name, IntPtr addr, int count)
-    {
-        if (addr == IntPtr.Zero) return;
-        var sb = new System.Text.StringBuilder();
-        byte* p = (byte*)addr;
-        for (int i = 0; i < count; i++) sb.Append($"{p[i]:X2} ");
-        Log.LogInfo($"  DUMP {name} @0x{addr:X}: {sb}");
     }
 
     private static void LogFnOwner(string fnName, IntPtr addr)
