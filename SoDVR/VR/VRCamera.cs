@@ -317,9 +317,18 @@ public class VRCamera : MonoBehaviour
     private int   _interactionLayerMask = ~0;     // Toolbox.Instance.interactionRayLayerMask
     private float _baseInteractionRange = 1.85f;  // GameplayControls.Instance.interactionRange
 
-    // ── HUD objective arrow override ─────────────────────────────────
+    // ── HUD objective arrow override ──────────────────────────��──────
     private InterfaceController? _interfaceCtrl;
     private RectTransform?       _firstPersonUI;  // = GameWorldDisplay, sd=100x100
+
+    // ── Tutorial / desktopMode hang prevention ──────────────────────
+    // The game's TutorialMessage and PopupMessage call PauseGame → SetDesktopMode(true),
+    // which starts a DesktopModeTransition coroutine that modifies canvas scales/alpha
+    // every frame.  This fights our WorldSpace canvas enforcement and can deadlock the
+    // render pipeline → permanent hang (xrWaitFrame blocks forever).
+    // Defence: disable tutorials, and immediately undo desktopMode=true each frame.
+    private bool _tutorialsDisabled;
+    private bool _prevDesktopMode;
 
     // ── Awareness compass VR override ────────────────────────────────
     private Transform? _compassContainer;          // InterfaceController.compassContainer
@@ -1084,6 +1093,36 @@ public class VRCamera : MonoBehaviour
         if (_playerRef != null && _sceneLoadGrace <= 0)
         {
             try { _playerRef.UpdateGameLocation(); }
+            catch { }
+        }
+
+        // -- Prevent popup/tutorial desktop-mode hang ---------------------
+        // PopupMessage/TutorialMessage -> PauseGame -> SetDesktopMode(true) starts
+        // DesktopModeTransition coroutine that fights our WorldSpace canvas enforcement.
+        // Only undo desktopMode when a POPUP triggered it (PopupMessageController.active),
+        // NOT when the player pressed ESC (normal case board pause is desktopMode=true).
+        if (_movementDiscoveryDone && _interfaceCtrl != null)
+        {
+            try
+            {
+                bool dm = _interfaceCtrl.desktopMode;
+                if (dm && !_prevDesktopMode)
+                {
+                    // desktopMode just flipped true.  Check if a popup caused it.
+                    bool popupActive = false;
+                    try { popupActive = PopupMessageController.Instance != null && PopupMessageController.Instance.active; } catch { }
+                    if (popupActive)
+                    {
+                        // Popup-triggered desktopMode -- undo immediately.
+                        // Zero transition values so the coroutine while-loop exits on next yield.
+                        Log.LogWarning("[VRCamera] desktopMode flipped TRUE (popup active) -- forcing back to FALSE");
+                        _interfaceCtrl.desktopModeTransition = 0f;
+                        _interfaceCtrl.desktopModeDesiredTransition = 0f;
+                        _interfaceCtrl.SetDesktopMode(false, false);
+                    }
+                }
+                _prevDesktopMode = _interfaceCtrl.desktopMode;
+            }
             catch { }
         }
 
@@ -4267,7 +4306,10 @@ public class VRCamera : MonoBehaviour
                         if (!dialogUp) continue;
                     }
                 }
-                if (GetCanvasCategory(c.gameObject.name) == CanvasCategory.HUD) continue;
+                var aimCat = GetCanvasCategory(c.gameObject.name);
+                if (aimCat == CanvasCategory.HUD) continue;
+                // DIAGNOSTIC: when case board is open, track which canvases absorb the cursor
+                // to identify invisible blockers at pin board edges.
                 // Allow grip-dragged notes through — they have independent world transforms
                 if (_nestedCanvasIds.Contains(kvp.Key))
                 {
@@ -4311,6 +4353,24 @@ public class VRCamera : MonoBehaviour
                 _cursorTargetPos   = bestCanvas.transform.position;
                 _cursorTargetRot   = bestCanvas.transform.rotation;
                 _cursorAimDepth    = bestDepth - 0.01f;
+
+                // DIAGNOSTIC: when case board is open, log which canvas absorbs the cursor
+                // every 90 frames, to identify invisible blockers at pin board edges.
+                bool diagCbOpen = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf;
+                if (diagCbOpen && (_frameCount % 90) == 0)
+                {
+                    var rt = bestCanvas.GetComponent<RectTransform>();
+                    string szInfo = rt != null ? $"sd={rt.sizeDelta.ToString("F0")}" : "no-rt";
+                    Log.LogInfo($"[AimDiag] cursorTarget='{bestCanvas.gameObject.name}' cat={GetCanvasCategory(bestCanvas.gameObject.name)} " +
+                                $"depth={bestDepth:F2} pos={bestCanvas.transform.position.ToString("F2")} {szInfo} " +
+                                $"allHits={_aimDotHits.Count}");
+                    foreach (var (hd, hc, _) in _aimDotHits)
+                    {
+                        var hrt = hc.GetComponent<RectTransform>();
+                        string hsz = hrt != null ? $"sd={hrt.sizeDelta.ToString("F0")}" : "no-rt";
+                        Log.LogInfo($"[AimDiag]   hit: '{hc.gameObject.name}' cat={GetCanvasCategory(hc.gameObject.name)} depth={hd:F2} {hsz}");
+                    }
+                }
             }
             else
             {
@@ -7759,6 +7819,40 @@ public class VRCamera : MonoBehaviour
             }
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] InterfaceController cache: {ex.Message}"); }
+
+        // 5i. Disable tutorials in VR — they are designed for flat-screen and their popup
+        //      triggers PauseGame → SetDesktopMode(true) → DesktopModeTransition coroutine
+        //      which fights our WorldSpace canvas enforcement and can cause permanent hangs.
+        if (!_tutorialsDisabled)
+        {
+            try
+            {
+                var sd = SessionData.Instance;
+                if (sd != null)
+                {
+                    sd.enableTutorialText = false;
+                    _tutorialsDisabled = true;
+                    Log.LogInfo("[Movement] Tutorials disabled for VR (prevents hang from SetDesktopMode transition)");
+                }
+            }
+            catch (Exception ex) { Log.LogWarning($"[Movement] Tutorial disable: {ex.Message}"); }
+        }
+
+        // 5j. Ensure desktopMode is false at discovery time — if the game started in desktop
+        //     mode (e.g. from a previous pause), undo it now.
+        if (_interfaceCtrl != null)
+        {
+            try
+            {
+                if (_interfaceCtrl.desktopMode)
+                {
+                    Log.LogInfo("[Movement] desktopMode was true at discovery — setting to false");
+                    _interfaceCtrl.SetDesktopMode(false, false);
+                }
+                _prevDesktopMode = false;
+            }
+            catch { }
+        }
 
         // 5h. Cache awareness compass container for VR positioning.
         _compassDiagDone = false;

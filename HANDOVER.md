@@ -1,7 +1,44 @@
 # SoDVR — Technical Handover
 
-**Date**: 2026-04-04 (updated end of Phase 19)
-**Phase**: 20 — polish and remaining issues
+**Date**: 2026-04-04 (updated mid-Phase 20)
+**Phase**: 20 — hang prevention, string connections, aim dot investigation
+
+---
+
+## Phase 20 (2026-04-04) — IN PROGRESS
+
+### Tutorial/popup hang prevention — DONE ✓
+
+**Root cause**: TutorialMessage/PopupMessage → PauseGame → SetDesktopMode(true) starts `DesktopModeTransition` coroutine which modifies `caseCanvas.localScale`, `windowCanvas.localScale`, and multiple CanvasGroup.alpha values every frame. This fights our WorldSpace canvas enforcement and can cause permanent hangs (WER: IsFatal=1, Hang Type=134217728 = app stopped processing Windows messages).
+
+**Fix — two layers:**
+1. **Tutorials disabled in VR**: `SessionData.Instance.enableTutorialText = false` in `DiscoverMovementSystem()`. Tutorials are flat-screen only.
+2. **desktopMode watchdog** (per-frame in Update): detects `desktopMode` flip true→false. Only acts when `PopupMessageController.Instance.active` is true (popup-triggered, not normal ESC/pause). Immediately zeros `desktopModeTransition` + `desktopModeDesiredTransition`, then calls `SetDesktopMode(false, false)`. Game remains paused; popup UI still visible on TooltipCanvas; RemoveMessage→ResumeGame properly unpauses.
+
+**Fields added**: `_tutorialsDisabled` (bool), `_prevDesktopMode` (bool)
+
+**Important**: normal ESC → case board → desktopMode=true is NOT affected. Only popup-triggered transitions are blocked.
+
+### Case board string connections (commit `0211e61`) — UNTESTED
+
+B-button drag between pins creates string connections. Bypasses game's CustomStringLink coroutine (which checks `!desktopMode` and cancels). Implementation:
+- B press on pin: sets `CasePanelController.Instance.customStringLinkSelection` + `customLinkSelectionMode`, instantiates preview string prefab
+- B held: updates preview string in canvas-local space each frame (position + rotation via Atan2)
+- B release on different pin: calls `FinishCustomStringLinkSelection()`; on empty space: `CancelCustomStringLinkSelection()`
+- `FixStringRotations()` in LateUpdate after EnforceCaseCanvasPosition: overrides `StringController.UpdatePosition()` which uses `rect.rotation` (world-space Euler, causes Z-drift in WorldSpace canvases) → sets `rect.localRotation` instead
+
+### Case board aim dot edge-blocking — DIAGNOSTIC DEPLOYED, AWAITING LOG
+
+**User report**: "invisible sphere centered around the player" blocks aim dot at pin board edges, intermittently. Prevents moving pins to board edges.
+
+**Analysis so far**:
+- Case board aim dot (`_caseBoardDot`) has NO bounds check — always shows on pin board plane. This is separate from `_cursorTargetCanvas`.
+- `_cursorTargetCanvas` selection (aim dot scan, line ~4289) iterates all `_managedCanvases`, does plane raycast + bounds check, picks closest depth.
+- Pin drag uses direct raycast against `_cbContentContainerRT` — independent of `_cursorTargetCanvas`.
+- Pin click initiation uses `TryFindCaseBoardTarget` which excludes Panel/Menu/Tooltip/HUD categories and adds CaseCanvas WITHOUT bounds check.
+- The "sphere" blocking pattern suggests a canvas positioned near the player whose bounds create angular blocking at oblique aim angles.
+
+**Diagnostic deployed**: `[AimDiag]` log prefix, fires every 90 frames when case board is open. Logs winning canvas name, category, depth, sizeDelta, and all competing hits. **Next step**: user runs game, aims at blocked edges, says "done" → read log to identify blocker.
 
 ---
 
@@ -440,5 +477,11 @@ FMODUnity.RuntimeManager.GetVCA("vca:/Soundtrack").setVolume(vol);   // per-chan
 - [x] Phase 11: Movement — all controls bound, held items + arm display (`255dafc`)
 - [x] Phase 12: Case board pin drag, context menu world-lock (`1ee8e9d`)
 - [x] Phase 13: Save-load warp eliminated, ActionPanelCanvas grip-drag deadlock fixed (`d0bd328`)
-- [ ] **Phase 14 (in progress)**: A/B button canvas mapping done; HUD settings + auto-hide plan ready; case board interaction issues parked
-- [ ] **Phase 15 (next)**: Comfort options (vignette, snap-turn config, IPD) + remaining polish
+- [x] Phase 14: A/B button canvas clicks, GPU TDR fix, action text fix, compass fix, HUD plan
+- [x] Phase 15: Minimap interaction — pan, click, right-click, floor nav
+- [x] Phase 16: Case board context menu + string connect + aim dot fix
+- [x] Phase 17: Note warp fix, individual note 6DOF drag, multi-spawn
+- [x] Phase 18: Grip-drag generalized, map position persistence, log cleanup
+- [x] Phase 19: B button hold-to-show for map/notebook
+- [ ] **Phase 20 (in progress)**: Tutorial hang fix (done), string connections (untested), aim dot edge-blocking (diagnostic deployed)
+- [ ] **Phase 21 (next)**: HUD settings implementation, comfort options, remaining polish

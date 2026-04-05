@@ -297,6 +297,43 @@ When the player loads a save from the main menu (same Unity scene reused):
 - `_cursorTargetCanvas` field tracks nearest aimed-at canvas ✓
 - HUD settings plan written (plan file at `C:\Users\blah6\.claude\plans\tender-wibbling-sunbeam.md`) — NOT YET IMPLEMENTED
 
+## Phase 20 status (IN PROGRESS — 2026-04-04)
+Tutorial/popup hang prevention + case board aim dot investigation:
+
+### Tutorial hang prevention (DONE)
+- `SessionData.Instance.enableTutorialText = false` in DiscoverMovementSystem — prevents TutorialMessage from firing
+- Per-frame desktopMode watchdog: if `desktopMode` flips true AND `PopupMessageController.Instance.active` is true, immediately zero `desktopModeTransition`/`desktopModeDesiredTransition` and call `SetDesktopMode(false, false)` — prevents DesktopModeTransition coroutine from fighting WorldSpace canvas enforcement
+- Normal ESC/pause desktopMode is NOT affected (only popup-triggered transitions blocked)
+- Fields: `_tutorialsDisabled`, `_prevDesktopMode`
+
+### Case board aim dot edge-blocking (DIAGNOSTIC DEPLOYED, AWAITING LOG)
+- User reports "invisible sphere" centered on player blocks aim dot at pin board edges
+- Blocking is intermittent ("only sometimes")
+- Diagnostic logging added: every 90 frames when case board is open, logs `_cursorTargetCanvas` name, category, depth, sizeDelta, and all competing canvas hits (`[AimDiag]` log prefix)
+- **Next step**: read `[AimDiag]` log lines while user aims at blocked edges to identify the blocker canvas
+
+### Case board string connections (commit `0211e61`, UNTESTED)
+- B-button drag between pins on case board creates string connections
+- Bypasses game's CustomStringLink coroutine (checks `!desktopMode`, cancels in VR)
+- Direct API: sets `customStringLinkSelection`/`customLinkSelectionMode`, instantiates preview string, updates in canvas-local space, calls `FinishCustomStringLinkSelection` on release
+- `FixStringRotations()` in LateUpdate corrects StringController.UpdatePosition() Z-drift (uses `rect.rotation` world-space Euler, wrong for WorldSpace canvases — replaced with `localRotation`)
+
+## CRITICAL: DesktopModeTransition coroutine — canvas scale/alpha fighting (discovered 2026-04-04)
+When PauseGame → SetDesktopMode(true) fires, `DesktopModeTransition` coroutine runs every frame:
+```csharp
+while (desktopModeTransition != desktopModeDesiredTransition)
+{
+    desktopModeTransition += ... * Time.deltaTime;
+    canvasRect.localScale = new Vector3(num, num, num);  // caseCanvas
+    windowRect.localScale = new Vector3(num, num, num);  // windowCanvas
+    caseCanvasGroup.alpha = desktopModeTransition;
+    // ... more alpha/scale modifications
+    yield return null;
+}
+```
+This fights our WorldSpace canvas enforcement and can cause permanent hangs.
+**Fix**: desktopMode watchdog detects popup-triggered transitions and immediately zeros transition values + calls SetDesktopMode(false). Fields on InterfaceController are all public: `desktopMode`, `desktopModeTransition`, `desktopModeDesiredTransition`.
+
 ## Phase 19 status (COMPLETE — 2026-04-04)
 B button hold-to-show for map/notebook:
 - B held → Tab key held (map stays open), B released → Tab UP (`92f92f5`) ✓
@@ -457,3 +494,4 @@ The `UpdateInventory()` grip-camera-redirect was removed as the TDR source (2026
 - **Phase 17 complete** (2026-04-03): Note warp fix, individual note 6DOF drag, multi-spawn, aim dot on moved notes (`9e52b49`)
 - **Phase 18 complete** (2026-04-04): Grip-drag generalized to all nested canvases, map position persistence, diagnostic log cleanup (`8338fba`, `92caaec`)
 - **Phase 19 complete** (2026-04-04): B button hold-to-show for map/notebook, fresh placement on each open (`92f92f5`)
+- **Phase 20 in progress** (2026-04-04): Tutorial hang prevention (done), desktopMode watchdog (done), case board string connections (untested `0211e61`), aim dot edge-blocking diagnostic (deployed, awaiting log)
