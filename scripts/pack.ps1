@@ -11,7 +11,8 @@
 #>
 param(
     [Parameter(Mandatory)]
-    [string]$Version
+    [string]$Version,
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,13 +25,17 @@ $ZipOut    = "$OutputDir\SoDVR-$Version.zip"
 function Step([string]$msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 
 # ── 1. Build ──────────────────────────────────────────────────────────────────
-Step "Building SoDVR (Release)"
-dotnet build "$Root\SoDVR\SoDVR.csproj" -c Release --nologo
-if ($LASTEXITCODE -ne 0) { throw "SoDVR build failed" }
+if (-not $SkipBuild) {
+    Step "Building SoDVR (Release)"
+    dotnet build "$Root\SoDVR\SoDVR.csproj" -c Release --nologo
+    if ($LASTEXITCODE -ne 0) { throw "SoDVR build failed" }
 
-Step "Building SoDVR.Preload (Release)"
-dotnet build "$Root\SoDVR.Preload\SoDVR.Preload.csproj" -c Release --nologo
-if ($LASTEXITCODE -ne 0) { throw "SoDVR.Preload build failed" }
+    Step "Building SoDVR.Preload (Release)"
+    dotnet build "$Root\SoDVR.Preload\SoDVR.Preload.csproj" -c Release --nologo
+    if ($LASTEXITCODE -ne 0) { throw "SoDVR.Preload build failed" }
+} else {
+    Write-Host "`nSkipping build - using existing DLLs from bin/Release." -ForegroundColor Yellow
+}
 
 # ── 2. Locate build outputs ───────────────────────────────────────────────────
 $SoDVRDll   = "$Root\SoDVR\bin\Release\net6.0\SoDVR.dll"
