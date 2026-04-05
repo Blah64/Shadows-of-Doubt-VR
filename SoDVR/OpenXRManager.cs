@@ -1203,9 +1203,8 @@ public static class OpenXRManager
     private static ulong XrStringToPath(string s)
     {
         if (_pfnStringToPath == IntPtr.Zero) return 0;
-        int rc = Marshal.GetDelegateForFunctionPointer<XrStringToPathDelegate>
+        Marshal.GetDelegateForFunctionPointer<XrStringToPathDelegate>
             (_pfnStringToPath)(_instance, s, out ulong path);
-        Log.LogInfo($"  xrStringToPath('{s}') rc={rc} path=0x{path:X}");
         return path;
     }
 
@@ -1270,14 +1269,6 @@ public static class OpenXRManager
             if (_pfnCreateActionSet == IntPtr.Zero || _pfnCreateAction == IntPtr.Zero)
             { Log.LogWarning("  SetupActionSetsInstance: fn ptrs not ready — skipping"); return; }
 
-            // Diagnostic: verify instance-level calls work by calling xrStringToPath first
-            {
-                ulong testPath = 0;
-                int testRc = Marshal.GetDelegateForFunctionPointer<XrStringToPathDelegate>
-                    (_pfnStringToPath)(_instance, "/user/hand/right", out testPath);
-                Log.LogInfo($"  PreCheck xrStringToPath rc={testRc} path=0x{testPath:X}");
-            }
-
             // 1. Create action set
             // XrActionSetCreateInfo: type(28)+pad(4)+next(8)+name[64]+localName[128]+priority(4)+pad(4) = 216
             const int asSz = 216;
@@ -1289,11 +1280,6 @@ public static class OpenXRManager
                 WriteAsciiString(asInfo, 16, "gameplay");       // actionSetName[64] at +16
                 WriteAsciiString(asInfo, 80, "Gameplay");       // localizedName[128] at +80
                 // priority = 0 already
-
-                // Diagnostic: dump first 32 bytes of struct so we can verify layout
-                var sb = new System.Text.StringBuilder("  CreateActionSet struct[0..31]: ");
-                for (int i = 0; i < 32; i++) sb.Append($"{Marshal.ReadByte(asInfo, i):X2} ");
-                Log.LogInfo(sb.ToString());
 
                 int rc = Marshal.GetDelegateForFunctionPointer<XrCreateActionSetDelegate>
                     (_pfnCreateActionSet)(_instance, asInfo, out _actionSet);

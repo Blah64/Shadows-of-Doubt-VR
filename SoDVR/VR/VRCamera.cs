@@ -332,7 +332,6 @@ public class VRCamera : MonoBehaviour
 
     // ── Awareness compass VR override ────────────────────────────────
     private Transform? _compassContainer;          // InterfaceController.compassContainer
-    private bool       _compassDiagDone;
     // Compass placement in front of VR head (tuned after diagnostic run).
     // Forward = metres in front of head; YOffset = metres below eye level.
     private const float CompassDist    = 1.2f;
@@ -4354,23 +4353,6 @@ public class VRCamera : MonoBehaviour
                 _cursorTargetRot   = bestCanvas.transform.rotation;
                 _cursorAimDepth    = bestDepth - 0.01f;
 
-                // DIAGNOSTIC: when case board is open, log which canvas absorbs the cursor
-                // every 90 frames, to identify invisible blockers at pin board edges.
-                bool diagCbOpen = _actionPanelCanvas != null && _actionPanelCanvas.gameObject.activeSelf;
-                if (diagCbOpen && (_frameCount % 90) == 0)
-                {
-                    var rt = bestCanvas.GetComponent<RectTransform>();
-                    string szInfo = rt != null ? $"sd={rt.sizeDelta.ToString("F0")}" : "no-rt";
-                    Log.LogInfo($"[AimDiag] cursorTarget='{bestCanvas.gameObject.name}' cat={GetCanvasCategory(bestCanvas.gameObject.name)} " +
-                                $"depth={bestDepth:F2} pos={bestCanvas.transform.position.ToString("F2")} {szInfo} " +
-                                $"allHits={_aimDotHits.Count}");
-                    foreach (var (hd, hc, _) in _aimDotHits)
-                    {
-                        var hrt = hc.GetComponent<RectTransform>();
-                        string hsz = hrt != null ? $"sd={hrt.sizeDelta.ToString("F0")}" : "no-rt";
-                        Log.LogInfo($"[AimDiag]   hit: '{hc.gameObject.name}' cat={GetCanvasCategory(hc.gameObject.name)} depth={hd:F2} {hsz}");
-                    }
-                }
             }
             else
             {
@@ -6547,9 +6529,6 @@ public class VRCamera : MonoBehaviour
                 catch { }
             }
 
-            // Periodic diagnostic (first 5 frames, then every 300)
-            if (_poseFrameCount <= 5 || (_poseFrameCount % 300) == 0)
-                Log.LogInfo($"[LeftMarker] hit={didHit} interactable={isInteractable} hitDist={lHit.distance:F2} dot={_leftDotCanvas != null} label={_leftLabelCanvas != null}");
 
             // ── Dot: WorldSpace canvas at hit point ──────────────────────
             if (_leftDotCanvas != null)
@@ -6800,32 +6779,6 @@ public class VRCamera : MonoBehaviour
     private void UpdateCompass()
     {
         if (_compassContainer == null || _interfaceCtrl == null || _leftCam == null) return;
-
-        // ── Diagnostic: log compass hierarchy on first call ──────────────────
-        if (!_compassDiagDone)
-        {
-            _compassDiagDone = true;
-            try
-            {
-                Transform? bg = _interfaceCtrl.backgroundTransform;
-                var p = _compassContainer.parent;
-                var gp = p?.parent;
-                Log.LogInfo($"[Compass] compassContainer worldPos={_compassContainer.position} " +
-                            $"localPos={_compassContainer.localPosition} " +
-                            $"parent='{(p  != null ? p.gameObject.name   : "null")}' " +
-                            $"grandparent='{(gp != null ? gp.gameObject.name : "null")}' " +
-                            $"lossyScale={_compassContainer.lossyScale}");
-                if (bg != null)
-                    Log.LogInfo($"[Compass] backgroundTransform worldPos={bg.position} " +
-                                $"localPos={bg.localPosition} localScale={bg.localScale} lossyScale={bg.lossyScale}");
-                int iconCount = 0;
-                try { iconCount = _interfaceCtrl.awarenessIcons?.Count ?? 0; } catch { }
-                Log.LogInfo($"[Compass] meshRend active={_interfaceCtrl.compassMeshRend?.gameObject.activeSelf} " +
-                            $"containerActive={_compassContainer.gameObject.activeSelf} " +
-                            $"awarenessIcons={iconCount}");
-            }
-            catch (Exception ex) { Log.LogWarning($"[Compass] diag: {ex.Message}"); }
-        }
 
         // ── Reposition compass in front of VR head ────────────────────────────
         try
@@ -7557,21 +7510,11 @@ public class VRCamera : MonoBehaviour
             {
                 var cc = t.GetComponent<CharacterController>();
                 var rb = t.GetComponent<Rigidbody>();
-                // Enumerate ALL components for camera-look system identification
-                var allComps = t.GetComponents<Component>();
-                var compNames = new System.Text.StringBuilder();
-                foreach (var c in allComps)
-                {
-                    if (c == null) continue;
-                    try { compNames.Append($" {c.GetIl2CppType().Name}"); } catch { }
-                }
-                Log.LogInfo($"[Movement] Ancestor[{i}] '{t.gameObject.name}': CC={cc != null} RB={rb != null} components=[{compNames}]");
                 if (cc != null)
                 {
                     _playerCC = cc;
                     _playerRb = rb; // may be null; kept only for reset-on-reload checks
-                    Log.LogInfo($"[Movement] Cached playerCC on '{t.gameObject.name}'" +
-                                $" isKinematic={rb?.isKinematic}");
+                    Log.LogInfo($"[Movement] Cached playerCC on '{t.gameObject.name}'");
                     break;
                 }
                 t = t.parent;
@@ -7593,8 +7536,6 @@ public class VRCamera : MonoBehaviour
                 if (_gameCam != null && _gameCam.parent != null)
                     _cameraPivotTransform = _gameCam.parent;
 
-                Log.LogInfo($"[Movement] Cached FPSController transform='{_fpsControllerTransform.gameObject.name}' " +
-                            $"cameraPivot='{_cameraPivotTransform?.gameObject.name ?? "NULL"}'");
 
                 // Disable camera-look MonoBehaviours that override VR head rotation.
                 // CameraController (on Main Camera): handles mouse-look pitch/effects.
@@ -7616,10 +7557,7 @@ public class VRCamera : MonoBehaviour
                             foreach (var target in disableTargets)
                                 if (typeName == target) { shouldDisable = true; break; }
                             if (shouldDisable)
-                            {
                                 mb.enabled = false;
-                                Log.LogInfo($"[Movement] Disabled '{typeName}' on '{t.gameObject.name}'");
-                            }
                         }
                         catch { }
                     }
@@ -7631,42 +7569,6 @@ public class VRCamera : MonoBehaviour
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] Camera hierarchy setup: {ex.Message}"); }
 
-        // 4. FindObjectOfType for the FPS controller (diagnostic position check)
-        try
-        {
-            var cc = FindObjectOfType<CharacterController>();
-            if (cc != null)
-                Log.LogInfo($"[Movement] FindObjectOfType<CC>: GO='{cc.gameObject.name}' pos={cc.transform.position}");
-            else
-                Log.LogInfo("[Movement] FindObjectOfType<CC>: not found");
-        }
-        catch (Exception ex) { Log.LogWarning($"[Movement] FindCC: {ex.Message}"); }
-
-        // 5. Probe common Rewired axis names (diagnostic only — logs which axes the game uses
-        //    so we can implement injection in a future session if needed)
-        try
-        {
-            var player = Rewired.ReInput.players.GetPlayer(0);
-            if (player != null)
-            {
-                string[] candidates = { "Horizontal", "Vertical", "MoveHorizontal", "MoveVertical",
-                                        "Move Horizontal", "Move Vertical", "Strafe", "Forward",
-                                        "Walk", "Run", "Move X", "Move Y" };
-                var sb2 = new System.Text.StringBuilder("[Movement] Rewired axis probe:");
-                foreach (var name in candidates)
-                {
-                    try
-                    {
-                        float v = player.GetAxis(name);
-                        sb2.Append($" '{name}'={v:F2}");
-                    }
-                    catch { }
-                }
-                Log.LogInfo(sb2.ToString());
-            }
-        }
-        catch (Exception ex) { Log.LogWarning($"[Movement] Rewired probe: {ex.Message}"); }
-
         // 5b. Cache FirstPersonItemController for VR hand item tracking.
         try
         {
@@ -7676,89 +7578,16 @@ public class VRCamera : MonoBehaviour
                 if (fpsIC != null)
                 {
                     _fpsItemController = fpsIC;
-                    var lp = fpsIC.leftHandObjectParent;
-                    var rp = fpsIC.rightHandObjectParent;
-                    var ci = fpsIC.currentItem;
-                    // Log the full hierarchy from ItemContainer up to find what drives its position
-                    var sb = new System.Text.StringBuilder();
-                    sb.Append($"[Movement] FirstPersonItemController found. ");
-                    sb.Append($"leftHandParent='{lp?.gameObject?.name ?? "NULL"}' ");
-                    sb.Append($"rightHandParent='{rp?.gameObject?.name ?? "NULL"}' ");
-                    sb.Append($"currentItem='{(ci != null ? "present" : "NULL")}' ");
-                    sb.Append($"lagPivot='{fpsIC.lagPivotTransform?.gameObject?.name ?? "NULL"}'");
-                    Log.LogInfo(sb.ToString());
-
-                    // Walk up from ItemContainer to find its full parent chain
-                    if (lp != null)
-                    {
-                        var walk = lp;
-                        var chain = new System.Text.StringBuilder("[Movement] ItemContainer hierarchy: ");
-                        for (int h = 0; h < 10 && walk != null; h++)
-                        {
-                            chain.Append($"'{walk.gameObject.name}' → ");
-                            walk = walk.parent;
-                        }
-                        chain.Append("(root)");
-                        Log.LogInfo(chain.ToString());
-                    }
-                    // Also walk from LagPivot
+                    Log.LogInfo("[Movement] FirstPersonItemController found.");
                     var lag = fpsIC.lagPivotTransform;
                     if (lag != null)
                     {
-                        var walk2 = lag;
-                        var chain2 = new System.Text.StringBuilder("[Movement] LagPivot hierarchy: ");
-                        for (int h = 0; h < 10 && walk2 != null; h++)
-                        {
-                            chain2.Append($"'{walk2.gameObject.name}' → ");
-                            walk2 = walk2.parent;
-                        }
-                        chain2.Append("(root)");
-                        Log.LogInfo(chain2.ToString());
-
-                        // Log all children of LagPivot
-                        var childSb = new System.Text.StringBuilder("[Movement] LagPivot children: ");
-                        for (int c2 = 0; c2 < lag.childCount; c2++)
-                        {
-                            var child = lag.GetChild(c2);
-                            if (child != null) childSb.Append($"'{child.gameObject.name}' ");
-                        }
-                        Log.LogInfo(childSb.ToString());
-
-                        // Log components on LagPivot and descendants to find what drives position
-                        try
-                        {
-                            var diagNodes = new Transform[] { lag };
-                            // Also check FirstPersonModels (child of LagPivot)
-                            if (lag.childCount > 0) diagNodes = new Transform[] { lag, lag.GetChild(0) };
-                            foreach (var dNode in diagNodes)
-                            {
-                                if (dNode == null) continue;
-                                var comps = dNode.GetComponents<Component>();
-                                var cSb = new System.Text.StringBuilder($"[Movement] Components on '{dNode.gameObject.name}': ");
-                                foreach (var comp in comps)
-                                {
-                                    if (comp == null) continue;
-                                    try
-                                    {
-                                        string tn = comp.GetIl2CppType().Name;
-                                        cSb.Append($"{tn} ");
-                                        // If MonoBehaviour, note if enabled
-                                        var mb = comp.TryCast<MonoBehaviour>();
-                                        if (mb != null) cSb.Append($"(enabled={mb.enabled}) ");
-                                    }
-                                    catch { }
-                                }
-                                Log.LogInfo(cSb.ToString());
-                            }
-                        }
-                        catch { }
-
                         // Cache LagPivot for per-frame position override in UpdateHeldItemTracking.
                         // We do NOT reparent — the game's FirstPersonItemController sets LagPivot
                         // position in Update(). We override it in LateUpdate() so our write wins.
                         _lagPivotTransform = lag;
                         _lagPivotOrigParent = lag.parent;
-                        Log.LogInfo($"[Movement] Cached LagPivot for hand tracking (parent='{lag.parent?.gameObject?.name ?? "NULL"}')");
+                        Log.LogInfo("[Movement] Cached LagPivot for hand tracking.");
                     }
                 }
                 else
@@ -7778,9 +7607,7 @@ public class VRCamera : MonoBehaviour
                 if (ic != null)
                 {
                     _interactionController = ic;
-                    Log.LogInfo($"[Movement] InteractionController found on '{_playerCC.gameObject.name}'");
-                    var co = ic.carryingObject;
-                    Log.LogInfo($"[Movement] carryingObject={(co != null ? co.gameObject.name : "NULL")}");
+                    Log.LogInfo("[Movement] InteractionController found.");
                 }
                 else
                     Log.LogInfo("[Movement] InteractionController not found on FPSController.");
@@ -7811,7 +7638,7 @@ public class VRCamera : MonoBehaviour
             if (_interfaceCtrl != null)
             {
                 _firstPersonUI = _interfaceCtrl.firstPersonUI;
-                Log.LogInfo($"[Movement] InterfaceController found, firstPersonUI={(_firstPersonUI != null ? _firstPersonUI.gameObject.name : "null")}");
+                Log.LogInfo("[Movement] InterfaceController found.");
             }
             else
             {
@@ -7855,7 +7682,6 @@ public class VRCamera : MonoBehaviour
         }
 
         // 5h. Cache awareness compass container for VR positioning.
-        _compassDiagDone = false;
         _compassContainer = null;
         try
         {
@@ -7863,10 +7689,7 @@ public class VRCamera : MonoBehaviour
             {
                 _compassContainer = _interfaceCtrl.compassContainer.transform;
                 var p = _compassContainer.parent;
-                Log.LogInfo($"[Movement] compassContainer found: '{_compassContainer.gameObject.name}' " +
-                            $"parent='{(p != null ? p.gameObject.name : "null")}' " +
-                            $"worldPos={_compassContainer.position} localPos={_compassContainer.localPosition} " +
-                            $"lossyScale={_compassContainer.lossyScale}");
+                Log.LogInfo("[Movement] compassContainer found.");
             }
             else
                 Log.LogInfo("[Movement] compassContainer not found or null");
@@ -7880,7 +7703,7 @@ public class VRCamera : MonoBehaviour
             if (player != null)
             {
                 _playerRef = player;
-                Log.LogInfo($"[Movement] Player component found. inAirVent={player.inAirVent}");
+                Log.LogInfo("[Movement] Player component found.");
             }
             else
             {
@@ -7890,13 +7713,6 @@ public class VRCamera : MonoBehaviour
         catch (Exception ex) { Log.LogWarning($"[Movement] Player lookup: {ex.Message}"); }
 
         // 6. Camera.main diagnostic — confirm it's non-null so SaveStateController won't crash
-        try
-        {
-            var cm = Camera.main;
-            Log.LogInfo($"[Movement] Camera.main='{cm?.gameObject?.name ?? "NULL"}'" +
-                        $" enabled={cm?.enabled} cullingMask={cm?.cullingMask}");
-        }
-        catch (Exception ex) { Log.LogWarning($"[Movement] Camera.main check: {ex.Message}"); }
     }
     /// <summary>
     /// <summary>
