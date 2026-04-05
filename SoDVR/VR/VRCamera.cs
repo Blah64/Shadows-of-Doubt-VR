@@ -342,6 +342,15 @@ public class VRCamera : MonoBehaviour
     private const float CompassDist    = 1.2f;
     private const float CompassYOffset = -0.55f;
 
+    // ── Directional route arrow VR override ──────────────────────────
+    // MapController.directionalArrowContainer is a 3D MeshRenderer that points toward
+    // the next waypoint on a plotted route. Player.Update() sets directionalArrow.rotation.
+    // In VR we reposition the container in front of the VR head (like the compass).
+    private Transform? _dirArrowContainer;         // MapController.directionalArrowContainer
+    private Transform? _dirArrowTransform;         // MapController.directionalArrow
+    private const float DirArrowDist    = 1.0f;    // metres in front of head
+    private const float DirArrowYOffset = -0.40f;  // metres below eye level
+
     // ── Case board pin visual correction ─────────────────────────────
     // The Canvas renderer draws pins at a different position than transform.position
     // reports — proportional compression in X toward board center (~0.81x).
@@ -1764,6 +1773,9 @@ public class VRCamera : MonoBehaviour
 
                 // Awareness compass: reposition and reorient for VR head view.
                 UpdateCompass();
+
+                // Directional route arrow: reposition in front of VR head.
+                UpdateDirectionArrow();
 
                 // Minimap: set ZoomContent zoom range so the full city fits within the
                 // Viewport at minimum zoom (applied once after MapController is ready).
@@ -6904,6 +6916,29 @@ public class VRCamera : MonoBehaviour
         catch { }
     }
 
+    /// <summary>
+    /// Repositions the directional route arrow in front of the VR head.
+    /// Player.Update() already sets directionalArrow.rotation to point toward
+    /// the next waypoint — we just need the container visible in VR space.
+    /// Called from LateUpdate after Player.Update().
+    /// </summary>
+    private void UpdateDirectionArrow()
+    {
+        if (_dirArrowContainer == null || _leftCam == null) return;
+        if (!_dirArrowContainer.gameObject.activeSelf) return;
+
+        try
+        {
+            Vector3 headPos = _leftCam.transform.position;
+            Vector3 headFwd = _leftCam.transform.forward;
+            Vector3 headUp  = _leftCam.transform.up;
+
+            _dirArrowContainer.position =
+                headPos + headFwd * DirArrowDist + headUp * DirArrowYOffset;
+        }
+        catch { }
+    }
+
     /// <summary>Left X → C (crouch toggle).</summary>
     private float _crouchCooldownUntil;
     private bool  _crouchNeedsRelease;
@@ -7824,6 +7859,23 @@ public class VRCamera : MonoBehaviour
                 Log.LogInfo("[Movement] compassContainer not found or null");
         }
         catch (Exception ex) { Log.LogWarning($"[Movement] compassContainer cache: {ex.Message}"); }
+
+        // 5i. Cache directional route arrow for VR repositioning.
+        _dirArrowContainer = null;
+        _dirArrowTransform = null;
+        try
+        {
+            var mapCtrl = MapController.Instance;
+            if (mapCtrl != null && mapCtrl.directionalArrowContainer != null)
+            {
+                _dirArrowContainer = mapCtrl.directionalArrowContainer.transform;
+                _dirArrowTransform = mapCtrl.directionalArrow;
+                Log.LogInfo("[Movement] directionalArrowContainer found.");
+            }
+            else
+                Log.LogInfo("[Movement] directionalArrowContainer not found or null");
+        }
+        catch (Exception ex) { Log.LogWarning($"[Movement] dirArrowContainer cache: {ex.Message}"); }
 
         // 5d. Cache Player for vent-state detection.
         try
