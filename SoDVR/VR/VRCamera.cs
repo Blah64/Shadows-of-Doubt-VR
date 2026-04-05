@@ -7002,7 +7002,8 @@ public class VRCamera : MonoBehaviour
         Log.LogInfo("[VRCamera] Sprint stop");
     }
 
-    /// <summary>Right B → Tab (notebook/map).  3-phase debounce (same as menu button).</summary>
+    /// <summary>Right B → Tab (notebook/map), or X (inventory) if controller is behind shoulder.</summary>
+    private bool _backpackBtnPrev;  // edge detection for backpack gesture
     private void UpdateNotebook()
     {
         if (VRSettingsPanel.RootGO?.activeSelf == true)
@@ -7023,6 +7024,43 @@ public class VRCamera : MonoBehaviour
             if (_tabHeldDown) ReleaseTabKey();
             return;
         }
+
+        // ── Backpack gesture: B pressed with right controller behind shoulder → inventory (X key) ──
+        bool behindShoulder = false;
+        if (pressed && !_tabHeldDown && _rightControllerGO != null && _leftCam != null)
+        {
+            Vector3 headPos = _leftCam.transform.position;
+            Vector3 headFwd = _leftCam.transform.forward;
+            headFwd.y = 0; headFwd.Normalize(); // yaw-only forward
+            Vector3 headRight = _leftCam.transform.right;
+            headRight.y = 0; headRight.Normalize();
+            Vector3 toCtrl = _rightControllerGO.transform.position - headPos;
+            float fwdDot = Vector3.Dot(toCtrl, headFwd);   // negative = behind
+            float rightDot = Vector3.Dot(toCtrl, headRight); // positive = right side
+            float yOff = toCtrl.y;                           // relative to head
+            // Behind head, right side, roughly shoulder height
+            behindShoulder = fwdDot < -0.1f && rightDot > 0.05f && yOff > -0.5f && yOff < 0.15f;
+        }
+        if (behindShoulder)
+        {
+            bool backpackEdge = pressed && !_backpackBtnPrev;
+            _backpackBtnPrev = pressed;
+            if (backpackEdge)
+            {
+                try
+                {
+                    const byte VK_X = 0x58;
+                    const uint KEYEVENTF_KEYUP = 0x0002;
+                    keybd_event(VK_X, 0, 0,               UIntPtr.Zero);
+                    keybd_event(VK_X, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                    Log.LogInfo("[VRCamera] Backpack gesture → Inventory (X)");
+                }
+                catch (Exception ex) { Log.LogWarning($"[VRCamera] Backpack: {ex.Message}"); }
+            }
+            return; // don't process Tab while in backpack zone
+        }
+        _backpackBtnPrev = pressed;
+
         // When NOT holding Tab, suppress if aiming at a canvas (B = middle-click on canvas)
         if (!_tabHeldDown && _cursorHasTarget)
             return;
