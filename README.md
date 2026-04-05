@@ -40,7 +40,7 @@ Any OpenXR runtime works — bindings are included for:
    ```
 
 5. Start your VR runtime / headset software **before** launching the game.
-6. Launch Shadows of Doubt through Steam. The game will open on your desktop; put on your headset — the VR view should appear automatically.
+6. Launch Shadows of Doubt through Steam. The game will open on your desktop; put on your headset — press a button or click your mouse to get past the first screen, then the VR view should appear automatically.
 
 ## Controls
 
