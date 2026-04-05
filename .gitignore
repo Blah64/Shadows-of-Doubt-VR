@@ -3,6 +3,9 @@ bin/
 obj/
 *.nupkg
 
+# Old Files folder
+Old Files/
+
 # IDE / editor
 .vs/
 *.user
