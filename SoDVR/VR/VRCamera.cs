@@ -253,6 +253,11 @@ public class VRCamera : MonoBehaviour
     private readonly Dictionary<int, (Vector3 pos, Quaternion rot)> _gripDragEnforce = new(); // absolute world positions enforced every LateUpdate
     private Canvas? _actionPanelCanvas;       // ActionPanelCanvas reference — anchor for grip-drag offsets
     private int     _actionPanelId = -1;
+    // ── B-button minimap: body-locked offset relative to VROrigin yaw ────────
+    private bool       _minimapBBtnHasOffset;      // true after first B-button minimap placement or grip-drag
+    private Vector3    _minimapBBtnLocalOffset;     // position offset in VROrigin-local space (yaw-aligned)
+    private Quaternion _minimapBBtnLocalRot = Quaternion.identity; // rotation in VROrigin-local space
+    private bool       _minimapInBBtnContext;       // true while B is held and minimap shown (not case board)
     // ── Individual nested note grip-drag ─────────────────────────────────────
     // Allows dragging individual Note canvases apart inside WindowCanvas.
     // Uses full 6DOF world-space tracking (same as regular grip-drag) converted to local space.
@@ -3810,6 +3815,39 @@ public class VRCamera : MonoBehaviour
             // ── Menu, Panel, CaseBoard, Default ──────────────────────────────
             // Skip if already positioned and not needing recentre.
             if (_positionedCanvases.Contains(id)) continue;
+
+            // ── B-button minimap: body-locked placement ──────────────────────
+            // When B is held (not case board), place MinimapCanvas from VROrigin-relative offset
+            // instead of the standard head+forward Panel logic. Marked positioned so it doesn't
+            // fall through to default placement. Per-frame body-lock update happens in Update().
+            string nameForBBtn = canvas.gameObject.name ?? "";
+            if (_minimapInBBtnContext && nameForBBtn.Equals("MinimapCanvas", StringComparison.OrdinalIgnoreCase))
+            {
+                if (IsCanvasVisible(canvas))
+                {
+                    Quaternion vrYaw = Quaternion.Euler(0, transform.eulerAngles.y, 0);
+                    if (_minimapBBtnHasOffset)
+                    {
+                        canvas.transform.position = transform.position + vrYaw * _minimapBBtnLocalOffset;
+                        canvas.transform.rotation = vrYaw * _minimapBBtnLocalRot;
+                    }
+                    else
+                    {
+                        // First time — use default head+forward, then save as VROrigin-relative
+                        float bDist = catDefs.Distance;
+                        canvas.transform.position = headPos + forward * bDist + Vector3.up * catDefs.VerticalOffset;
+                        canvas.transform.rotation = yawOnly;
+                        Quaternion invVrYaw = Quaternion.Inverse(vrYaw);
+                        _minimapBBtnLocalOffset = invVrYaw * (canvas.transform.position - transform.position);
+                        _minimapBBtnLocalRot = invVrYaw * canvas.transform.rotation;
+                        _minimapBBtnHasOffset = true;
+                    }
+                    _positionedCanvases.Add(id);
+                    _gripDragEnforce[id] = (canvas.transform.position, canvas.transform.rotation);
+                }
+                continue;
+            }
+
             _placementIndex++; // incremental depth offset to prevent z-fighting
             // Skip if not currently visible (will be placed when it activates).
             // Exception: CaseBoard canvases are always positioned — the game may
@@ -4150,6 +4188,19 @@ public class VRCamera : MonoBehaviour
                     nc.transform.rotation = nt.worldRot;
                 }
             }
+        }
+
+        // ── B-button minimap body-lock: update VROrigin-relative position every frame ──
+        if (_minimapInBBtnContext && _minimapBBtnHasOffset && _minimapCanvasRef != null
+            && _minimapCanvasRef.gameObject.activeSelf)
+        {
+            int mmId = _minimapCanvasRef.GetInstanceID();
+            Quaternion vrYaw = Quaternion.Euler(0, transform.eulerAngles.y, 0);
+            Vector3 mmPos = transform.position + vrYaw * _minimapBBtnLocalOffset;
+            Quaternion mmRot = vrYaw * _minimapBBtnLocalRot;
+            _minimapCanvasRef.transform.position = mmPos;
+            _minimapCanvasRef.transform.rotation = mmRot;
+            _gripDragEnforce[mmId] = (mmPos, mmRot);
         }
 
         // Enforce grip-dragged top-level canvas positions in Update too (LateUpdate enforcement
@@ -6061,30 +6112,52 @@ public class VRCamera : MonoBehaviour
                 );
             }
 
-            // Store offset in ActionPanelCanvas's LOCAL coordinate space.
-            // This means the offset rotates with the anchor — when the case board
-            // reopens facing a different direction, the arrangement is preserved.
-            // Skip Tooltip canvas (dialog host) — its position is transient; no persistence needed.
-            var releasedCat = GetCanvasCategory(_gripDragCanvas.gameObject.name ?? "");
-            bool isReleasedTooltip = releasedCat == CanvasCategory.Tooltip;
-            if (!isReleasedTooltip && _actionPanelCanvas != null)
+            // B-button minimap: save as VROrigin-relative offset (body-locked context).
+            // Skip the ActionPanelCanvas-relative save so case board context is unaffected.
+            string releasedName = _gripDragCanvas.gameObject.name ?? "";
+            bool isMinimapBBtn = _minimapInBBtnContext
+                && releasedName.Equals("MinimapCanvas", StringComparison.OrdinalIgnoreCase);
+            if (isMinimapBBtn)
             {
-                int dragId = _gripDragCanvas.GetInstanceID();
-                Quaternion invAnchorRot = Quaternion.Inverse(_actionPanelCanvas.transform.rotation);
-                _gripDragAnchorOffsets[dragId] = (
-                    invAnchorRot * (_gripDragCanvas.transform.position - _actionPanelCanvas.transform.position),
-                    invAnchorRot * _gripDragCanvas.transform.rotation
-                );
-            }
-
-            // Store absolute position for LateUpdate enforcement (game may reset between frames)
-            if (!isReleasedTooltip)
-            {
+                Quaternion vrYaw = Quaternion.Euler(0, transform.eulerAngles.y, 0);
+                Quaternion invVrYaw = Quaternion.Inverse(vrYaw);
+                _minimapBBtnLocalOffset = invVrYaw * (_gripDragCanvas.transform.position - transform.position);
+                _minimapBBtnLocalRot = invVrYaw * _gripDragCanvas.transform.rotation;
+                _minimapBBtnHasOffset = true;
+                // Still store absolute for this-frame enforcement
                 int enfId = _gripDragCanvas.GetInstanceID();
                 _gripDragEnforce[enfId] = (
                     _gripDragCanvas.transform.position,
                     _gripDragCanvas.transform.rotation
                 );
+            }
+            else
+            {
+                // Store offset in ActionPanelCanvas's LOCAL coordinate space.
+                // This means the offset rotates with the anchor — when the case board
+                // reopens facing a different direction, the arrangement is preserved.
+                // Skip Tooltip canvas (dialog host) — its position is transient; no persistence needed.
+                var releasedCat = GetCanvasCategory(releasedName);
+                bool isReleasedTooltip = releasedCat == CanvasCategory.Tooltip;
+                if (!isReleasedTooltip && _actionPanelCanvas != null)
+                {
+                    int dragId = _gripDragCanvas.GetInstanceID();
+                    Quaternion invAnchorRot = Quaternion.Inverse(_actionPanelCanvas.transform.rotation);
+                    _gripDragAnchorOffsets[dragId] = (
+                        invAnchorRot * (_gripDragCanvas.transform.position - _actionPanelCanvas.transform.position),
+                        invAnchorRot * _gripDragCanvas.transform.rotation
+                    );
+                }
+
+                // Store absolute position for LateUpdate enforcement (game may reset between frames)
+                if (!isReleasedTooltip)
+                {
+                    int enfId = _gripDragCanvas.GetInstanceID();
+                    _gripDragEnforce[enfId] = (
+                        _gripDragCanvas.transform.position,
+                        _gripDragCanvas.transform.rotation
+                    );
+                }
             }
 
             Log.LogInfo($"[VRCamera] GripDrag end: '{_gripDragCanvas.gameObject.name}'");
@@ -6962,15 +7035,33 @@ public class VRCamera : MonoBehaviour
                 const byte VK_TAB = 0x09;
                 keybd_event(VK_TAB, 0, 0, UIntPtr.Zero); // key DOWN
                 _tabHeldDown = true;
+                _minimapInBBtnContext = true;
                 Log.LogInfo("[VRCamera] Notebook Tab DOWN (hold-to-show)");
             }
             catch (Exception ex) { Log.LogWarning($"[VRCamera] UpdateNotebook DOWN: {ex.Message}"); }
         }
         else if (!pressed && _tabHeldDown)
         {
+            // Before clearing, save B-button minimap position as VROrigin-relative offset
+            // (only if we don't already have a grip-dragged offset — default placement is
+            // saved here so the minimap reopens at the same spot next time).
+            if (_minimapInBBtnContext && _minimapCanvasRef != null && _minimapCanvasRef.gameObject.activeSelf)
+            {
+                try
+                {
+                    Quaternion vrYaw = Quaternion.Euler(0, transform.eulerAngles.y, 0);
+                    Quaternion invVrYaw = Quaternion.Inverse(vrYaw);
+                    _minimapBBtnLocalOffset = invVrYaw * (_minimapCanvasRef.transform.position - transform.position);
+                    _minimapBBtnLocalRot = invVrYaw * _minimapCanvasRef.transform.rotation;
+                    _minimapBBtnHasOffset = true;
+                }
+                catch { }
+            }
+            _minimapInBBtnContext = false;
+
             ReleaseTabKey();
             // Remove map/notebook canvases from _positionedCanvases so they get
-            // fresh head-relative placement next time they open.
+            // fresh placement next time they open.
             try
             {
                 foreach (var kvp in _managedCanvases)
